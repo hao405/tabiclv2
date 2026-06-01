@@ -27,6 +27,59 @@ cd ../tabular-dl-tabr
 python benchmark_infer.py --max-datasets 1 --workers 1 --gpus auto --verbose
 ```
 
+## Unified pipeline
+
+`Experiment_TTT_pipeline` provides a TabTune-style registry/runner over the
+baseline scripts and TabICL. It supports ordinary inference and the existing
+1C-style chunk TTT entrypoints:
+
+```bash
+# See supported model keys and aliases.
+python -m Experiment_TTT_pipeline --list-models
+
+# Smoke-test commands without launching heavy model code.
+python -m Experiment_TTT_pipeline \
+  --strategy inference \
+  --models tabicl,tabpfnv25,limix,tabr,tabdpt,orion_msp \
+  --max-datasets 1 --workers 1 --gpus auto --dry-run
+
+# Run all TTT-capable models with the 1C/chunk TTT scripts.
+python -m Experiment_TTT_pipeline \
+  --strategy ttt \
+  --models all_ttt \
+  --max-datasets 1 --workers 1 --gpus auto --verbose
+```
+
+The default output root is:
+
+```text
+Experiment_TTT_pipeline/results/<strategy>/<model_key>/
+```
+
+For TabICL TTT, the pipeline clears `1C_Chunk_TTT.py`'s default
+`--gpu-groups` when `--gpus` is used, so `--gpus auto` behaves consistently
+with the other baselines. To use intra-worker TabICL GPU groups explicitly:
+
+```bash
+python -m Experiment_TTT_pipeline \
+  --strategy ttt --models tabicl \
+  --workers 1 --gpu-groups 0,1
+```
+
+Model-specific backend arguments can be forwarded with `--model-extra-arg`
+using the `MODEL:ARG` form:
+
+```bash
+python -m Experiment_TTT_pipeline \
+  --strategy ttt --models tabpfnv3 \
+  --model-extra-arg=tabpfnv3:--ttt-epochs=8 \
+  --model-extra-arg=tabpfnv3:--ttt-max-chunk-size=2000
+```
+
+TTT-capable keys are `tabicl`, `tabpfnv2`, `tabpfnv25`, `tabpfnv26`,
+`tabpfnv3`, `limix`, `tabdpt`, and `orion_msp`. `tabr` is currently inference
+only.
+
 The default output roots are:
 
 ```text

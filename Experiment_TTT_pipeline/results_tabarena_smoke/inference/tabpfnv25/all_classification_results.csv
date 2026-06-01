@@ -1,0 +1,2 @@
+dataset_name,dataset_dir,task_type,n_train,n_val,n_test,n_features,n_classes,accuracy,fit_seconds,predict_seconds,status,error
+churn,/data0/zhuhao2025/tabiclv2_test/data_tabarena/churn,binclass,3333,0,1667,19,2,0.967006598680264,4.115384101867676,14.476661920547484,ok,

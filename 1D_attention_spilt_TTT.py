@@ -16,7 +16,7 @@ import time
 import traceback
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from typing import Any, Dict, Iterator, List, Optional
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -24,13 +24,11 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-DEFAULT_DATA_ROOT = Path("data178")
+DEFAULT_DATA_ROOT = Path("data200")
 DEFAULT_MODEL_PATH = "tabicl-classifier-v2-20260212.ckpt"
 DEFAULT_CHECKPOINT_VERSION = "tabicl-classifier-v2-20260212.ckpt"
 CLASSIFICATION_TASKS = {"binclass", "multiclass"}
 CATEGORICAL_MISSING_TOKEN = "__tabicl_missing__"
-ADAPTOR_BLOCKS = {"mlp", "dcnv2"}
-ADAPTOR_TARGET = "model_input"
 
 np = None
 pd = None
@@ -78,11 +76,6 @@ class ResultRow:
     ttt_stopped_early: bool = False
     ttt_oom_fallback: bool = False
     ttt_fallback_reason: Optional[str] = None
-    ttt_adaptor_enabled: bool = False
-    ttt_adaptor_block: Optional[str] = None
-    ttt_adaptor_bottleneck: int = 0
-    ttt_adaptor_trainable_params: int = 0
-    ttt_adaptor_target: Optional[str] = None
 
 
 @dataclass
@@ -101,6 +94,10 @@ class TTTConfig:
     max_chunk_size: int = 10_000
     min_chunk_size: int = 50
     query_ratio: float = 0.2
+    attention_final_epochs: int = 3
+    attention_mass: float = 0.80
+    attention_min_query_ratio: float = 0.20
+    attention_max_query_ratio: float = 0.50
     n_estimators_finetune: int = 2
     early_stopping: bool = True
     patience: int = 8
@@ -111,12 +108,6 @@ class TTTConfig:
     freeze_col: bool = False
     freeze_row: bool = False
     freeze_icl: bool = False
-    adaptor_enabled: bool = False
-    adaptor_block: str = "mlp"
-    adaptor_bottleneck: int = 64
-    adaptor_dropout: float = 0.0
-    adaptor_scale: float = 1.0
-    adaptor_train_backbone: bool = False
     train_fraction: float = 0.75
     random_state: int = 42
     data_parallel: bool = False
@@ -131,6 +122,15 @@ class TTTConfig:
 class TTTSplit:
     b_indices: Any
     c_indices: Any
+    strategy: str
+    reason: str
+
+
+@dataclass
+class AttentionSplitSelection:
+    a_indices: Any
+    b_indices: Any
+    scores: Any
     strategy: str
     reason: str
 
@@ -152,11 +152,6 @@ class TTTUpdateResult:
     val_best_accuracy: Optional[float] = None
     best_epoch: int = 0
     stopped_early: bool = False
-    adaptor_enabled: bool = False
-    adaptor_block: Optional[str] = None
-    adaptor_bottleneck: int = 0
-    adaptor_trainable_params: int = 0
-    adaptor_target: Optional[str] = None
 
 
 @dataclass
@@ -172,6 +167,9 @@ class MetaBatch:
     y_query: Any
     train_size: int
     skip_reason: Optional[str] = None
+    query_mode: str = "chunk_b"
+    target_query_size: int = 0
+    attention_shortfall: int = 0
 
 
 @dataclass
@@ -197,9 +195,6 @@ class ModelSummaryRow:
     status: str
     error: Optional[str]
     failed_datasets: str
-    ttt_adaptor_enabled_count: int = 0
-    ttt_adaptor_block_counts: str = "(none)"
-    avg_ttt_adaptor_trainable_params_ok: Optional[float] = None
 
 
 OOM_ERROR_MARKERS = (
@@ -370,49 +365,6 @@ def truthy_column_mask(frame: Any, column: str) -> Any:
     return values.map(lambda value: str(value).strip().lower() in {"1", "true", "yes"})
 
 
-def format_adaptor_block_counts(frame: Any) -> str:
-    if frame is None or not len(frame) or "ttt_adaptor_block" not in frame.columns:
-        return "(none)"
-
-    blocks = frame["ttt_adaptor_block"].dropna().map(lambda value: str(value).strip())
-    blocks = blocks[(blocks != "") & (blocks.str.lower() != "none")]
-    if not len(blocks):
-        return "(none)"
-
-    counts = blocks.value_counts()
-    return ", ".join(f"{block}={int(counts[block])}" for block in sorted(counts.index))
-
-
-def parse_adaptor_block_count_string(value: Any) -> Dict[str, int]:
-    text = str(value).strip()
-    if not text or text == "(none)":
-        return {}
-
-    counts: Dict[str, int] = {}
-    for item in text.split(","):
-        if "=" not in item:
-            continue
-        key, raw_count = item.split("=", 1)
-        key = key.strip()
-        try:
-            count = int(float(raw_count.strip()))
-        except ValueError:
-            continue
-        if key:
-            counts[key] = counts.get(key, 0) + count
-    return counts
-
-
-def format_adaptor_block_count_totals(values: Any) -> str:
-    totals: Dict[str, int] = {}
-    for value in values:
-        for block, count in parse_adaptor_block_count_string(value).items():
-            totals[block] = totals.get(block, 0) + count
-    if not totals:
-        return "(none)"
-    return ", ".join(f"{block}={totals[block]}" for block in sorted(totals))
-
-
 def format_dataset_result_log(
     worker_label: str,
     row: ResultRow,
@@ -443,10 +395,7 @@ def format_dataset_result_log(
             f"ttt_val_best={format_optional_float(row.ttt_val_best_metric)} "
             f"ttt_best_epoch={row.ttt_best_epoch} "
             f"ttt_stopped_early={row.ttt_stopped_early} "
-            f"ttt_oom_fallback={row.ttt_oom_fallback} "
-            f"ttt_adaptor_enabled={row.ttt_adaptor_enabled} "
-            f"ttt_adaptor_block={row.ttt_adaptor_block} "
-            f"ttt_adaptor_params={row.ttt_adaptor_trainable_params}"
+            f"ttt_oom_fallback={row.ttt_oom_fallback}"
         )
     if row.status == "skip":
         return f"{prefix} [skip] {row.dataset_name} reason={row.error}"
@@ -863,7 +812,7 @@ def force_memory_cleanup(device_str: str) -> None:
 
 
 def build_ttt_config(args: argparse.Namespace) -> TTTConfig:
-    ttt_adaptor_block = str(getattr(args, "ttt_adaptor_block", "mlp")).lower()
+    out_dir_value = args.out_dir if args.out_dir is not None else str(build_auto_out_dir(args))
     if int(args.ttt_save_ckpt_every) < 1:
         raise ValueError("--ttt-save-ckpt-every must be >= 1")
     if args.ttt_save_ckpt_start_step is not None and int(args.ttt_save_ckpt_start_step) < 1:
@@ -876,6 +825,16 @@ def build_ttt_config(args: argparse.Namespace) -> TTTConfig:
         raise ValueError("--ttt-min-chunk-size must be >= 1")
     if not 0.0 < float(args.ttt_query_ratio) < 1.0:
         raise ValueError("--ttt-query-ratio must be in (0, 1)")
+    if int(args.ttt_attention_final_epochs) < 0:
+        raise ValueError("--ttt-attention-final-epochs must be >= 0")
+    if not 0.0 < float(args.ttt_attention_mass) <= 1.0:
+        raise ValueError("--ttt-attention-mass must be in (0, 1]")
+    if not 0.0 <= float(args.ttt_attention_min_query_ratio) < 1.0:
+        raise ValueError("--ttt-attention-min-query-ratio must be in [0, 1)")
+    if not 0.0 < float(args.ttt_attention_max_query_ratio) < 1.0:
+        raise ValueError("--ttt-attention-max-query-ratio must be in (0, 1)")
+    if float(args.ttt_attention_min_query_ratio) > float(args.ttt_attention_max_query_ratio):
+        raise ValueError("--ttt-attention-min-query-ratio must be <= --ttt-attention-max-query-ratio")
     if int(args.ttt_n_estimators_finetune) < 1:
         raise ValueError("--ttt-n-estimators-finetune must be >= 1")
     if int(args.ttt_patience) < 1:
@@ -890,14 +849,6 @@ def build_ttt_config(args: argparse.Namespace) -> TTTConfig:
         raise ValueError("--ttt-validation-n-estimators must be >= 1")
     if str(args.ttt_eval_metric) not in {"roc_auc", "log_loss", "accuracy"}:
         raise ValueError("--ttt-eval-metric must be one of: roc_auc, log_loss, accuracy")
-    if ttt_adaptor_block not in ADAPTOR_BLOCKS:
-        raise ValueError("--ttt-adaptor-block must be one of: mlp, dcnv2")
-    if int(args.ttt_adaptor_bottleneck) < 1:
-        raise ValueError("--ttt-adaptor-bottleneck must be >= 1")
-    if not 0.0 <= float(args.ttt_adaptor_dropout) < 1.0:
-        raise ValueError("--ttt-adaptor-dropout must be in [0, 1)")
-    if float(args.ttt_adaptor_scale) < 0:
-        raise ValueError("--ttt-adaptor-scale must be >= 0")
 
     return TTTConfig(
         enabled=bool(args.ttt_enabled),
@@ -914,6 +865,10 @@ def build_ttt_config(args: argparse.Namespace) -> TTTConfig:
         max_chunk_size=int(args.ttt_max_chunk_size),
         min_chunk_size=int(args.ttt_min_chunk_size),
         query_ratio=float(args.ttt_query_ratio),
+        attention_final_epochs=int(args.ttt_attention_final_epochs),
+        attention_mass=float(args.ttt_attention_mass),
+        attention_min_query_ratio=float(args.ttt_attention_min_query_ratio),
+        attention_max_query_ratio=float(args.ttt_attention_max_query_ratio),
         n_estimators_finetune=int(args.ttt_n_estimators_finetune),
         early_stopping=bool(args.ttt_early_stopping),
         patience=int(args.ttt_patience),
@@ -924,12 +879,6 @@ def build_ttt_config(args: argparse.Namespace) -> TTTConfig:
         freeze_col=bool(args.ttt_freeze_col),
         freeze_row=bool(args.ttt_freeze_row),
         freeze_icl=bool(args.ttt_freeze_icl),
-        adaptor_enabled=bool(args.ttt_adaptor),
-        adaptor_block=ttt_adaptor_block,
-        adaptor_bottleneck=int(args.ttt_adaptor_bottleneck),
-        adaptor_dropout=float(args.ttt_adaptor_dropout),
-        adaptor_scale=float(args.ttt_adaptor_scale),
-        adaptor_train_backbone=bool(args.ttt_adaptor_train_backbone),
         random_state=int(args.random_state),
         data_parallel=bool(args.ttt_data_parallel),
         save_ckpt=bool(args.ttt_save_ckpt),
@@ -937,7 +886,7 @@ def build_ttt_config(args: argparse.Namespace) -> TTTConfig:
         save_ckpt_start_step=(
             int(args.ttt_save_ckpt_start_step) if args.ttt_save_ckpt_start_step is not None else None
         ),
-        ckpt_root=str((Path(args.out_dir).expanduser() / "ttt_ckpts").resolve()),
+        ckpt_root=str((Path(out_dir_value).expanduser() / "ttt_ckpts").resolve()),
     )
 
 
@@ -1122,205 +1071,12 @@ def _build_ttt_forward_model(classifier, config: TTTConfig):
         return base_model, 1
 
 
-def _remove_ttt_adaptor(classifier) -> None:
-    model = _get_ttt_base_model(classifier)
-    handle = getattr(model, "_ttt_adaptor_hook_handle", None)
-    if handle is not None:
-        try:
-            handle.remove()
-        except Exception:
-            pass
-    original_forward = getattr(model, "_ttt_adaptor_original_forward", None)
-    if original_forward is not None:
-        if getattr(original_forward, "__self__", None) is not None:
-            model.forward = original_forward
-        else:
-            try:
-                delattr(model, "forward")
-            except AttributeError:
-                model.forward = MethodType(original_forward, model)
-    original_forward_with_cache = getattr(model, "_ttt_adaptor_original_forward_with_cache", None)
-    if original_forward_with_cache is not None:
-        if getattr(original_forward_with_cache, "__self__", None) is not None:
-            model.forward_with_cache = original_forward_with_cache
-        else:
-            try:
-                delattr(model, "forward_with_cache")
-            except AttributeError:
-                model.forward_with_cache = MethodType(original_forward_with_cache, model)
-    if hasattr(model, "ttt_adaptor"):
-        delattr(model, "ttt_adaptor")
-    if hasattr(model.row_interactor, "ttt_adaptor"):
-        delattr(model.row_interactor, "ttt_adaptor")
-    if hasattr(model, "_ttt_adaptor_original_forward"):
-        delattr(model, "_ttt_adaptor_original_forward")
-    if hasattr(model, "_ttt_adaptor_original_forward_with_cache"):
-        delattr(model, "_ttt_adaptor_original_forward_with_cache")
-    model._ttt_adaptor_hook_handle = None
-    model._ttt_adaptor_target = None
-    model._ttt_adaptor_block = None
-
-
-def _apply_ttt_input_adaptor(model, X):
-    if X is None:
-        return None
-    adaptor = getattr(model, "ttt_adaptor", None)
-    if adaptor is None:
-        return X
-    return X + adaptor(X)
-
-
-def _install_ttt_adaptor(classifier, config: TTTConfig, input_dim: int):
-    import torch
-
-    model = _get_ttt_base_model(classifier)
-    _remove_ttt_adaptor(classifier)
-
-    dim = int(input_dim)
-    if dim < 1:
-        raise ValueError("TTT input adaptor requires input_dim >= 1")
-    bottleneck = min(max(1, int(config.adaptor_bottleneck)), dim)
-
-    class TTTMLPResidualAdaptor(torch.nn.Module):
-        def __init__(self, input_dim: int, hidden_dim: int, dropout: float, scale: float) -> None:
-            super().__init__()
-            self.scale = float(scale)
-            self.net = torch.nn.Sequential(
-                torch.nn.LayerNorm(input_dim),
-                torch.nn.Linear(input_dim, hidden_dim),
-                torch.nn.GELU(),
-                torch.nn.Dropout(float(dropout)),
-                torch.nn.Linear(hidden_dim, input_dim),
-            )
-            last_linear = self.net[-1]
-            torch.nn.init.zeros_(last_linear.weight)
-            if last_linear.bias is not None:
-                torch.nn.init.zeros_(last_linear.bias)
-
-        def forward(self, x):
-            return self.net(x) * self.scale
-
-    class TTTDCNv2ResidualAdaptor(torch.nn.Module):
-        def __init__(self, input_dim: int, cross_dim: int, dropout: float, scale: float) -> None:
-            super().__init__()
-            self.scale = float(scale)
-            self.norm = torch.nn.LayerNorm(input_dim)
-            self.down = torch.nn.Linear(input_dim, cross_dim)
-            self.activation = torch.nn.GELU()
-            self.dropout = torch.nn.Dropout(float(dropout))
-            self.up = torch.nn.Linear(cross_dim, input_dim)
-            torch.nn.init.zeros_(self.up.weight)
-            if self.up.bias is not None:
-                torch.nn.init.zeros_(self.up.bias)
-
-        def forward(self, x):
-            x_norm = self.norm(x)
-            cross = self.up(self.dropout(self.activation(self.down(x_norm))))
-            return x_norm * cross * self.scale
-
-    adaptor_block = str(config.adaptor_block).lower()
-    if adaptor_block == "mlp":
-        adaptor = TTTMLPResidualAdaptor(
-            input_dim=dim,
-            hidden_dim=bottleneck,
-            dropout=float(config.adaptor_dropout),
-            scale=float(config.adaptor_scale),
-        )
-    elif adaptor_block == "dcnv2":
-        adaptor = TTTDCNv2ResidualAdaptor(
-            input_dim=dim,
-            cross_dim=bottleneck,
-            dropout=float(config.adaptor_dropout),
-            scale=float(config.adaptor_scale),
-        )
-    else:
-        raise ValueError("--ttt-adaptor-block must be one of: mlp, dcnv2")
-    first_param = next(model.parameters())
-    adaptor.to(device=first_param.device, dtype=first_param.dtype)
-    model.ttt_adaptor = adaptor
-    model._ttt_adaptor_target = ADAPTOR_TARGET
-    model._ttt_adaptor_block = adaptor_block
-    model._ttt_adaptor_original_forward = type(model).forward
-    model._ttt_adaptor_original_forward_with_cache = type(model).forward_with_cache
-
-    original_forward = model._ttt_adaptor_original_forward
-    original_forward_with_cache = model._ttt_adaptor_original_forward_with_cache
-
-    def _forward_with_input_adaptor(_model, *args, **kwargs):
-        if args:
-            args = (_apply_ttt_input_adaptor(_model, args[0]),) + args[1:]
-        elif "X" in kwargs:
-            kwargs = dict(kwargs)
-            kwargs["X"] = _apply_ttt_input_adaptor(_model, kwargs["X"])
-        return original_forward(_model, *args, **kwargs)
-
-    def _forward_with_cache_input_adaptor(_model, *args, **kwargs):
-        if args:
-            args = list(args)
-            if len(args) > 0:
-                args[0] = _apply_ttt_input_adaptor(_model, args[0])
-            if len(args) > 2:
-                args[2] = _apply_ttt_input_adaptor(_model, args[2])
-            args = tuple(args)
-        if "X_train" in kwargs or "X_test" in kwargs:
-            kwargs = dict(kwargs)
-            if "X_train" in kwargs:
-                kwargs["X_train"] = _apply_ttt_input_adaptor(_model, kwargs["X_train"])
-            if "X_test" in kwargs:
-                kwargs["X_test"] = _apply_ttt_input_adaptor(_model, kwargs["X_test"])
-        return original_forward_with_cache(_model, *args, **kwargs)
-
-    model.forward = MethodType(_forward_with_input_adaptor, model)
-    model.forward_with_cache = MethodType(_forward_with_cache_input_adaptor, model)
-    return adaptor
-
-
-def _get_ttt_adaptor(classifier):
-    model = _get_ttt_base_model(classifier)
-    return getattr(model, "ttt_adaptor", None)
-
-
-def _count_trainable_params(params: List[Any]) -> int:
-    return int(sum(param.numel() for param in params if getattr(param, "requires_grad", False)))
-
-
-def _configure_ttt_trainable_params(classifier, config: TTTConfig, input_dim: int | None = None):
+def _configure_ttt_trainable_params(classifier, config: TTTConfig):
     model = _get_ttt_base_model(classifier)
     model.train()
 
     for param in model.parameters():
         param.requires_grad = False
-
-    if config.adaptor_enabled:
-        if input_dim is None:
-            raise ValueError("TTT input adaptor requires input_dim")
-        adaptor = _install_ttt_adaptor(classifier, config, input_dim=input_dim)
-        if config.adaptor_train_backbone:
-            if config.freeze_col:
-                model.col_embedder.eval()
-            else:
-                model.col_embedder.train()
-                _set_requires_grad(model.col_embedder, True)
-
-            if config.freeze_row:
-                model.row_interactor.eval()
-            else:
-                model.row_interactor.train()
-                _set_requires_grad(model.row_interactor, True)
-
-            if config.freeze_icl:
-                model.icl_predictor.eval()
-            else:
-                model.icl_predictor.train()
-                _set_requires_grad(model.icl_predictor, True)
-        else:
-            model.col_embedder.train()
-            model.row_interactor.train()
-            model.icl_predictor.train()
-
-        adaptor.train()
-        _set_requires_grad(adaptor, True)
-        return [param for param in model.parameters() if param.requires_grad]
 
     if config.freeze_col:
         model.col_embedder.eval()
@@ -1343,30 +1099,17 @@ def _configure_ttt_trainable_params(classifier, config: TTTConfig, input_dim: in
     return [param for param in model.parameters() if param.requires_grad]
 
 
-def _set_ttt_train_mode(classifier, config: TTTConfig) -> None:
+def _set_ttt_train_mode(classifier) -> None:
     model = _get_ttt_base_model(classifier)
     model.train()
-    adaptor = _get_ttt_adaptor(classifier)
-    if adaptor is not None and not config.adaptor_train_backbone:
-        model.col_embedder.train()
-        model.row_interactor.train()
-        model.icl_predictor.train()
-        adaptor.train()
-        return
-    if config.freeze_col or not any(param.requires_grad for param in model.col_embedder.parameters()):
+    if not any(param.requires_grad for param in model.col_embedder.parameters()):
         model.col_embedder.eval()
-    else:
-        model.col_embedder.train()
-    if config.freeze_row:
+    if not any(param.requires_grad for param in model.row_interactor.parameters()):
         model.row_interactor.eval()
-    else:
-        model.row_interactor.train()
-    if config.freeze_icl or not any(param.requires_grad for param in model.icl_predictor.parameters()):
+    if not any(param.requires_grad for param in model.icl_predictor.parameters()):
         model.icl_predictor.eval()
     else:
         model.icl_predictor.train()
-    if adaptor is not None:
-        adaptor.train()
 
 
 def _fit_preserving_model_weights(classifier, X, y) -> None:
@@ -1470,6 +1213,8 @@ def _build_classification_meta_batch(
     query_size: int,
     epoch_seed: int,
     chunk_idx: int,
+    attention_scores_chunk=None,
+    use_attention_query: bool = False,
 ) -> MetaBatch:
     try:
         from tabicl._sklearn.preprocessing import EnsembleGenerator
@@ -1483,6 +1228,22 @@ def _build_classification_meta_batch(
     n_classes_in_chunk = int(np.max(y_chunk)) + 1
     query_size = max(int(query_size), n_classes_in_chunk)
     ctx_idx, qry_idx, split_strategy = _split_ctx_query(y_chunk, query_size=query_size, seed=split_seed)
+    target_query_size = int(len(qry_idx))
+    attention_shortfall = 0
+    query_mode = "chunk_b"
+    if use_attention_query:
+        attn_ctx_idx, attn_qry_idx, attn_reason, attention_shortfall = _select_attention_query_indices(
+            y_chunk,
+            attention_scores_chunk,
+            target_query_size,
+        )
+        if attn_ctx_idx is None or attn_qry_idx is None:
+            return MetaBatch(None, None, None, 0, attn_reason)
+        ctx_idx = attn_ctx_idx
+        qry_idx = attn_qry_idx
+        split_strategy = attn_reason
+        query_mode = "attention_d"
+
     y_ctx_raw = np.asarray(y_chunk)[ctx_idx].astype(int)
     y_qry_raw = np.asarray(y_chunk)[qry_idx].astype(int)
 
@@ -1541,6 +1302,9 @@ def _build_classification_meta_batch(
         y_train=torch.from_numpy(np.concatenate(y_train_list, axis=0)).float(),
         y_query=torch.from_numpy(np.stack(y_query_list, axis=0)).long(),
         train_size=int(len(ctx_idx)),
+        query_mode=query_mode,
+        target_query_size=target_query_size,
+        attention_shortfall=attention_shortfall,
         skip_reason=None,
     )
 
@@ -1552,6 +1316,8 @@ def iter_epoch_meta_batches(
     *,
     config: TTTConfig,
     epoch_seed: int,
+    attention_scores=None,
+    use_attention_query: bool = False,
 ) -> Iterator[MetaBatch]:
     rng = np.random.default_rng(epoch_seed)
     chunks = _chunk_indices(
@@ -1563,6 +1329,9 @@ def iter_epoch_meta_batches(
     for chunk_idx, indices in enumerate(chunks):
         X_chunk = X_encoded[indices]
         y_chunk = y_encoded[indices]
+        attention_scores_chunk = None
+        if use_attention_query and attention_scores is not None:
+            attention_scores_chunk = np.asarray(attention_scores, dtype=np.float64)[indices]
         query_size = max(1, int(len(indices) * config.query_ratio))
         yield _build_classification_meta_batch(
             classifier,
@@ -1572,6 +1341,417 @@ def iter_epoch_meta_batches(
             query_size=query_size,
             epoch_seed=epoch_seed,
             chunk_idx=chunk_idx,
+            attention_scores_chunk=attention_scores_chunk,
+            use_attention_query=use_attention_query,
+        )
+
+
+def _safe_module_attr(module, name: str):
+    try:
+        return getattr(module, name)
+    except Exception:
+        return None
+
+
+def _select_attention_query_indices(
+    y_chunk,
+    attention_scores_chunk,
+    target_query_size: int,
+) -> tuple[Any | None, Any | None, str, int]:
+    y_array = np.asarray(y_chunk).astype(int)
+    n_samples = int(len(y_array))
+    if n_samples < 2:
+        return None, None, "attention D selection needs at least two chunk samples", 0
+
+    target_query_size = max(1, min(int(target_query_size), n_samples - 1))
+    score_arr = np.asarray(attention_scores_chunk, dtype=np.float64)
+    if score_arr.shape != (n_samples,) or not np.isfinite(score_arr).any():
+        return None, None, "attention scores unavailable for chunk D selection", target_query_size
+
+    score_arr = np.nan_to_num(score_arr, nan=-np.inf, posinf=-np.inf, neginf=-np.inf)
+    order = np.lexsort((np.arange(n_samples), -score_arr))
+    remaining_by_label: Dict[int, int] = {}
+    for label in y_array.tolist():
+        label = int(label)
+        remaining_by_label[label] = remaining_by_label.get(label, 0) + 1
+
+    selected: list[int] = []
+    for idx in order:
+        idx = int(idx)
+        label = int(y_array[idx])
+        if remaining_by_label.get(label, 0) <= 1:
+            continue
+        selected.append(idx)
+        remaining_by_label[label] -= 1
+        if len(selected) >= target_query_size:
+            break
+
+    if not selected:
+        return None, None, "attention D selection produced empty query under label coverage", target_query_size
+
+    selected_arr = np.asarray(selected, dtype=int)
+    selected_mask = np.zeros(n_samples, dtype=bool)
+    selected_mask[selected_arr] = True
+    ctx_idx = np.where(~selected_mask)[0].astype(int)
+    shortfall = max(0, int(target_query_size) - int(len(selected_arr)))
+    reason = (
+        f"attention_d:target={target_query_size}:selected={len(selected_arr)}"
+        f":shortfall={shortfall}"
+    )
+    return ctx_idx, selected_arr, reason, shortfall
+
+
+def _select_attention_split_indices(
+    scores: Any,
+    y_candidates: Any,
+    *,
+    attention_mass: float,
+    min_query_ratio: float,
+    max_query_ratio: float,
+    random_state: int,
+) -> AttentionSplitSelection:
+    y_array = np.asarray(y_candidates)
+    n_samples = int(len(y_array))
+    if n_samples < 2:
+        return AttentionSplitSelection(
+            a_indices=np.arange(n_samples, dtype=int),
+            b_indices=np.asarray([], dtype=int),
+            scores=np.asarray(scores, dtype=float),
+            strategy="attention_top_cumulative_80_min20",
+            reason="Need at least two training candidates for attention split",
+        )
+
+    score_arr = np.asarray(scores, dtype=np.float64)
+    if score_arr.shape != (n_samples,) or not np.isfinite(score_arr).any() or float(np.nansum(score_arr)) <= 0.0:
+        rng = np.random.default_rng(random_state)
+        score_arr = rng.random(n_samples)
+        fallback_reason = "attention scores unavailable; deterministic random fallback"
+    else:
+        score_arr = np.nan_to_num(score_arr, nan=0.0, posinf=0.0, neginf=0.0)
+        fallback_reason = None
+
+    score_sum = float(score_arr.sum())
+    normalized_scores = score_arr / score_sum if score_sum > 0.0 else np.full(n_samples, 1.0 / n_samples)
+    order = np.lexsort((np.arange(n_samples), -normalized_scores))
+    cumulative = np.cumsum(normalized_scores[order])
+    mass_count = int(np.searchsorted(cumulative, float(attention_mass), side="left") + 1)
+    min_count = int(np.ceil(float(min_query_ratio) * n_samples))
+    max_count = max(1, int(np.floor(float(max_query_ratio) * n_samples)))
+    desired_count = min(max(1, mass_count, min_count), max_count, n_samples - 1)
+
+    selected_mask = np.zeros(n_samples, dtype=bool)
+    selected_mask[order[:desired_count]] = True
+
+    a_counts: Dict[Any, int] = {}
+    for label in y_array[~selected_mask].tolist():
+        a_counts[label] = a_counts.get(label, 0) + 1
+
+    moved_for_coverage = 0
+    selected_labels = set(y_array[selected_mask].tolist())
+    for label in sorted(selected_labels, key=lambda value: str(value)):
+        if a_counts.get(label, 0) > 0:
+            continue
+        label_selected = np.where(selected_mask & (y_array == label))[0]
+        if len(label_selected) == 0:
+            continue
+        move_idx = int(label_selected[np.argmin(normalized_scores[label_selected])])
+        selected_mask[move_idx] = False
+        a_counts[label] = a_counts.get(label, 0) + 1
+        moved_for_coverage += 1
+
+    if int(selected_mask.sum()) < desired_count:
+        for idx in order:
+            idx = int(idx)
+            if selected_mask[idx]:
+                continue
+            label = y_array[idx]
+            if a_counts.get(label, 0) <= 1:
+                continue
+            selected_mask[idx] = True
+            a_counts[label] -= 1
+            if int(selected_mask.sum()) >= desired_count:
+                break
+
+    if int(selected_mask.sum()) == 0:
+        for idx in order:
+            idx = int(idx)
+            label = y_array[idx]
+            if a_counts.get(label, 0) > 1:
+                selected_mask[idx] = True
+                a_counts[label] -= 1
+                break
+
+    b_indices = np.where(selected_mask)[0].astype(int)
+    a_indices = np.where(~selected_mask)[0].astype(int)
+    selected_mass = float(normalized_scores[b_indices].sum()) if len(b_indices) else 0.0
+    reason_parts = [
+        f"attention_mass={attention_mass:.2f}",
+        f"min_query_ratio={min_query_ratio:.2f}",
+        f"max_query_ratio={max_query_ratio:.2f}",
+        f"selected_mass={selected_mass:.6f}",
+        f"n_train_a={len(a_indices)}",
+        f"n_train_b={len(b_indices)}",
+    ]
+    if moved_for_coverage:
+        reason_parts.append(f"label_coverage_moves={moved_for_coverage}")
+    if fallback_reason:
+        reason_parts.append(fallback_reason)
+
+    return AttentionSplitSelection(
+        a_indices=a_indices,
+        b_indices=b_indices,
+        scores=normalized_scores,
+        strategy="attention_top_cumulative_80_min20",
+        reason=" | ".join(reason_parts),
+    )
+
+
+def _compute_last_icl_attention_scores(classifier, X_query, expected_train_size: int) -> Any:
+    import math
+    import torch
+    import torch.nn.functional as F
+
+    base_model = _get_ttt_base_model(classifier)
+    icl_blocks = _safe_module_attr(_safe_module_attr(base_model, "icl_predictor"), "tf_icl")
+    icl_blocks = _safe_module_attr(icl_blocks, "blocks")
+    if not icl_blocks:
+        return None
+
+    attn_module = _safe_module_attr(icl_blocks[-1], "attn")
+    if attn_module is None:
+        return None
+
+    score_sum = None
+    denom_sum = 0.0
+
+    def hook(module, args, kwargs):
+        nonlocal score_sum
+        nonlocal denom_sum
+
+        try:
+            if kwargs.get("cached_kv") is not None:
+                return None
+            if len(args) < 3 or args[1] is None or args[2] is None:
+                return None
+
+            query, key, value = args[:3]
+            if query.shape[-2] <= key.shape[-2]:
+                return None
+            if int(key.shape[-2]) != int(expected_train_size):
+                return None
+
+            *batch_shape, tgt_len, embed_dim = query.shape
+            src_len = key.shape[-2]
+            num_heads = int(module.num_heads)
+            head_dim = int(embed_dim) // num_heads
+            if head_dim * num_heads != int(embed_dim):
+                return None
+
+            bias = module.in_proj_bias
+            q_bias = bias[:embed_dim] if bias is not None else None
+            k_bias = bias[embed_dim : 2 * embed_dim] if bias is not None else None
+            q = F.linear(query, module.in_proj_weight[:embed_dim], q_bias)
+            k = F.linear(key, module.in_proj_weight[embed_dim : 2 * embed_dim], k_bias)
+            q = q.view(*batch_shape, tgt_len, num_heads, head_dim).transpose(-3, -2)
+            k = k.view(*batch_shape, src_len, num_heads, head_dim).transpose(-3, -2)
+
+            rope = kwargs.get("rope")
+            if rope is not None:
+                q = rope.rotate_queries_or_keys(q)
+                k = rope.rotate_queries_or_keys(k)
+
+            ssmax_layer = getattr(module, "ssmax_layer", None)
+            if ssmax_layer is not None:
+                q_shape = q.shape
+                q = q.reshape(-1, *q.shape[-3:])
+                q = ssmax_layer(q, src_len)
+                q = q.view(q_shape)
+
+            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(float(head_dim))
+            weights = torch.softmax(scores.float(), dim=-1)
+            test_weights = weights[..., src_len:, :]
+            if test_weights.shape[-2] == 0:
+                return None
+
+            reduce_dims = tuple(range(test_weights.ndim - 1))
+            source_sum = test_weights.sum(dim=reduce_dims).detach().double().cpu()
+            denom = 1
+            for dim in test_weights.shape[:-1]:
+                denom *= int(dim)
+            if score_sum is None:
+                score_sum = source_sum
+            else:
+                score_sum += source_sum
+            denom_sum += float(denom)
+        except Exception:
+            return None
+        return None
+
+    handle = attn_module.register_forward_pre_hook(hook, with_kwargs=True)
+    saved_cache = getattr(classifier, "model_kv_cache_", None)
+    try:
+        classifier.model_kv_cache_ = None
+        classifier.predict_proba(X_query)
+    finally:
+        handle.remove()
+        classifier.model_kv_cache_ = saved_cache
+
+    if score_sum is None or denom_sum <= 0.0:
+        return None
+    scores = (score_sum / denom_sum).numpy()
+    if scores.shape != (expected_train_size,):
+        return None
+    score_total = float(np.sum(scores))
+    if score_total <= 0.0 or not np.isfinite(score_total):
+        return None
+    return scores / score_total
+
+
+def select_attention_ttt_split(
+    classifier,
+    X_candidates,
+    y_candidates,
+    X_test,
+    config: TTTConfig,
+    *,
+    model_name: str,
+    dataset_name: str,
+) -> AttentionSplitSelection:
+    candidate_count = int(len(y_candidates))
+    if candidate_count < 2:
+        selection = _select_attention_split_indices(
+            np.zeros(candidate_count, dtype=float),
+            y_candidates,
+            attention_mass=config.attention_mass,
+            min_query_ratio=config.attention_min_query_ratio,
+            max_query_ratio=config.attention_max_query_ratio,
+            random_state=config.random_state,
+        )
+        print(
+            f"[ttt-attention-split] model={model_name} dataset={dataset_name} "
+            f"{selection.reason}",
+            flush=True,
+        )
+        return selection
+    classifier.fit(X_candidates, y_candidates)
+    scores = _compute_last_icl_attention_scores(classifier, X_test, candidate_count)
+    selection = _select_attention_split_indices(
+        scores if scores is not None else np.zeros(candidate_count, dtype=float),
+        y_candidates,
+        attention_mass=config.attention_mass,
+        min_query_ratio=config.attention_min_query_ratio,
+        max_query_ratio=config.attention_max_query_ratio,
+        random_state=config.random_state,
+    )
+    print(
+        f"[ttt-attention-split] model={model_name} dataset={dataset_name} "
+        f"{selection.reason}",
+        flush=True,
+    )
+    return selection
+
+
+def _build_attention_split_meta_batch(
+    classifier,
+    X_context,
+    y_context,
+    X_query,
+    y_query,
+    *,
+    config: TTTConfig,
+) -> MetaBatch:
+    try:
+        from tabicl._sklearn.preprocessing import EnsembleGenerator
+    except ImportError:
+        from tabicl.sklearn.preprocessing import EnsembleGenerator
+
+    if len(y_context) < 1 or len(y_query) < 1:
+        return MetaBatch(None, None, None, 0, "attention split batch is empty")
+
+    y_ctx_raw = np.asarray(y_context).astype(int)
+    y_qry_raw = np.asarray(y_query).astype(int)
+    missing_query_labels = sorted(set(y_qry_raw.tolist()) - set(y_ctx_raw.tolist()))
+    if missing_query_labels:
+        return MetaBatch(
+            None,
+            None,
+            None,
+            0,
+            "query labels absent from fixed attention context: "
+            f"{','.join(str(item) for item in missing_query_labels)}",
+        )
+
+    local_classes = np.asarray(sorted(set(y_ctx_raw.tolist())), dtype=np.int64)
+    local_label_map = {int(label): idx for idx, label in enumerate(local_classes.tolist())}
+    y_ctx = np.asarray([local_label_map[int(label)] for label in y_ctx_raw], dtype=np.int64)
+    y_qry = np.asarray([local_label_map[int(label)] for label in y_qry_raw], dtype=np.int64)
+
+    gen = EnsembleGenerator(
+        classification=True,
+        n_estimators=config.n_estimators_finetune,
+        norm_methods=getattr(classifier, "norm_methods", None),
+        feat_shuffle_method=getattr(classifier, "feat_shuffle_method", "latin"),
+        class_shuffle_method=getattr(classifier, "class_shuffle_method", "shift"),
+        outlier_threshold=getattr(classifier, "outlier_threshold", 4.0),
+        random_state=config.random_state,
+    )
+    gen.fit(X_context, y_ctx)
+    variants = gen.transform(X_query, mode="both")
+
+    X_list = []
+    y_train_list = []
+    y_query_list = []
+    for norm_method, (X_variant, y_variant) in variants.items():
+        X_list.append(X_variant)
+        y_train_list.append(y_variant)
+        shuffle_configs = gen.ensemble_configs_[norm_method]
+        if len(shuffle_configs) != X_variant.shape[0]:
+            raise RuntimeError(
+                f"Ensemble data/class shuffle mismatch for norm_method={norm_method!r}: "
+                f"{X_variant.shape[0]} views vs {len(shuffle_configs)} class shuffles"
+            )
+        for _feat_shuffle, class_shuffle in shuffle_configs:
+            if class_shuffle is None:
+                y_query_list.append(y_qry)
+            else:
+                y_query_list.append(np.asarray(class_shuffle, dtype=np.int64)[y_qry.astype(int)])
+
+    import torch
+
+    return MetaBatch(
+        X=torch.from_numpy(np.concatenate(X_list, axis=0)).float(),
+        y_train=torch.from_numpy(np.concatenate(y_train_list, axis=0)).float(),
+        y_query=torch.from_numpy(np.stack(y_query_list, axis=0)).long(),
+        train_size=int(len(y_ctx)),
+        skip_reason=None,
+    )
+
+
+def iter_attention_split_meta_batches(
+    classifier,
+    X_context,
+    y_context,
+    X_query,
+    y_query,
+    *,
+    config: TTTConfig,
+    epoch_seed: int,
+) -> Iterator[MetaBatch]:
+    rng = np.random.default_rng(epoch_seed)
+    chunks = _chunk_indices(
+        len(y_query),
+        max_chunk_size=config.max_chunk_size,
+        min_chunk_size=config.min_chunk_size,
+        rng=rng,
+    )
+    for indices in chunks:
+        yield _build_attention_split_meta_batch(
+            classifier,
+            X_context,
+            y_context,
+            X_query[indices],
+            y_query[indices],
+            config=config,
         )
 
 
@@ -1581,6 +1761,9 @@ def move_meta_batch(batch: MetaBatch, device) -> MetaBatch:
         y_train=batch.y_train.to(device, non_blocking=True),
         y_query=batch.y_query.to(device, non_blocking=True),
         train_size=batch.train_size,
+        query_mode=batch.query_mode,
+        target_query_size=batch.target_query_size,
+        attention_shortfall=batch.attention_shortfall,
         skip_reason=batch.skip_reason,
     )
 
@@ -1620,13 +1803,6 @@ def _save_ttt_model_ckpt(classifier, config: TTTConfig, model_name: str, dataset
             "model_name": str(model_name),
             "dataset_name": str(dataset_name),
             "step": int(step_idx),
-            "adaptor_enabled": bool(config.adaptor_enabled),
-            "adaptor_block": str(config.adaptor_block).lower() if config.adaptor_enabled else None,
-            "adaptor_target": ADAPTOR_TARGET if config.adaptor_enabled else None,
-            "adaptor_bottleneck": int(config.adaptor_bottleneck) if config.adaptor_enabled else 0,
-            "adaptor_dropout": float(config.adaptor_dropout) if config.adaptor_enabled else 0.0,
-            "adaptor_scale": float(config.adaptor_scale) if config.adaptor_enabled else 0.0,
-            "adaptor_train_backbone": bool(config.adaptor_train_backbone),
         },
     }
     torch.save(checkpoint, ckpt_path)
@@ -1655,8 +1831,48 @@ def _should_save_ttt_final_ckpt(config: TTTConfig, final_step: int) -> bool:
 def _derive_model_name(model_path: str | None, checkpoint_version: str | None) -> str:
     candidate = model_path if model_path else checkpoint_version
     if not candidate:
-        return "tabicl_model"
-    return Path(str(candidate)).stem
+        return "Tabicl"
+    stem = Path(str(candidate)).stem
+    if "tabicl" in stem.lower():
+        return "Tabicl"
+    return stem
+
+
+def _format_out_dir_param(value: Any) -> str:
+    if isinstance(value, float):
+        text = f"{value:g}"
+    else:
+        text = str(value)
+    return _sanitize_path_component(text)
+
+
+def build_auto_out_dir(args: argparse.Namespace) -> Path:
+    if args.models_dir:
+        model_component = f"models_{Path(args.models_dir).expanduser().name}"
+        if args.max_models is not None:
+            model_component += f"_n{int(args.max_models)}"
+    else:
+        model_path = normalize_model_path(args.model_path or DEFAULT_MODEL_PATH)
+        model_component = _derive_model_name(model_path, args.checkpoint_version)
+
+    model_component = _sanitize_path_component(model_component)
+    if not args.ttt_enabled:
+        method_component = f"no_ttt_ens{int(args.n_estimators)}"
+    else:
+        method_parts = [
+            "attention_final_d",
+            f"e{int(args.ttt_epochs)}",
+            f"chunk{int(args.ttt_max_chunk_size)}",
+            f"q{_format_out_dir_param(float(args.ttt_query_ratio))}",
+            f"last{int(args.ttt_attention_final_epochs)}",
+            f"lr{_format_out_dir_param(float(args.ttt_lr))}",
+            f"sched{_format_out_dir_param(args.ttt_scheduler)}",
+            f"ft{int(args.ttt_n_estimators_finetune)}",
+            f"ens{int(args.n_estimators)}",
+        ]
+        method_component = "_".join(method_parts)
+
+    return Path("1b_result") / f"{model_component}__{method_component}"
 
 
 def _build_ttt_lr_scheduler(optimizer, config: TTTConfig, total_steps: int):
@@ -1708,6 +1924,7 @@ def run_ttt_epoch_chunk_update(
     *,
     model_name: str,
     dataset_name: str,
+    X_attention_query=None,
 ) -> TTTUpdateResult:
     ensure_runtime_deps()
 
@@ -1746,19 +1963,36 @@ def run_ttt_epoch_chunk_update(
     import torch.nn.functional as F
 
     base_model = _get_ttt_base_model(classifier)
-    X_encoded = classifier.X_encoder_.transform(X_train)
-    y_encoded = classifier.y_encoder_.transform(y_train)
-    chunks_per_epoch = count_ttt_chunks(
-        int(len(y_encoded)),
-        max_chunk_size=config.max_chunk_size,
-        min_chunk_size=config.min_chunk_size,
-    )
-    trainable_params = _configure_ttt_trainable_params(
-        classifier,
-        config,
-        input_dim=int(X_encoded.shape[1]) if config.adaptor_enabled else None,
-    )
-    trainable_param_count = _count_trainable_params(trainable_params)
+    attention_final_epochs = min(max(0, int(config.attention_final_epochs)), int(config.epochs))
+    attention_start_epoch = int(config.epochs) - attention_final_epochs if attention_final_epochs > 0 else int(config.epochs)
+    attention_scores = None
+    attention_reason_parts: list[str] = []
+    if attention_final_epochs > 0:
+        attention_reason_parts.append(f"attention_train_d:last_epochs={attention_final_epochs}")
+        if X_attention_query is None or len(X_attention_query) == 0:
+            attention_reason_parts.append("attention_scores_unavailable:no_query")
+        else:
+            try:
+                attention_scores = _compute_last_icl_attention_scores(
+                    classifier,
+                    X_attention_query,
+                    int(len(y_train)),
+                )
+            except Exception as exc:
+                if is_oom_exception(exc):
+                    raise
+                attention_scores = None
+                attention_reason_parts.append(f"attention_scores_unavailable:{type(exc).__name__}")
+            if attention_scores is None and not any(
+                "attention_scores_unavailable" in part for part in attention_reason_parts
+            ):
+                attention_reason_parts.append("attention_scores_unavailable")
+            elif attention_scores is not None:
+                attention_reason_parts.append(f"attention_scores=available:start_epoch={attention_start_epoch + 1}")
+    else:
+        attention_reason_parts.append("attention_train_d:disabled")
+
+    trainable_params = _configure_ttt_trainable_params(classifier, config)
     if not trainable_params:
         return TTTUpdateResult(
             applied=False,
@@ -1768,17 +2002,367 @@ def run_ttt_epoch_chunk_update(
             reason="No trainable parameters selected for TTT",
             epochs=0,
             chunks_per_epoch=0,
-            adaptor_enabled=bool(config.adaptor_enabled),
-            adaptor_block=str(config.adaptor_block).lower() if config.adaptor_enabled else None,
-            adaptor_bottleneck=int(config.adaptor_bottleneck) if config.adaptor_enabled else 0,
-            adaptor_trainable_params=0,
-            adaptor_target=ADAPTOR_TARGET if config.adaptor_enabled else None,
         )
 
     optimizer = torch.optim.AdamW(trainable_params, lr=config.lr, weight_decay=config.weight_decay)
     forward_model, data_parallel_world_size = _build_ttt_forward_model(classifier, config)
     effective_micro_batch_size = config.micro_batch_size * data_parallel_world_size
 
+    X_encoded = classifier.X_encoder_.transform(X_train)
+    y_encoded = classifier.y_encoder_.transform(y_train)
+    chunks_per_epoch = count_ttt_chunks(
+        int(len(y_encoded)),
+        max_chunk_size=config.max_chunk_size,
+        min_chunk_size=config.min_chunk_size,
+    )
+    scheduler = _build_ttt_lr_scheduler(
+        optimizer,
+        config,
+        total_steps=max(1, config.epochs * chunks_per_epoch),
+    )
+
+    device = classifier.device_
+    use_amp, scaler, amp_ctx_factory = _make_ttt_amp(config, device)
+    if str(config.dtype).lower() != "float32":
+        print(
+            f"[ttt-amp] model={model_name} dataset={dataset_name} "
+            f"--ttt-dtype={config.dtype} is ignored; TTT AMP follows --use-amp "
+            f"and uses float16 autocast on CUDA. use_amp={use_amp}",
+            flush=True,
+        )
+
+    last_loss = None
+    update_steps = 0
+    skipped_batches = 0
+    skip_reasons: Dict[str, int] = {}
+    baseline_metric: Optional[float] = None
+    best_metric: Optional[float] = None
+    baseline_accuracy: Optional[float] = None
+    best_accuracy: Optional[float] = None
+    best_epoch = 0
+    best_state = None
+    patience_counter = 0
+    stopped_early = False
+    attention_batches = 0
+    attention_query_total = 0
+    attention_target_total = 0
+    attention_shortfall_total = 0
+
+    def attention_reason() -> Optional[str]:
+        if not attention_reason_parts:
+            return None
+        parts = list(attention_reason_parts)
+        if attention_scores is not None:
+            parts.append(f"attention_batches={attention_batches}")
+            parts.append(f"attention_query_total={attention_query_total}")
+            parts.append(f"attention_target_total={attention_target_total}")
+            parts.append(f"attention_shortfall_total={attention_shortfall_total}")
+        return " | ".join(parts)
+
+    try:
+        if X_encoded.shape[0] < 2 or chunks_per_epoch == 0:
+            return TTTUpdateResult(
+                applied=False,
+                loss=None,
+                steps=0,
+                update_seconds=time.time() - update_start,
+                reason="Need at least two encoded training samples for chunk TTT",
+                epochs=0,
+                chunks_per_epoch=chunks_per_epoch,
+            )
+
+        if config.early_stopping and X_val is not None and y_val is not None and len(y_val) > 0:
+            baseline_result = _evaluate_ttt_validation_metrics(classifier, X_train, y_train, X_val, y_val, config)
+            if baseline_result is not None:
+                baseline_metric = float(baseline_result.primary)
+                best_metric = float(baseline_result.primary)
+                baseline_accuracy = baseline_result.secondary.get("accuracy")
+                best_accuracy = baseline_accuracy
+                best_state = {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()}
+                print(
+                    f"[ttt-val] model={model_name} dataset={dataset_name} "
+                    f"baseline_{config.eval_metric}={best_metric:.6f}",
+                    flush=True,
+                )
+
+        last_saved_step = 0
+        for epoch_idx in range(config.epochs):
+            _set_ttt_train_mode(classifier)
+            epoch_seed = config.random_state + epoch_idx
+            epoch_loss_sum = 0.0
+            epoch_updates = 0
+            use_attention_epoch = attention_scores is not None and epoch_idx >= attention_start_epoch
+            epoch_query_mode = "attention_d" if use_attention_epoch else "chunk_b"
+            for batch in iter_epoch_meta_batches(
+                classifier,
+                X_encoded,
+                y_encoded,
+                config=config,
+                epoch_seed=epoch_seed,
+                attention_scores=attention_scores,
+                use_attention_query=use_attention_epoch,
+            ):
+                if batch.skip_reason:
+                    skipped_batches += 1
+                    skip_reasons[batch.skip_reason] = skip_reasons.get(batch.skip_reason, 0) + 1
+                    continue
+
+                if batch.query_mode == "attention_d":
+                    attention_batches += 1
+                    attention_query_total += int(batch.y_query.shape[-1])
+                    attention_target_total += int(batch.target_query_size)
+                    attention_shortfall_total += int(batch.attention_shortfall)
+
+                batch = move_meta_batch(batch, device)
+                optimizer.zero_grad(set_to_none=True)
+                batch_loss = 0.0
+                total_views = int(batch.X.shape[0])
+
+                for start_idx in range(0, total_views, effective_micro_batch_size):
+                    end_idx = min(start_idx + effective_micro_batch_size, total_views)
+                    X_batch = batch.X[start_idx:end_idx]
+                    y_train_batch = batch.y_train[start_idx:end_idx]
+                    y_query_batch = batch.y_query[start_idx:end_idx]
+                    with amp_ctx_factory():
+                        logits = forward_model(X_batch, y_train_batch.float())
+                        n_classes = int(y_train_batch.max().item()) + 1
+                        logits_used = logits[..., :n_classes].reshape(-1, n_classes)
+                        loss = F.cross_entropy(logits_used, y_query_batch.long().reshape(-1))
+                        scaled_loss = loss * (X_batch.shape[0] / total_views)
+
+                    scaler.scale(scaled_loss).backward()
+                    batch_loss += float(scaled_loss.detach().cpu())
+
+                if config.grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(trainable_params, config.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                update_steps += 1
+                epoch_updates += 1
+                epoch_loss_sum += batch_loss
+                last_loss = batch_loss
+                current_lr = scheduler.get_last_lr()[0]
+
+                if update_steps % 3 == 0:
+                    print(
+                        f"[ttt-loss] model={model_name} dataset={dataset_name} "
+                        f"epoch={epoch_idx + 1}/{config.epochs} step={update_steps} "
+                        f"query_mode={epoch_query_mode} loss={batch_loss:.6f} lr={current_lr:.2e}",
+                        flush=True,
+                    )
+                if _should_save_ttt_ckpt_step(config, update_steps):
+                    ckpt_path = _save_ttt_model_ckpt(classifier, config, model_name, dataset_name, update_steps)
+                    last_saved_step = update_steps
+                    print(
+                        f"[ttt-ckpt] saved model={model_name} dataset={dataset_name} "
+                        f"step={update_steps} path={ckpt_path}",
+                        flush=True,
+                    )
+
+            if epoch_updates > 0:
+                print(
+                    f"[ttt-loss] model={model_name} dataset={dataset_name} "
+                    f"epoch={epoch_idx + 1}/{config.epochs} "
+                    f"query_mode={epoch_query_mode} "
+                    f"mean_loss={epoch_loss_sum / epoch_updates:.6f} "
+                    f"updates={epoch_updates} lr={scheduler.get_last_lr()[0]:.2e}",
+                    flush=True,
+                )
+
+            if best_state is not None:
+                val_result = _evaluate_ttt_validation_metrics(classifier, X_train, y_train, X_val, y_val, config)
+                if val_result is not None:
+                    val_metric = float(val_result.primary)
+                    improved = _ttt_metric_improved(val_metric, best_metric, config.min_delta)
+                    if improved:
+                        best_metric = val_metric
+                        best_accuracy = val_result.secondary.get("accuracy")
+                        best_epoch = epoch_idx + 1
+                        patience_counter = 0
+                        best_state = {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()}
+                    elif _metric_is_valid(val_metric):
+                        patience_counter += 1
+                    print(
+                        f"[ttt-val] model={model_name} dataset={dataset_name} "
+                        f"epoch={epoch_idx + 1}/{config.epochs} "
+                        f"{config.eval_metric}={val_metric:.6f} best={best_metric:.6f} "
+                        f"patience={patience_counter}/{config.patience}",
+                        flush=True,
+                    )
+                    if patience_counter >= config.patience:
+                        can_stop = attention_scores is None or epoch_idx + 1 >= int(config.epochs)
+                        if not can_stop:
+                            print(
+                                f"[ttt-early-stop-deferred] model={model_name} dataset={dataset_name} "
+                                f"epoch={epoch_idx + 1} attention_start_epoch={attention_start_epoch + 1}",
+                                flush=True,
+                            )
+                            continue
+                        stopped_early = True
+                        print(
+                            f"[ttt-early-stop] model={model_name} dataset={dataset_name} "
+                            f"epoch={epoch_idx + 1} best_epoch={best_epoch} "
+                            f"best_{config.eval_metric}={best_metric:.6f}",
+                            flush=True,
+                        )
+                        break
+
+        if update_steps == 0:
+            reason = "No valid epoch chunks produced an optimizer update"
+            if skip_reasons:
+                top_reasons = sorted(skip_reasons.items(), key=lambda item: (-item[1], item[0]))[:3]
+                reason += "; skipped=" + "; ".join(f"{count}x {text}" for text, count in top_reasons)
+            attn_reason = attention_reason()
+            if attn_reason:
+                reason = append_ttt_reason(reason, attn_reason)
+            return TTTUpdateResult(
+                applied=False,
+                loss=None,
+                steps=0,
+                update_seconds=time.time() - update_start,
+                reason=reason,
+                epochs=config.epochs,
+                chunks_per_epoch=chunks_per_epoch,
+                val_eval_metric=config.eval_metric,
+                val_baseline_metric=baseline_metric,
+                val_best_metric=best_metric,
+                val_baseline_accuracy=baseline_accuracy,
+                val_best_accuracy=best_accuracy,
+                best_epoch=best_epoch,
+                stopped_early=stopped_early,
+            )
+
+        if best_state is not None:
+            base_model.load_state_dict(best_state)
+
+        if _should_save_ttt_final_ckpt(config, update_steps) and last_saved_step != update_steps:
+            ckpt_path = _save_ttt_model_ckpt(classifier, config, model_name, dataset_name, update_steps)
+            print(
+                f"[ttt-ckpt] saved model={model_name} dataset={dataset_name} "
+                f"step={update_steps} path={ckpt_path}",
+                flush=True,
+            )
+    finally:
+        if hasattr(base_model, "clear_cache"):
+            base_model.clear_cache()
+        classifier.model_kv_cache_ = None
+        base_model.eval()
+
+    return TTTUpdateResult(
+        applied=True,
+        loss=last_loss,
+        steps=update_steps,
+        update_seconds=time.time() - update_start,
+        reason=attention_reason(),
+        epochs=config.epochs,
+        chunks_per_epoch=chunks_per_epoch,
+        val_eval_metric=config.eval_metric,
+        val_baseline_metric=baseline_metric,
+        val_best_metric=best_metric,
+        val_baseline_accuracy=baseline_accuracy,
+        val_best_accuracy=best_accuracy,
+        best_epoch=best_epoch,
+        stopped_early=stopped_early,
+    )
+
+
+def run_ttt_attention_split_update(
+    classifier,
+    X_candidates,
+    y_candidates,
+    X_val,
+    y_val,
+    split_selection: AttentionSplitSelection,
+    config: TTTConfig,
+    *,
+    model_name: str,
+    dataset_name: str,
+) -> TTTUpdateResult:
+    ensure_runtime_deps()
+
+    if config.scheduler not in {"constant", "cosine_warmup"}:
+        raise ValueError("--ttt-scheduler must be one of: constant, cosine_warmup")
+    if config.epochs < 1:
+        return TTTUpdateResult(
+            applied=False,
+            loss=None,
+            steps=0,
+            update_seconds=0.0,
+            reason="--ttt-epochs must be >= 1",
+            epochs=0,
+            chunks_per_epoch=0,
+        )
+    if config.micro_batch_size < 1:
+        raise ValueError("--ttt-micro-batch-size must be >= 1")
+
+    update_start = time.time()
+    a_indices = np.asarray(split_selection.a_indices, dtype=int)
+    b_indices = np.asarray(split_selection.b_indices, dtype=int)
+    if len(a_indices) < 1 or len(b_indices) < 1:
+        return TTTUpdateResult(
+            applied=False,
+            loss=None,
+            steps=0,
+            update_seconds=time.time() - update_start,
+            reason=(
+                "Attention split did not produce a non-empty A/B split: "
+                f"n_train_a={len(a_indices)} n_train_b={len(b_indices)}"
+            ),
+            epochs=0,
+            chunks_per_epoch=0,
+        )
+
+    X_context_raw = take_rows(X_candidates, a_indices)
+    y_context_raw = np.asarray(y_candidates)[a_indices]
+    X_query_raw = take_rows(X_candidates, b_indices)
+    y_query_raw = np.asarray(y_candidates)[b_indices]
+
+    classifier.fit(X_context_raw, y_context_raw)
+    if classifier.n_classes_ > classifier.model_.max_classes:
+        return TTTUpdateResult(
+            applied=False,
+            loss=None,
+            steps=0,
+            update_seconds=time.time() - update_start,
+            reason=(
+                f"TTT training skipped because n_classes={classifier.n_classes_} "
+                f"exceeds model max_classes={classifier.model_.max_classes}"
+            ),
+            epochs=0,
+            chunks_per_epoch=0,
+        )
+
+    import torch
+    import torch.nn.functional as F
+
+    base_model = _get_ttt_base_model(classifier)
+    trainable_params = _configure_ttt_trainable_params(classifier, config)
+    if not trainable_params:
+        return TTTUpdateResult(
+            applied=False,
+            loss=None,
+            steps=0,
+            update_seconds=time.time() - update_start,
+            reason="No trainable parameters selected for TTT",
+            epochs=0,
+            chunks_per_epoch=0,
+        )
+
+    optimizer = torch.optim.AdamW(trainable_params, lr=config.lr, weight_decay=config.weight_decay)
+    forward_model, data_parallel_world_size = _build_ttt_forward_model(classifier, config)
+    effective_micro_batch_size = config.micro_batch_size * data_parallel_world_size
+
+    X_context = classifier.X_encoder_.transform(X_context_raw)
+    y_context = classifier.y_encoder_.transform(y_context_raw)
+    X_query = classifier.X_encoder_.transform(X_query_raw)
+    y_query = classifier.y_encoder_.transform(y_query_raw)
+    chunks_per_epoch = count_ttt_chunks(
+        int(len(y_query)),
+        max_chunk_size=config.max_chunk_size,
+        min_chunk_size=config.min_chunk_size,
+    )
     scheduler = _build_ttt_lr_scheduler(
         optimizer,
         config,
@@ -1808,19 +2392,29 @@ def run_ttt_epoch_chunk_update(
     patience_counter = 0
     stopped_early = False
     try:
-        if X_encoded.shape[0] < 2 or chunks_per_epoch == 0:
+        if X_context.shape[0] < 1 or X_query.shape[0] < 1 or chunks_per_epoch == 0:
             return TTTUpdateResult(
                 applied=False,
                 loss=None,
                 steps=0,
                 update_seconds=time.time() - update_start,
-                reason="Need at least two encoded training samples for chunk TTT",
+                reason=(
+                    "Need non-empty attention context/query samples for TTT: "
+                    f"n_train_a={X_context.shape[0]} n_train_b={X_query.shape[0]}"
+                ),
                 epochs=0,
                 chunks_per_epoch=chunks_per_epoch,
             )
 
         if config.early_stopping and X_val is not None and y_val is not None and len(y_val) > 0:
-            baseline_result = _evaluate_ttt_validation_metrics(classifier, X_train, y_train, X_val, y_val, config)
+            baseline_result = _evaluate_ttt_validation_metrics(
+                classifier,
+                X_context_raw,
+                y_context_raw,
+                X_val,
+                y_val,
+                config,
+            )
             if baseline_result is not None:
                 baseline_metric = float(baseline_result.primary)
                 best_metric = float(baseline_result.primary)
@@ -1835,14 +2429,16 @@ def run_ttt_epoch_chunk_update(
 
         last_saved_step = 0
         for epoch_idx in range(config.epochs):
-            _set_ttt_train_mode(classifier, config)
+            _set_ttt_train_mode(classifier)
             epoch_seed = config.random_state + epoch_idx
             epoch_loss_sum = 0.0
             epoch_updates = 0
-            for batch in iter_epoch_meta_batches(
+            for batch in iter_attention_split_meta_batches(
                 classifier,
-                X_encoded,
-                y_encoded,
+                X_context,
+                y_context,
+                X_query,
+                y_query,
                 config=config,
                 epoch_seed=epoch_seed,
             ):
@@ -1909,7 +2505,14 @@ def run_ttt_epoch_chunk_update(
                 )
 
             if best_state is not None:
-                val_result = _evaluate_ttt_validation_metrics(classifier, X_train, y_train, X_val, y_val, config)
+                val_result = _evaluate_ttt_validation_metrics(
+                    classifier,
+                    X_context_raw,
+                    y_context_raw,
+                    X_val,
+                    y_val,
+                    config,
+                )
                 if val_result is not None:
                     val_metric = float(val_result.primary)
                     improved = _ttt_metric_improved(val_metric, best_metric, config.min_delta)
@@ -1928,6 +2531,7 @@ def run_ttt_epoch_chunk_update(
                         f"patience={patience_counter}/{config.patience}",
                         flush=True,
                     )
+
                     if patience_counter >= config.patience:
                         stopped_early = True
                         print(
@@ -1939,7 +2543,7 @@ def run_ttt_epoch_chunk_update(
                         break
 
         if update_steps == 0:
-            reason = "No valid epoch chunks produced an optimizer update"
+            reason = "No valid attention split chunks produced an optimizer update"
             if skip_reasons:
                 top_reasons = sorted(skip_reasons.items(), key=lambda item: (-item[1], item[0]))[:3]
                 reason += "; skipped=" + "; ".join(f"{count}x {text}" for text, count in top_reasons)
@@ -1958,11 +2562,6 @@ def run_ttt_epoch_chunk_update(
                 val_best_accuracy=best_accuracy,
                 best_epoch=best_epoch,
                 stopped_early=stopped_early,
-                adaptor_enabled=bool(config.adaptor_enabled),
-                adaptor_block=str(config.adaptor_block).lower() if config.adaptor_enabled else None,
-                adaptor_bottleneck=int(config.adaptor_bottleneck) if config.adaptor_enabled else 0,
-                adaptor_trainable_params=trainable_param_count,
-                adaptor_target=ADAPTOR_TARGET if config.adaptor_enabled else None,
             )
 
         if best_state is not None:
@@ -1996,11 +2595,6 @@ def run_ttt_epoch_chunk_update(
         val_best_accuracy=best_accuracy,
         best_epoch=best_epoch,
         stopped_early=stopped_early,
-        adaptor_enabled=bool(config.adaptor_enabled),
-        adaptor_block=str(config.adaptor_block).lower() if config.adaptor_enabled else None,
-        adaptor_bottleneck=int(config.adaptor_bottleneck) if config.adaptor_enabled else 0,
-        adaptor_trainable_params=trainable_param_count,
-        adaptor_target=ADAPTOR_TARGET if config.adaptor_enabled else None,
     )
 
 
@@ -2023,12 +2617,6 @@ def build_model_summary_row(
     failed_df = result_df[result_df["status"] == "fail"].copy() if len(result_df) else pd.DataFrame()
     skipped_df = result_df[result_df["status"] == "skip"].copy() if len(result_df) else pd.DataFrame()
     oom_fallback_count = int(truthy_column_mask(ok_df, "ttt_oom_fallback").sum()) if len(ok_df) else 0
-    adaptor_enabled_count = int(truthy_column_mask(ok_df, "ttt_adaptor_enabled").sum()) if len(ok_df) else 0
-    adaptor_block_counts = format_adaptor_block_counts(
-        ok_df[truthy_column_mask(ok_df, "ttt_adaptor_enabled")].copy()
-        if len(ok_df)
-        else pd.DataFrame()
-    )
 
     avg_fit_seconds_ok = float(ok_df["fit_seconds"].mean()) if len(ok_df) else None
     avg_predict_seconds_ok = float(ok_df["predict_seconds"].mean()) if len(ok_df) else None
@@ -2067,9 +2655,6 @@ def build_model_summary_row(
             status="fail",
             error=error,
             failed_datasets=",".join(path.name for path in dataset_dirs),
-            ttt_adaptor_enabled_count=0,
-            ttt_adaptor_block_counts="(none)",
-            avg_ttt_adaptor_trainable_params_ok=None,
         )
 
     return ModelSummaryRow(
@@ -2106,15 +2691,6 @@ def build_model_summary_row(
         status="ok" if len(ok_df) else "fail",
         error=None if len(ok_df) else "No successful datasets processed",
         failed_datasets=failed_datasets,
-        ttt_adaptor_enabled_count=adaptor_enabled_count,
-        ttt_adaptor_block_counts=adaptor_block_counts,
-        avg_ttt_adaptor_trainable_params_ok=(
-            float(pd.to_numeric(ok_df["ttt_adaptor_trainable_params"], errors="coerce").mean())
-            if len(ok_df)
-            and "ttt_adaptor_trainable_params" in ok_df.columns
-            and pd.to_numeric(ok_df["ttt_adaptor_trainable_params"], errors="coerce").notna().any()
-            else None
-        ),
     )
 
 
@@ -2264,11 +2840,7 @@ def evaluate_one_dataset(
         ttt_stopped_early = False
         ttt_oom_fallback = False
         ttt_fallback_reason = None
-        ttt_adaptor_enabled = bool(ttt_config.enabled and ttt_config.adaptor_enabled)
-        ttt_adaptor_block = str(ttt_config.adaptor_block).lower() if ttt_adaptor_enabled else None
-        ttt_adaptor_bottleneck = int(ttt_config.adaptor_bottleneck) if ttt_adaptor_enabled else 0
-        ttt_adaptor_trainable_params = 0
-        ttt_adaptor_target = ADAPTOR_TARGET if ttt_adaptor_enabled else None
+        n_train_a = int(len(y_train))
         n_train_b = 0
         n_holdout_c = 0
 
@@ -2278,12 +2850,16 @@ def evaluate_one_dataset(
                 ttt_split_reason = "TTT skipped for dataset=volkert to avoid OOM"
                 classifier.fit(X_train, y_train)
             else:
-                ttt_split_strategy = "full_train_epoch_chunks"
+                n_holdout_c = 0
+                ttt_split_strategy = "full_train_epoch_chunks_attention_final_d"
                 ttt_split_reason = "full train set chunked per epoch"
                 if ttt_validation_reason:
-                    ttt_split_reason += f" | validation={ttt_validation_reason}"
+                    ttt_split_reason = append_ttt_reason(
+                        ttt_split_reason,
+                        f"validation={ttt_validation_reason}",
+                    )
+                n_train_a = int(len(y_train))
                 n_train_b = int(len(y_ttt_train))
-                n_holdout_c = 0
                 ttt_attempt_start = time.time()
                 try:
                     ttt_result = run_ttt_epoch_chunk_update(
@@ -2295,6 +2871,7 @@ def evaluate_one_dataset(
                         ttt_config,
                         model_name=model_name,
                         dataset_name=dataset_dir.name,
+                        X_attention_query=X_test,
                     )
                 except Exception as ttt_exc:
                     if not is_oom_exception(ttt_exc):
@@ -2312,7 +2889,7 @@ def evaluate_one_dataset(
                     ttt_loss = ttt_result.loss
                     ttt_steps = ttt_result.steps
                     ttt_applied = ttt_result.applied
-                    ttt_update_seconds = float(ttt_result.update_seconds)
+                    ttt_update_seconds = time.time() - ttt_attempt_start
                     ttt_epochs = ttt_result.epochs
                     ttt_chunks_per_epoch = ttt_result.chunks_per_epoch
                     ttt_batch_mode = ttt_result.batch_mode
@@ -2323,11 +2900,6 @@ def evaluate_one_dataset(
                     ttt_val_best_accuracy = ttt_result.val_best_accuracy
                     ttt_best_epoch = ttt_result.best_epoch
                     ttt_stopped_early = ttt_result.stopped_early
-                    ttt_adaptor_enabled = ttt_result.adaptor_enabled
-                    ttt_adaptor_block = ttt_result.adaptor_block
-                    ttt_adaptor_bottleneck = ttt_result.adaptor_bottleneck
-                    ttt_adaptor_trainable_params = ttt_result.adaptor_trainable_params
-                    ttt_adaptor_target = ttt_result.adaptor_target
                     if ttt_result.reason:
                         ttt_split_reason = append_ttt_reason(ttt_split_reason, ttt_result.reason)
 
@@ -2370,7 +2942,7 @@ def evaluate_one_dataset(
             predict_seconds=float(predict_seconds),
             status="ok",
             error=None,
-            n_train_a=int(len(y_train)),
+            n_train_a=n_train_a,
             n_train_b=n_train_b,
             n_holdout_c=n_holdout_c,
             n_test_d=int(len(y_test)),
@@ -2393,11 +2965,6 @@ def evaluate_one_dataset(
             ttt_stopped_early=ttt_stopped_early,
             ttt_oom_fallback=ttt_oom_fallback,
             ttt_fallback_reason=ttt_fallback_reason,
-            ttt_adaptor_enabled=ttt_adaptor_enabled,
-            ttt_adaptor_block=ttt_adaptor_block,
-            ttt_adaptor_bottleneck=ttt_adaptor_bottleneck,
-            ttt_adaptor_trainable_params=ttt_adaptor_trainable_params,
-            ttt_adaptor_target=ttt_adaptor_target,
         )
     except Exception as exc:
         return ResultRow(
@@ -2678,11 +3245,6 @@ def write_summary(
     for metric_column in ("accuracy", "f1", "balanced_accuracy", "roc_auc", "log_loss"):
         if metric_column in result_df.columns:
             result_df[metric_column] = pd.to_numeric(result_df[metric_column], errors="coerce")
-    if "ttt_adaptor_trainable_params" in result_df.columns:
-        result_df["ttt_adaptor_trainable_params"] = pd.to_numeric(
-            result_df["ttt_adaptor_trainable_params"],
-            errors="coerce",
-        )
 
     ok_df = result_df[result_df["status"] == "ok"].copy() if len(result_df) else pd.DataFrame()
     failed_df = result_df[result_df["status"] == "fail"].copy() if len(result_df) else pd.DataFrame()
@@ -2692,12 +3254,6 @@ def write_summary(
         if len(ok_df)
         else pd.DataFrame()
     )
-    adaptor_enabled_df = (
-        ok_df[truthy_column_mask(ok_df, "ttt_adaptor_enabled")].copy()
-        if len(ok_df)
-        else pd.DataFrame()
-    )
-    adaptor_block_counts = format_adaptor_block_counts(adaptor_enabled_df)
 
     def mean_line(label: str, column: str) -> str:
         if len(ok_df) and column in ok_df.columns and ok_df[column].notna().any():
@@ -2711,14 +3267,11 @@ def write_summary(
         f"failed_count: {len(failed_df)}",
         f"skipped_count: {len(skipped_df)}",
         f"ttt_oom_fallback_count: {len(oom_fallback_df)}",
-        f"ttt_adaptor_enabled_count: {len(adaptor_enabled_df)}",
-        f"ttt_adaptor_block_counts: {adaptor_block_counts}",
         mean_line("avg_accuracy_ok", "accuracy"),
         mean_line("avg_f1_ok", "f1"),
         mean_line("avg_balanced_accuracy_ok", "balanced_accuracy"),
         mean_line("avg_roc_auc_ok", "roc_auc"),
         mean_line("avg_log_loss_ok", "log_loss"),
-        mean_line("avg_ttt_adaptor_trainable_params_ok", "ttt_adaptor_trainable_params"),
         f"wall_seconds: {wall_seconds:.3f}",
     ]
 
@@ -2739,12 +3292,6 @@ def write_summary(
         lines.append(f"ttt_oom_fallback_datasets: {oom_fallback_names}")
     else:
         lines.append("ttt_oom_fallback_datasets: (none)")
-
-    if len(adaptor_enabled_df):
-        adaptor_names = ", ".join(adaptor_enabled_df["dataset_name"].astype(str).tolist())
-        lines.append(f"ttt_adaptor_enabled_datasets: {adaptor_names}")
-    else:
-        lines.append("ttt_adaptor_enabled_datasets: (none)")
 
     summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -2773,8 +3320,6 @@ def write_model_pool_outputs(
         "total_dataset_seconds_ok",
         "model_wall_seconds",
         "ttt_oom_fallback_count",
-        "ttt_adaptor_enabled_count",
-        "avg_ttt_adaptor_trainable_params_ok",
     ):
         if column in summary_df.columns:
             summary_df[column] = pd.to_numeric(summary_df[column], errors="coerce")
@@ -2784,11 +3329,6 @@ def write_model_pool_outputs(
 
     ok_df = summary_df[summary_df["status"] == "ok"].copy() if len(summary_df) else pd.DataFrame()
     failed_df = summary_df[summary_df["status"] == "fail"].copy() if len(summary_df) else pd.DataFrame()
-    adaptor_block_counts = (
-        format_adaptor_block_count_totals(ok_df["ttt_adaptor_block_counts"])
-        if len(ok_df) and "ttt_adaptor_block_counts" in ok_df.columns
-        else "(none)"
-    )
 
     def mean_line(label: str, column: str) -> str:
         if len(ok_df) and column in ok_df.columns and ok_df[column].notna().any():
@@ -2805,9 +3345,6 @@ def write_model_pool_outputs(
         mean_line("average_avg_balanced_accuracy_ok", "avg_balanced_accuracy_ok"),
         mean_line("average_avg_roc_auc_ok", "avg_roc_auc_ok"),
         mean_line("average_avg_log_loss_ok", "avg_log_loss_ok"),
-        mean_line("average_ttt_adaptor_enabled_count", "ttt_adaptor_enabled_count"),
-        f"ttt_adaptor_block_counts: {adaptor_block_counts}",
-        mean_line("average_ttt_adaptor_trainable_params_ok", "avg_ttt_adaptor_trainable_params_ok"),
         f"global_wall_seconds: {wall_seconds:.3f}",
     ]
 
@@ -2826,18 +3363,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Run TabICLv2 classification benchmarks on data178 with "
-            "epoch-shuffled chunk TTT, optional row-level residual adaptors, "
-            "and AMD/ROCm multi-GPU workers."
+            "attention-selected query TTT and AMD/ROCm multi-GPU workers."
         )
     )
     parser.add_argument("--data-root", default=str(DEFAULT_DATA_ROOT))
     parser.add_argument("--model-path", default=None)
     parser.add_argument("--models-dir", default=None)
     parser.add_argument("--checkpoint-version", default=DEFAULT_CHECKPOINT_VERSION)
-    parser.add_argument("--out-dir", default="1b_result/adaptor_dcnv2_full_chunk10000_accuracy")
-    parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument(
+        "--out-dir",
+        default=None,
+        help=(
+            "Output directory. Defaults to an auto-generated name under 1b_result/ "
+            "based on model, method, and key TTT parameters."
+        ),
+    )
+    parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--gpus", default=None)
-    parser.add_argument("--gpu-groups", default="0,1")
+    parser.add_argument("--gpu-groups", default="1")
     parser.add_argument("--n-estimators", type=int, default=32)
     parser.add_argument("--batch-size", type=parse_optional_int, default=8)
     parser.add_argument("--kv-cache", type=parse_kv_cache, default=False)
@@ -2845,7 +3388,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use-fa3", type=parse_auto_bool, default="auto")
     parser.add_argument("--offload-mode", choices=["auto", "gpu", "cpu", "disk"], default="auto")
     parser.add_argument("--random-state", type=int, default=42)
-    parser.add_argument("--max-datasets", type=int, default=40)
+    parser.add_argument("--max-datasets", type=int, default=None)
     parser.add_argument("--max-models", type=int, default=None)
     parser.add_argument("--prefetch-models", type=int, default=4)
     parser.add_argument(
@@ -2888,37 +3431,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ttt-max-chunk-size", type=int, default=10000)
     parser.add_argument("--ttt-min-chunk-size", type=int, default=50)
     parser.add_argument("--ttt-query-ratio", type=float, default=0.2)
-    parser.add_argument("--ttt-n-estimators-finetune", type=int, default=32)
+    parser.add_argument(
+        "--ttt-attention-final-epochs",
+        type=int,
+        default=3,
+        help=(
+            "Use train-set attention-selected D query samples for the final N TTT epochs. "
+            "Set 0 to keep ordinary 1C chunk query sampling for all epochs."
+        ),
+    )
+    parser.add_argument("--ttt-attention-mass", type=float, default=0.85)
+    parser.add_argument("--ttt-attention-min-query-ratio", type=float, default=0.2)
+    parser.add_argument("--ttt-attention-max-query-ratio", type=float, default=0.5)
+    parser.add_argument("--ttt-n-estimators-finetune", type=int, default=2)
     parser.add_argument("--ttt-early-stopping", type=parse_bool, default=True)
     parser.add_argument("--ttt-patience", type=int, default=8)
     parser.add_argument("--ttt-min-delta", type=float, default=1e-4)
     parser.add_argument("--ttt-eval-metric", choices=["roc_auc", "log_loss", "accuracy"], default="accuracy")
     parser.add_argument("--ttt-validation-fraction", type=float, default=0.1)
-    parser.add_argument("--ttt-validation-n-estimators", type=int, default=32)
+    parser.add_argument("--ttt-validation-n-estimators", type=int, default=2)
     parser.add_argument("--ttt-freeze-col", type=parse_bool, default=False)
     parser.add_argument("--ttt-freeze-row", type=parse_bool, default=False)
     parser.add_argument("--ttt-freeze-icl", type=parse_bool, default=False)
-    parser.add_argument(
-        "--ttt-adaptor",
-        type=parse_bool,
-        default=True,
-        help="Enable a row-representation residual adaptor during the TTT update path.",
-    )
-    parser.add_argument(
-        "--ttt-adaptor-block",
-        choices=["mlp", "dcnv2"],
-        default="dcnv2",
-        help="Adaptor block type. mlp keeps the legacy bottleneck residual adaptor; dcnv2 uses a low-rank cross block.",
-    )
-    parser.add_argument("--ttt-adaptor-bottleneck", type=int, default=64)
-    parser.add_argument("--ttt-adaptor-dropout", type=float, default=0.0)
-    parser.add_argument("--ttt-adaptor-scale", type=float, default=1.0)
-    parser.add_argument(
-        "--ttt-adaptor-train-backbone",
-        type=parse_bool,
-        default=False,
-        help="When the adaptor is enabled, also train the selected TabICL backbone modules.",
-    )
     parser.add_argument(
         "--ttt-save-ckpt",
         type=parse_bool,
@@ -3273,6 +3807,10 @@ def main() -> None:
         raise FileNotFoundError(f"Data root does not exist: {data_root}")
     if not data_root.is_dir():
         raise NotADirectoryError(f"Data root is not a directory: {data_root}")
+
+    if args.out_dir is None:
+        args.out_dir = str(build_auto_out_dir(args))
+        print(f"auto_out_dir: {args.out_dir}")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

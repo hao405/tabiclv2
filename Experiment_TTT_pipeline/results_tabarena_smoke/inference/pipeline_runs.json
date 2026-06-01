@@ -1,0 +1,13 @@
+[
+  {
+    "model_key": "tabpfnv25",
+    "display_name": "TabPFN v2.5",
+    "strategy": "inference",
+    "status": "ok",
+    "returncode": 0,
+    "command": "/data0/zhuhao2025/.conda/envs/pipeline/bin/python /data0/zhuhao2025/tabiclv2_test/baseline_compare/TabPFN-main/benchmark_infer.py --data-root /data0/zhuhao2025/tabiclv2_test/data_tabarena --out-dir /data0/zhuhao2025/tabiclv2_test/Experiment_TTT_pipeline/results_tabarena_smoke/inference/tabpfnv25 --workers 1 --max-datasets 1 --random-state 42 --verbose --gpus 0 --model-version v2.5",
+    "out_dir": "/data0/zhuhao2025/tabiclv2_test/Experiment_TTT_pipeline/results_tabarena_smoke/inference/tabpfnv25",
+    "elapsed_seconds": 29.024150133132935,
+    "error": null
+  }
+]

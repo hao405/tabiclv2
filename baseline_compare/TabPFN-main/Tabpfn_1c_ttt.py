@@ -89,7 +89,7 @@ import pandas as pd
 
 CLASSIFICATION_TASKS = {"binclass", "multiclass"}
 CATEGORICAL_MISSING_TOKEN = "__tabicl_missing__"
-DEFAULT_MODEL_VERSION = "v3"
+DEFAULT_MODEL_VERSION = "v2.5"
 TABPFN_CLASS_LIMIT = 10
 V3_BINARY_CLASSIFIER_FILE = "tabpfn-v3-classifier-v3_20260417_binary.ckpt"
 V3_MULTICLASS_CLASSIFIER_FILE = "tabpfn-v3-classifier-v3_20260417_multiclass.ckpt"
@@ -1792,13 +1792,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--out-dir",
-        default="pfn_results/tabpfnv3_1c_ttt_epoch30_chunk2000_lr5e-6",
+        default="pfn_results/tabpfnv2.5_1c_ttt_epoch30_chunk2000_lr1e-5_all_estimators8",
         help="Directory for worker CSVs, all_classification_results.csv, and summary.txt.",
     )
-    parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument("--workers", type=int, default=1)
     parser.add_argument(
         "--gpus",
-        default="2,3",
+        default="1",
         help="Comma-separated physical GPU ids, or 'auto' to use detected GPUs.",
     )
     parser.add_argument("--max-datasets", type=int, default=None)
@@ -1875,15 +1875,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ttt-epochs", type=int, default=30)
     parser.add_argument("--ttt-max-chunk-size", type=int, default=2000)
     parser.add_argument("--ttt-query-ratio", type=float, default=0.2)
-    parser.add_argument("--ttt-lr", type=float, default=5e-6)
+    parser.add_argument("--ttt-lr", type=float, default=1e-5)
     parser.add_argument("--ttt-weight-decay", type=float, default=0.01)
     parser.add_argument("--ttt-grad-clip", type=float, default=1.0)
     parser.add_argument("--ttt-patience", type=int, default=8)
     parser.add_argument("--ttt-min-delta", type=float, default=1e-4)
     parser.add_argument("--ttt-eval-metric", choices=["roc_auc", "log_loss"], default="roc_auc")
     parser.add_argument("--ttt-validation-fraction", type=float, default=0.1)
-    parser.add_argument("--ttt-n-estimators-finetune", type=int, default=8)
-    parser.add_argument("--ttt-validation-n-estimators", type=int, default=8)
+    parser.add_argument("--ttt-n-estimators-finetune", type=int, default=2)
+    parser.add_argument("--ttt-validation-n-estimators", type=int, default=2)
     parser.add_argument(
         "--ttt-lr-scheduler",
         action=argparse.BooleanOptionalAction,

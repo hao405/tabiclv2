@@ -25,8 +25,8 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 DEFAULT_DATA_ROOT = Path("data178")
-DEFAULT_MODEL_PATH = "tabicl-classifier-v2-20260212.ckpt"
-DEFAULT_CHECKPOINT_VERSION = "tabicl-classifier-v2-20260212.ckpt"
+DEFAULT_MODEL_PATH = "tabicl-classifier-v1.1-20250506.ckpt"
+DEFAULT_CHECKPOINT_VERSION = "tabicl-classifier-v1.1-20250506.ckpt"
 CLASSIFICATION_TASKS = {"binclass", "multiclass"}
 CATEGORICAL_MISSING_TOKEN = "__tabicl_missing__"
 
@@ -2455,7 +2455,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-path", default=None)
     parser.add_argument("--models-dir", default=None)
     parser.add_argument("--checkpoint-version", default=DEFAULT_CHECKPOINT_VERSION)
-    parser.add_argument("--out-dir", default="1b_result/iclv2_ttt_chunk8000")
+    parser.add_argument("--out-dir", default="1b_result/iclv1.1_ttt_default")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--gpus", default=None)
     parser.add_argument("--gpu-groups", default="3")
@@ -2506,14 +2506,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=30,
         help="Number of epoch-shuffled chunk TTT passes. --ttt-steps is kept as a compatibility alias.",
     )
-    parser.add_argument("--ttt-max-chunk-size", type=int, default=8000)
+    parser.add_argument("--ttt-max-chunk-size", type=int, default=10000)
     parser.add_argument("--ttt-min-chunk-size", type=int, default=50)
     parser.add_argument("--ttt-query-ratio", type=float, default=0.2)
     parser.add_argument("--ttt-n-estimators-finetune", type=int, default=2)
     parser.add_argument("--ttt-early-stopping", type=parse_bool, default=True)
     parser.add_argument("--ttt-patience", type=int, default=8)
     parser.add_argument("--ttt-min-delta", type=float, default=1e-4)
-    parser.add_argument("--ttt-eval-metric", choices=["roc_auc", "log_loss", "accuracy"], default="roc_auc")
+    parser.add_argument("--ttt-eval-metric", choices=["roc_auc", "log_loss", "accuracy"], default="accuracy")
     parser.add_argument("--ttt-validation-fraction", type=float, default=0.1)
     parser.add_argument("--ttt-validation-n-estimators", type=int, default=2)
     parser.add_argument("--ttt-freeze-col", type=parse_bool, default=False)
