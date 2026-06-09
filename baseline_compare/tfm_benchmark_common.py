@@ -367,10 +367,21 @@ def write_summary(summary_path: Path, result_df: Any, dataset_dirs: list[Path], 
     summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def use_rocm_gpu_visibility() -> bool:
+    backend = (os.environ.get("TFM_GPU_BACKEND") or os.environ.get("TABICL_GPU_BACKEND") or "").strip().lower()
+    return backend in {"rocm", "hip", "amd"}
+
+
 def bind_worker_gpu(gpu_id: int) -> None:
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    os.environ["ROCR_VISIBLE_DEVICES"] = str(gpu_id)
-    os.environ.pop("HIP_VISIBLE_DEVICES", None)
+    gpu_id_str = str(gpu_id)
+    if use_rocm_gpu_visibility():
+        os.environ["ROCR_VISIBLE_DEVICES"] = gpu_id_str
+        os.environ["HIP_VISIBLE_DEVICES"] = gpu_id_str
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+    else:
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id_str
+        os.environ.pop("ROCR_VISIBLE_DEVICES", None)
+        os.environ.pop("HIP_VISIBLE_DEVICES", None)
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
 

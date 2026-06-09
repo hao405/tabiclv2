@@ -1,0 +1,79 @@
+[
+  {
+    "model_key": "tabicl",
+    "display_name": "TabICL",
+    "strategy": "inference",
+    "status": "ok",
+    "returncode": 0,
+    "command": "/home/crc00006699/anaconda3/envs/tabicl/bin/python /home/crc00006699/zh/tabiclv2/benchmark.py --data-root /home/crc00006699/zh/tabiclv2/Experiment_TTT_pipeline/generated/data200_minus_data172 --out-dir /home/crc00006699/zh/tabiclv2/baseline_compare/compare_results_data200_minus_data172/inference/tabicl --workers 2 --random-state 42 --gpus 2,3",
+    "out_dir": "/home/crc00006699/zh/tabiclv2/baseline_compare/compare_results_data200_minus_data172/inference/tabicl",
+    "elapsed_seconds": 195.6694996356964,
+    "error": null
+  },
+  {
+    "model_key": "tabpfnv2",
+    "display_name": "TabPFN v2",
+    "strategy": "inference",
+    "status": "ok",
+    "returncode": 0,
+    "command": "/home/crc00006699/anaconda3/envs/tabicl/bin/python /home/crc00006699/zh/tabiclv2/baseline_compare/TabPFN-main/benchmark_infer.py --data-root /home/crc00006699/zh/tabiclv2/Experiment_TTT_pipeline/generated/data200_minus_data172 --out-dir /home/crc00006699/zh/tabiclv2/baseline_compare/compare_results_data200_minus_data172/inference/tabpfnv2 --workers 2 --random-state 42 --gpus 2,3 --model-version v2",
+    "out_dir": "/home/crc00006699/zh/tabiclv2/baseline_compare/compare_results_data200_minus_data172/inference/tabpfnv2",
+    "elapsed_seconds": 209.06627988815308,
+    "error": null
+  },
+  {
+    "model_key": "tabpfnv25",
+    "display_name": "TabPFN v2.5",
+    "strategy": "inference",
+    "status": "ok",
+    "returncode": 0,
+    "command": "/home/crc00006699/anaconda3/envs/tabicl/bin/python /home/crc00006699/zh/tabiclv2/baseline_compare/TabPFN-main/benchmark_infer.py --data-root /home/crc00006699/zh/tabiclv2/Experiment_TTT_pipeline/generated/data200_minus_data172 --out-dir /home/crc00006699/zh/tabiclv2/baseline_compare/compare_results_data200_minus_data172/inference/tabpfnv25 --workers 2 --random-state 42 --gpus 2,3 --model-version v2.5",
+    "out_dir": "/home/crc00006699/zh/tabiclv2/baseline_compare/compare_results_data200_minus_data172/inference/tabpfnv25",
+    "elapsed_seconds": 212.21532607078552,
+    "error": null
+  },
+  {
+    "model_key": "tabpfnv3",
+    "display_name": "TabPFN v3",
+    "strategy": "inference",
+    "status": "ok",
+    "returncode": 0,
+    "command": "/home/crc00006699/anaconda3/envs/tabicl/bin/python /home/crc00006699/zh/tabiclv2/baseline_compare/TabPFN-main/benchmark_infer.py --data-root /home/crc00006699/zh/tabiclv2/Experiment_TTT_pipeline/generated/data200_minus_data172 --out-dir /home/crc00006699/zh/tabiclv2/baseline_compare/compare_results_data200_minus_data172/inference/tabpfnv3 --workers 2 --random-state 42 --gpus 2,3 --model-version v3",
+    "out_dir": "/home/crc00006699/zh/tabiclv2/baseline_compare/compare_results_data200_minus_data172/inference/tabpfnv3",
+    "elapsed_seconds": 77.70733213424683,
+    "error": null
+  },
+  {
+    "model_key": "limix",
+    "display_name": "LimiX",
+    "strategy": "inference",
+    "status": "ok",
+    "returncode": 0,
+    "command": "/home/crc00006699/anaconda3/envs/tabicl/bin/python /home/crc00006699/zh/tabiclv2/baseline_compare/LimiX/benchmark_infer.py --data-root /home/crc00006699/zh/tabiclv2/Experiment_TTT_pipeline/generated/data200_minus_data172 --out-dir /home/crc00006699/zh/tabiclv2/baseline_compare/compare_results_data200_minus_data172/inference/limix --workers 2 --random-state 42 --gpus 2,3",
+    "out_dir": "/home/crc00006699/zh/tabiclv2/baseline_compare/compare_results_data200_minus_data172/inference/limix",
+    "elapsed_seconds": 6947.190692663193,
+    "error": null
+  },
+  {
+    "model_key": "tabr",
+    "display_name": "TaBR",
+    "strategy": "inference",
+    "status": "ok",
+    "returncode": 0,
+    "command": "/home/crc00006699/anaconda3/envs/tabicl/bin/python /home/crc00006699/zh/tabiclv2/baseline_compare/tabular-dl-tabr/benchmark_infer.py --data-root /home/crc00006699/zh/tabiclv2/Experiment_TTT_pipeline/generated/data200_minus_data172 --out-dir /home/crc00006699/zh/tabiclv2/baseline_compare/compare_results_data200_minus_data172/inference/tabr --workers 2 --random-state 42 --gpus 2,3",
+    "out_dir": "/home/crc00006699/zh/tabiclv2/baseline_compare/compare_results_data200_minus_data172/inference/tabr",
+    "elapsed_seconds": 87.76847267150879,
+    "error": null
+  },
+  {
+    "model_key": "orion_msp",
+    "display_name": "Orion-MSP",
+    "strategy": "inference",
+    "status": "ok",
+    "returncode": 0,
+    "command": "/home/crc00006699/anaconda3/envs/tabicl/bin/python /home/crc00006699/zh/tabiclv2/baseline_compare/Orion-MSP/benchmark_infer.py --data-root /home/crc00006699/zh/tabiclv2/Experiment_TTT_pipeline/generated/data200_minus_data172 --out-dir /home/crc00006699/zh/tabiclv2/baseline_compare/compare_results_data200_minus_data172/inference/orion_msp --workers 2 --random-state 42 --gpus 2,3",
+    "out_dir": "/home/crc00006699/zh/tabiclv2/baseline_compare/compare_results_data200_minus_data172/inference/orion_msp",
+    "elapsed_seconds": 248.31828355789185,
+    "error": null
+  }
+]

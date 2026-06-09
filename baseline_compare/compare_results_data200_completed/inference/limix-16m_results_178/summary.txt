@@ -1,0 +1,18 @@
+strategy: inference
+model_key: limix
+reference_dir: limix-16m_results_178
+merge_mode: full_data200
+discovered_datasets: 200
+processed_datasets: 200
+ok_count: 191
+failed_count: 9
+skipped_count: 0
+avg_accuracy_ok: 0.845252
+avg_f1_ok: 0.835617
+avg_balanced_accuracy_ok: 0.768198
+avg_roc_auc_ok: 0.901015
+avg_log_loss_ok: 0.522064
+avg_fit_seconds_ok: 0.000000
+avg_predict_seconds_ok: 48.013108
+failed_datasets: Cardiovascular-Disease-dataset, Credit_c, Rain_in_Australia, SDSS17, accelerometer, connect-4, customer_satisfaction_in_airline, dabetes_130-us_hospitals, walking-activity
+skipped_datasets: (none)

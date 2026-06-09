@@ -207,7 +207,7 @@ def main() -> None:
     parser.add_argument(
         "--results-dir",
         type=Path,
-        default=Path("baseline_compare/compare_results"),
+        default=Path("baseline_compare/results"),
         help="Directory containing method subdirectories with all_classification_results.csv.",
     )
     parser.add_argument(

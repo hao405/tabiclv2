@@ -9,6 +9,7 @@ import importlib.util
 import json
 import multiprocessing as mp
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -19,11 +20,15 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+BASELINE_COMPARE_ROOT = SCRIPT_DIR.parent
+if str(BASELINE_COMPARE_ROOT) not in sys.path:
+    sys.path.insert(0, str(BASELINE_COMPARE_ROOT))
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import numpy as np
 import pandas as pd
+import result_naming
 
 CLASSIFICATION_TASKS = {"binclass", "multiclass"}
 CATEGORICAL_MISSING_TOKEN = "__tabicl_missing__"
@@ -959,6 +964,93 @@ def _evaluate_one_dataset_child(
     result_queue.put(asdict(row))
 
 
+def terminate_subprocess_group(
+    process: subprocess.Popen[Any],
+    *,
+    grace_seconds: float = 30.0,
+    reason: str,
+) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        pgid = os.getpgid(int(process.pid))
+    except ProcessLookupError:
+        return
+    print(
+        f"[limix] terminating subprocess group pgid={pgid} reason={reason}",
+        file=sys.stderr,
+        flush=True,
+    )
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=max(0.0, float(grace_seconds)))
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    print(
+        f"[limix] subprocess group pgid={pgid} did not exit after "
+        f"{grace_seconds:.1f}s; sending SIGKILL",
+        file=sys.stderr,
+        flush=True,
+    )
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=max(1.0, float(grace_seconds)))
+    except subprocess.TimeoutExpired:
+        print(
+            f"[limix] warning: subprocess group pgid={pgid} survived SIGKILL. "
+            "If nvidia-smi shows No Such Process with GPU memory still used, "
+            "the remaining allocation is likely a stale CUDA driver context.",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def terminate_mp_processes(
+    processes: Iterable[mp.Process],
+    *,
+    grace_seconds: float = 30.0,
+    reason: str,
+) -> None:
+    alive = [proc for proc in processes if proc.is_alive()]
+    if not alive:
+        return
+    print(
+        f"[limix] terminating {len(alive)} multiprocessing worker(s) reason={reason}",
+        file=sys.stderr,
+        flush=True,
+    )
+    for proc in alive:
+        proc.terminate()
+    deadline = time.time() + max(0.0, float(grace_seconds))
+    for proc in alive:
+        remaining = max(0.0, deadline - time.time())
+        proc.join(timeout=remaining)
+    stubborn = [proc for proc in alive if proc.is_alive()]
+    if not stubborn:
+        return
+    print(
+        f"[limix] {len(stubborn)} worker(s) did not exit after "
+        f"{grace_seconds:.1f}s; killing",
+        file=sys.stderr,
+        flush=True,
+    )
+    for proc in stubborn:
+        try:
+            proc.kill()
+        except AttributeError:
+            if proc.pid is not None:
+                os.kill(int(proc.pid), signal.SIGKILL)
+    for proc in stubborn:
+        proc.join(timeout=max(1.0, float(grace_seconds)))
+
+
 def evaluate_one_dataset_in_fresh_process(
     dataset_dir: Path,
     gpu_id: int,
@@ -974,13 +1066,20 @@ def evaluate_one_dataset_in_fresh_process(
         daemon=False,
     )
     proc.start()
-    proc.join()
-
     row_dict: dict[str, Any] | None = None
-    if not result_queue.empty():
-        row_dict = result_queue.get()
-    result_queue.close()
-    result_queue.join_thread()
+    try:
+        proc.join()
+    except BaseException:
+        terminate_mp_processes(
+            [proc],
+            reason=f"interrupted child dataset retry for {dataset_dir.name}",
+        )
+        raise
+    finally:
+        if not result_queue.empty():
+            row_dict = result_queue.get()
+        result_queue.close()
+        result_queue.join_thread()
 
     if row_dict is None:
         return worker_crash_row(
@@ -1238,19 +1337,35 @@ def resolve_workers_and_gpu_ids(args: argparse.Namespace) -> tuple[int, list[int
     return workers, gpu_ids
 
 
+def use_rocm_gpu_visibility() -> bool:
+    backend = (os.environ.get("TFM_GPU_BACKEND") or os.environ.get("TABICL_GPU_BACKEND") or "").strip().lower()
+    return backend in {"rocm", "hip", "amd"}
+
+
 def bind_worker_gpu(gpu_id: int) -> None:
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    os.environ["ROCR_VISIBLE_DEVICES"] = str(gpu_id)
-    os.environ.pop("HIP_VISIBLE_DEVICES", None)
+    gpu_id_str = str(gpu_id)
+    if use_rocm_gpu_visibility():
+        os.environ["ROCR_VISIBLE_DEVICES"] = gpu_id_str
+        os.environ["HIP_VISIBLE_DEVICES"] = gpu_id_str
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+    else:
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id_str
+        os.environ.pop("ROCR_VISIBLE_DEVICES", None)
+        os.environ.pop("HIP_VISIBLE_DEVICES", None)
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 
 def bind_ddp_gpu_group(gpu_ids: list[int]) -> None:
     visible_devices = ",".join(str(gpu_id) for gpu_id in gpu_ids)
-    os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
-    os.environ["ROCR_VISIBLE_DEVICES"] = visible_devices
-    os.environ.pop("HIP_VISIBLE_DEVICES", None)
+    if use_rocm_gpu_visibility():
+        os.environ["ROCR_VISIBLE_DEVICES"] = visible_devices
+        os.environ["HIP_VISIBLE_DEVICES"] = visible_devices
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+    else:
+        os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
+        os.environ.pop("ROCR_VISIBLE_DEVICES", None)
+        os.environ.pop("HIP_VISIBLE_DEVICES", None)
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
 
@@ -1372,21 +1487,37 @@ def evaluate_one_dataset_with_ddp(
 
     env = os.environ.copy()
     bind_ddp_gpu_group(gpu_ids)
-    env["CUDA_VISIBLE_DEVICES"] = os.environ["CUDA_VISIBLE_DEVICES"]
-    env["ROCR_VISIBLE_DEVICES"] = os.environ["ROCR_VISIBLE_DEVICES"]
-    env.pop("HIP_VISIBLE_DEVICES", None)
+    for env_name in ("CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"):
+        if env_name in os.environ:
+            env[env_name] = os.environ[env_name]
+        else:
+            env.pop(env_name, None)
     env.setdefault("OMP_NUM_THREADS", os.environ.get("OMP_NUM_THREADS", "1"))
     env.setdefault("MKL_NUM_THREADS", os.environ.get("MKL_NUM_THREADS", "1"))
 
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             command,
             cwd=str(Path.cwd()),
             env=env,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            check=False,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = process.communicate()
+        except BaseException:
+            terminate_subprocess_group(
+                process,
+                reason=f"interrupted DDP subprocess for {dataset_dir.name}",
+            )
+            raise
+        completed = subprocess.CompletedProcess(
+            command,
+            process.returncode,
+            stdout,
+            stderr,
         )
         if args.verbose and completed.stdout.strip():
             print(completed.stdout, end="" if completed.stdout.endswith("\n") else "\n", flush=True)
@@ -1454,12 +1585,11 @@ def run_internal_ddp_dataset(args: argparse.Namespace) -> None:
 
 def run_retry_failed_datasets_with_ddp(args: argparse.Namespace) -> None:
     data_root = resolve_script_path(args.data_root)
-    out_dir = resolve_script_path(args.out_dir)
+    raw_model_path_arg = args.model_path
     if not data_root.exists():
         raise FileNotFoundError(f"Data root does not exist: {data_root}")
     if not data_root.is_dir():
         raise NotADirectoryError(f"Data root is not a directory: {data_root}")
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.workers is not None and int(args.workers) != 1:
         raise ValueError("--retry-failed-datasets-with-ddp requires --workers 1")
@@ -1485,6 +1615,22 @@ def run_retry_failed_datasets_with_ddp(args: argparse.Namespace) -> None:
         raise FileNotFoundError(
             f"No OOM retry target datasets found under {data_root} for {reference_results_csv}"
         )
+
+    if args.out_dir is None:
+        checkpoint_stem = result_naming.checkpoint_stem(raw_model_path_arg)
+        model_label = checkpoint_stem.lower() if checkpoint_stem else "limix-16m"
+        out_dir = result_naming.auto_out_dir(
+            model_label=model_label,
+            data_root=data_root,
+            dataset_dirs=all_dataset_dirs,
+            infer_label="infer_estall",
+            ttt_label=result_naming.no_ttt_label(),
+            seed_label=result_naming.seed_label(args),
+        )
+    else:
+        out_dir = resolve_script_path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"out_dir: {out_dir}", flush=True)
 
     if missing_dataset_names:
         print(
@@ -1550,12 +1696,11 @@ def run_retry_failed_datasets_with_ddp(args: argparse.Namespace) -> None:
 
 def run_benchmark(args: argparse.Namespace) -> None:
     data_root = resolve_script_path(args.data_root)
-    out_dir = resolve_script_path(args.out_dir)
+    raw_model_path_arg = args.model_path
     if not data_root.exists():
         raise FileNotFoundError(f"Data root does not exist: {data_root}")
     if not data_root.is_dir():
         raise NotADirectoryError(f"Data root is not a directory: {data_root}")
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     all_dataset_dirs = find_dataset_dirs(data_root)
     dataset_dirs = list(all_dataset_dirs)
@@ -1600,6 +1745,23 @@ def run_benchmark(args: argparse.Namespace) -> None:
             )
         raise FileNotFoundError(f"No dataset directories found under {data_root}")
 
+    if args.out_dir is None:
+        checkpoint_stem = result_naming.checkpoint_stem(raw_model_path_arg)
+        model_label = checkpoint_stem.lower() if checkpoint_stem else "limix-16m"
+        naming_dataset_dirs = all_dataset_dirs if merge_results_csv is not None else dataset_dirs
+        out_dir = result_naming.auto_out_dir(
+            model_label=model_label,
+            data_root=data_root,
+            dataset_dirs=naming_dataset_dirs,
+            infer_label="infer_estall",
+            ttt_label=result_naming.no_ttt_label(),
+            seed_label=result_naming.seed_label(args),
+        )
+    else:
+        out_dir = resolve_script_path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"out_dir: {out_dir}", flush=True)
+
     args.data_root = str(data_root)
     args.out_dir = str(out_dir)
     args.workers, gpu_ids = resolve_workers_and_gpu_ids(args)
@@ -1619,20 +1781,24 @@ def run_benchmark(args: argparse.Namespace) -> None:
     processes: list[mp.Process] = []
     args_dict = vars(args).copy()
 
-    for worker_id in range(args.workers):
-        assigned = [str(path.resolve()) for path in dataset_dirs[worker_id :: args.workers]]
-        worker_csv = out_dir / f"worker_{worker_id}.csv"
-        worker_csvs.append(worker_csv)
-        proc = mp.Process(
-            target=worker_main,
-            args=(worker_id, gpu_ids[worker_id], assigned, str(worker_csv), args_dict),
-            daemon=False,
-        )
-        proc.start()
-        processes.append(proc)
+    try:
+        for worker_id in range(args.workers):
+            assigned = [str(path.resolve()) for path in dataset_dirs[worker_id :: args.workers]]
+            worker_csv = out_dir / f"worker_{worker_id}.csv"
+            worker_csvs.append(worker_csv)
+            proc = mp.Process(
+                target=worker_main,
+                args=(worker_id, gpu_ids[worker_id], assigned, str(worker_csv), args_dict),
+                daemon=False,
+            )
+            proc.start()
+            processes.append(proc)
 
-    for proc in processes:
-        proc.join()
+        for proc in processes:
+            proc.join()
+    except BaseException:
+        terminate_mp_processes(processes, reason="parent benchmark interrupted")
+        raise
 
     frames = [pd.read_csv(path) for path in worker_csvs if path.exists()]
     result_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=RESULT_COLUMNS)
@@ -1655,7 +1821,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Run LimiX on data178 classification datasets."
     )
     parser.add_argument("--data-root", default="../../data178")
-    parser.add_argument("--out-dir", default="limix-16m_results_178")
+    parser.add_argument(
+        "--out-dir",
+        default=None,
+        help=(
+            "Directory for worker CSVs, all_classification_results.csv, and summary.txt. "
+            "If omitted, uses baseline_compare/results/<auto_name>."
+        ),
+    )
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument(
         "--gpus",

@@ -144,6 +144,7 @@ data*/
 datasets/
 dataset/
 tabzilla/
+openml_cc18/
 
 # ------------------------------
 # Model checkpoints / weights

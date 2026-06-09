@@ -1,0 +1,19 @@
+strategy: ttt
+model_key: limix
+reference_dir: limix_ttt_epoch30_chunk150
+merge_mode: full_data200
+discovered_datasets: 200
+processed_datasets: 200
+ok_count: 186
+failed_count: 14
+skipped_count: 0
+ttt_oom_fallback_count: 0
+avg_accuracy_ok: 0.843417
+avg_f1_ok: 0.833131
+avg_balanced_accuracy_ok: 0.762868
+avg_roc_auc_ok: 0.899125
+avg_log_loss_ok: 0.812690
+avg_fit_seconds_ok: 281.110865
+avg_predict_seconds_ok: 47.066233
+failed_datasets: Cardiovascular-Disease-dataset, Credit_c, Indian_pines, Rain_in_Australia, SDSS17, accelerometer, connect-4, customer_satisfaction_in_airline, dabetes_130-us_hospitals, madeline, mfeat-factors, mfeat-pixel, philippine, walking-activity
+skipped_datasets: (none)

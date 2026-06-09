@@ -1,0 +1,15 @@
+discovered_datasets: 28
+processed_datasets: 28
+ok_count: 26
+failed_count: 2
+skipped_count: 0
+ttt_oom_fallback_count: 0
+avg_accuracy_ok: 0.865997
+avg_f1_ok: 0.854207
+avg_balanced_accuracy_ok: 0.769690
+avg_roc_auc_ok: 0.894080
+avg_log_loss_ok: 0.504871
+wall_seconds: 8798.508
+failed_datasets: connect-4, philippine
+skipped_datasets: (none)
+ttt_oom_fallback_datasets: (none)

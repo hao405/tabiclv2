@@ -1,0 +1,46 @@
+[
+  {
+    "model_key": "tabicl",
+    "display_name": "TabICL",
+    "strategy": "ttt",
+    "status": "ok",
+    "returncode": 0,
+    "command": "/home/crc00006699/anaconda3/envs/tabicl/bin/python /home/crc00006699/zh/tabiclv2/1C_Chunk_TTT.py --data-root /home/crc00006699/zh/tabiclv2/Experiment_TTT_pipeline/generated/data200_minus_data172 --out-dir /home/crc00006699/zh/tabiclv2/baseline_compare/compare_results_data200_minus_data172/ttt/tabicl --workers 2 --random-state 42 --gpu-groups '' --gpus 2,3",
+    "out_dir": "/home/crc00006699/zh/tabiclv2/baseline_compare/compare_results_data200_minus_data172/ttt/tabicl",
+    "elapsed_seconds": 611.3498334884644,
+    "error": null
+  },
+  {
+    "model_key": "tabpfnv25",
+    "display_name": "TabPFN v2.5",
+    "strategy": "ttt",
+    "status": "ok",
+    "returncode": 0,
+    "command": "/home/crc00006699/anaconda3/envs/tabicl/bin/python /home/crc00006699/zh/tabiclv2/baseline_compare/TabPFN-main/Tabpfn_1c_ttt.py --data-root /home/crc00006699/zh/tabiclv2/Experiment_TTT_pipeline/generated/data200_minus_data172 --out-dir /home/crc00006699/zh/tabiclv2/baseline_compare/compare_results_data200_minus_data172/ttt/tabpfnv25 --workers 2 --random-state 42 --gpus 2,3 --model-version v2.5 --ttt",
+    "out_dir": "/home/crc00006699/zh/tabiclv2/baseline_compare/compare_results_data200_minus_data172/ttt/tabpfnv25",
+    "elapsed_seconds": 3484.2136266231537,
+    "error": null
+  },
+  {
+    "model_key": "tabpfnv3",
+    "display_name": "TabPFN v3",
+    "strategy": "ttt",
+    "status": "ok",
+    "returncode": 0,
+    "command": "/home/crc00006699/anaconda3/envs/tabicl/bin/python /home/crc00006699/zh/tabiclv2/baseline_compare/TabPFN-main/Tabpfn_1c_ttt.py --data-root /home/crc00006699/zh/tabiclv2/Experiment_TTT_pipeline/generated/data200_minus_data172 --out-dir /home/crc00006699/zh/tabiclv2/baseline_compare/compare_results_data200_minus_data172/ttt/tabpfnv3 --workers 2 --random-state 42 --gpus 2,3 --model-version v3 --ttt",
+    "out_dir": "/home/crc00006699/zh/tabiclv2/baseline_compare/compare_results_data200_minus_data172/ttt/tabpfnv3",
+    "elapsed_seconds": 1431.8893451690674,
+    "error": null
+  },
+  {
+    "model_key": "limix",
+    "display_name": "LimiX",
+    "strategy": "ttt",
+    "status": "ok",
+    "returncode": 0,
+    "command": "/home/crc00006699/anaconda3/envs/tabicl/bin/python /home/crc00006699/zh/tabiclv2/baseline_compare/LimiX/limix_ttt.py --data-root /home/crc00006699/zh/tabiclv2/Experiment_TTT_pipeline/generated/data200_minus_data172 --out-dir /home/crc00006699/zh/tabiclv2/baseline_compare/compare_results_data200_minus_data172/ttt/limix --workers 2 --random-state 42 --gpus 2,3 --ttt-holdout",
+    "out_dir": "/home/crc00006699/zh/tabiclv2/baseline_compare/compare_results_data200_minus_data172/ttt/limix",
+    "elapsed_seconds": 8799.127333402634,
+    "error": null
+  }
+]

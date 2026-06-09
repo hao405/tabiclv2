@@ -1,0 +1,14 @@
+{
+    "function": "bin.tabr.main",
+    "gpus": [
+        "NVIDIA GeForce RTX 3090"
+    ],
+    "n_parameters": 188673,
+    "best_epoch": 0,
+    "scores": {
+        "train": 0.8202036441586281,
+        "val": 0.6741693461950696,
+        "test": 0.7189374464438731
+    },
+    "time": "0:00:01"
+}

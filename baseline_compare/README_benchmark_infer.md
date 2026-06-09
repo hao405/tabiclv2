@@ -40,7 +40,7 @@ python -m Experiment_TTT_pipeline --list-models
 # Smoke-test commands without launching heavy model code.
 python -m Experiment_TTT_pipeline \
   --strategy inference \
-  --models tabicl,tabpfnv25,limix,tabr,tabdpt,orion_msp \
+  --models tabicl,tabpfnv25,limix,tabr,orion_msp \
   --max-datasets 1 --workers 1 --gpus auto --dry-run
 
 # Run all TTT-capable models with the 1C/chunk TTT scripts.
@@ -76,9 +76,8 @@ python -m Experiment_TTT_pipeline \
   --model-extra-arg=tabpfnv3:--ttt-max-chunk-size=2000
 ```
 
-TTT-capable keys are `tabicl`, `tabpfnv2`, `tabpfnv25`, `tabpfnv26`,
-`tabpfnv3`, `limix`, `tabdpt`, and `orion_msp`. `tabr` is currently inference
-only.
+TTT-capable keys are `tabicl`, `tabpfnv2`, `tabpfnv25`, `tabpfnv3`, `limix`,
+and `orion_msp`. `tabr` is currently inference only.
 
 The default output roots are:
 

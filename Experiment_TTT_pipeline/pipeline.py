@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -28,6 +30,8 @@ class PipelineConfig:
     dry_run: bool = False
     stop_on_failure: bool = False
     skip_unsupported: bool = True
+    backend_timeout_seconds: float | None = None
+    backend_kill_grace_seconds: float = 30.0
     extra_args: tuple[str, ...] = ()
     model_extra_args: Mapping[str, Sequence[str]] = field(default_factory=dict)
 
@@ -42,6 +46,12 @@ class PipelineRunResult:
     command: str
     out_dir: str
     elapsed_seconds: float
+    error: str | None = None
+
+
+@dataclass
+class BackendCompleted:
+    returncode: int | None
     error: str | None = None
 
 
@@ -154,6 +164,137 @@ def unsupported_result(model: ModelSpec, strategy: str, config: PipelineConfig) 
     )
 
 
+def terminate_process_group(
+    process: subprocess.Popen[object],
+    *,
+    grace_seconds: float,
+    reason: str,
+) -> None:
+    if process.poll() is not None:
+        return
+
+    pid = int(process.pid)
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        return
+
+    print(
+        f"[pipeline] terminating backend process group pgid={pgid} "
+        f"reason={reason}",
+        file=sys.stderr,
+        flush=True,
+    )
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+
+    try:
+        process.wait(timeout=max(0.0, float(grace_seconds)))
+        return
+    except subprocess.TimeoutExpired:
+        pass
+
+    print(
+        f"[pipeline] backend pgid={pgid} did not exit after "
+        f"{grace_seconds:.1f}s; sending SIGKILL",
+        file=sys.stderr,
+        flush=True,
+    )
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=max(1.0, float(grace_seconds)))
+    except subprocess.TimeoutExpired:
+        print(
+            f"[pipeline] warning: backend pgid={pgid} still did not exit "
+            "after SIGKILL. If nvidia-smi reports No Such Process with "
+            "memory still used, this is likely a stale CUDA driver context "
+            "that requires GPU reset by an administrator.",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def run_backend_command(command: Sequence[str], config: PipelineConfig) -> BackendCompleted:
+    timeout = config.backend_timeout_seconds
+    process = subprocess.Popen(
+        list(command),
+        cwd=REPO_ROOT,
+        start_new_session=True,
+    )
+    try:
+        returncode = process.wait(timeout=timeout)
+        return BackendCompleted(returncode=int(returncode))
+    except subprocess.TimeoutExpired:
+        terminate_process_group(
+            process,
+            grace_seconds=config.backend_kill_grace_seconds,
+            reason=f"timeout after {timeout}s",
+        )
+        return BackendCompleted(
+            returncode=process.returncode,
+            error=f"timeout after {timeout}s; backend process group terminated",
+        )
+    except KeyboardInterrupt:
+        terminate_process_group(
+            process,
+            grace_seconds=config.backend_kill_grace_seconds,
+            reason="KeyboardInterrupt",
+        )
+        return BackendCompleted(
+            returncode=process.returncode,
+            error="KeyboardInterrupt; backend process group terminated",
+        )
+    except BaseException:
+        terminate_process_group(
+            process,
+            grace_seconds=config.backend_kill_grace_seconds,
+            reason="parent exception",
+        )
+        raise
+
+
+def expected_dataset_count(config: PipelineConfig) -> int | None:
+    data_root = resolve_repo_path(config.data_root)
+    try:
+        dataset_dirs = [path for path in sorted(data_root.iterdir()) if path.is_dir()]
+    except Exception:
+        return None
+
+    if config.max_datasets is not None:
+        return len(dataset_dirs[: max(0, int(config.max_datasets))])
+    return len(dataset_dirs)
+
+
+def validate_backend_artifacts(out_dir: Path, config: PipelineConfig) -> str | None:
+    expected_count = expected_dataset_count(config)
+    if expected_count == 0:
+        return None
+
+    results_csv = out_dir / "all_classification_results.csv"
+    if not results_csv.exists():
+        return f"missing backend results CSV: {results_csv}"
+
+    try:
+        with results_csv.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            row_count = sum(1 for _ in reader)
+    except Exception as exc:
+        return f"failed to read backend results CSV {results_csv}: {type(exc).__name__}: {exc}"
+
+    if row_count == 0:
+        expected_label = "unknown" if expected_count is None else str(expected_count)
+        return (
+            f"empty backend results CSV: {results_csv} "
+            f"(expected_datasets={expected_label})"
+        )
+    return None
+
+
 def run_one_model(model: ModelSpec, strategy: str, config: PipelineConfig) -> PipelineRunResult:
     started = time.time()
     try:
@@ -182,19 +323,34 @@ def run_one_model(model: ModelSpec, strategy: str, config: PipelineConfig) -> Pi
             )
 
         out_dir.mkdir(parents=True, exist_ok=True)
-        completed = subprocess.run(command, cwd=REPO_ROOT, check=False)
+        completed = run_backend_command(command, config)
         elapsed = time.time() - started
-        status = "ok" if completed.returncode == 0 else "fail"
+        artifact_error = (
+            validate_backend_artifacts(out_dir, config)
+            if completed.returncode == 0 and completed.error is None
+            else None
+        )
+        status = (
+            "ok"
+            if completed.returncode == 0 and completed.error is None and artifact_error is None
+            else "fail"
+        )
         return PipelineRunResult(
             model_key=model.key,
             display_name=model.display_name,
             strategy=strategy,
             status=status,
-            returncode=int(completed.returncode),
+            returncode=None if completed.returncode is None else int(completed.returncode),
             command=command_preview,
             out_dir=str(out_dir),
             elapsed_seconds=elapsed,
-            error=None if status == "ok" else f"returncode={completed.returncode}",
+            error=(
+                completed.error
+                if completed.error
+                else artifact_error
+                if artifact_error
+                else (None if status == "ok" else f"returncode={completed.returncode}")
+            ),
         )
     except Exception as exc:
         elapsed = time.time() - started
@@ -229,6 +385,11 @@ def run_pipeline(model_keys: Sequence[str], config: PipelineConfig) -> list[Pipe
             result = run_one_model(model, strategy, stage_config)
             stage_results.append(result)
             results.append(result)
+            if result.error and result.error.startswith("KeyboardInterrupt"):
+                if not config.dry_run:
+                    write_pipeline_manifest(out_root / strategy, stage_results)
+                    write_pipeline_manifest(out_root / "manifests", results, stem="pipeline_runs_all")
+                return results
             if result.status == "fail" and config.stop_on_failure:
                 if not config.dry_run:
                     write_pipeline_manifest(out_root / strategy, stage_results)

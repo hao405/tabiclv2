@@ -1,0 +1,15 @@
+discovered_datasets: 72
+processed_datasets: 72
+ok_count: 56
+failed_count: 16
+skipped_count: 0
+ttt_oom_fallback_count: 0
+avg_accuracy_ok: 0.882387
+avg_f1_ok: 0.875962
+avg_balanced_accuracy_ok: 0.826982
+avg_roc_auc_ok: 0.924772
+avg_log_loss_ok: 0.883070
+wall_seconds: 17522.251
+failed_datasets: OpenML-ID-12, OpenML-ID-1468, OpenML-ID-1478, OpenML-ID-1485, OpenML-ID-1486, OpenML-ID-1501, OpenML-ID-23517, OpenML-ID-300, OpenML-ID-40668, OpenML-ID-40923, OpenML-ID-40927, OpenML-ID-40978, OpenML-ID-40979, OpenML-ID-40996, OpenML-ID-4134, OpenML-ID-554
+skipped_datasets: (none)
+ttt_oom_fallback_datasets: (none)

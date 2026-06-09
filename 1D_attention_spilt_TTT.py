@@ -3380,7 +3380,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--gpus", default=None)
-    parser.add_argument("--gpu-groups", default="1")
+    parser.add_argument("--gpu-groups", default="0")
     parser.add_argument("--n-estimators", type=int, default=32)
     parser.add_argument("--batch-size", type=parse_optional_int, default=8)
     parser.add_argument("--kv-cache", type=parse_kv_cache, default=False)
@@ -3440,7 +3440,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Set 0 to keep ordinary 1C chunk query sampling for all epochs."
         ),
     )
-    parser.add_argument("--ttt-attention-mass", type=float, default=0.85)
+    parser.add_argument("--ttt-attention-mass", type=float, default=0.6)
     parser.add_argument("--ttt-attention-min-query-ratio", type=float, default=0.2)
     parser.add_argument("--ttt-attention-max-query-ratio", type=float, default=0.5)
     parser.add_argument("--ttt-n-estimators-finetune", type=int, default=2)

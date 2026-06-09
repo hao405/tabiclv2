@@ -688,7 +688,7 @@ class FinetunedTabICLBase(BaseEstimator, ABC):
         其他逻辑尽可能保持一致，避免复杂的条件分支。
         """
         # 导入 scikit-learn 的数据校验工具，确保输入的数据格式合法
-        from sklearn.utils.validation import check_X_y, check_array
+        from sklearn.utils.validation import check_array, check_consistent_length, column_or_1d
 
         # ---------------------------------------------------------
         # 1. DDP setup (分布式数据并行设置)
@@ -717,13 +717,11 @@ class FinetunedTabICLBase(BaseEstimator, ABC):
         # ---------------------------------------------------------
         # 如果是回归任务，确保目标变量 y 是数值型
         ensure_numeric_y = self._model_type == "regressor"
-        X, y = check_X_y(
-            X,
-            y,
-            ensure_all_finite=False, # 允许有缺失值
-            y_numeric=ensure_numeric_y,
-            dtype=None,
-        )
+        check_array(X, ensure_all_finite=False, dtype=None)
+        y = column_or_1d(y, warn=True)
+        if ensure_numeric_y and getattr(y, "dtype", None) is not None and y.dtype.kind == "O":
+            y = y.astype(np.float64)
+        check_consistent_length(X, y)
         self.X_raw_ = X
         self.y_raw_ = y  # 暂存原始数据，最终拟合完整模型时会用到
 
@@ -742,7 +740,8 @@ class FinetunedTabICLBase(BaseEstimator, ABC):
         if X_val is not None and y_val is not None:
             # 如果用户自己提供了验证集，直接使用并进行必要的校验和标签转换
             X_train_arr, y_train_arr = X, y_fit
-            X_val_arr = check_array(X_val, ensure_all_finite=False, dtype=None)
+            check_array(X_val, ensure_all_finite=False, dtype=None)
+            X_val_arr = X_val
             y_val_arr = np.asarray(y_val)
             if self._model_type == "classifier":
                 y_val_arr = self._label_encoder_.transform(y_val_arr).astype(np.int64)

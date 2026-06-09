@@ -24,9 +24,10 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-DEFAULT_DATA_ROOT = Path("data178")
-DEFAULT_MODEL_PATH = "tabicl-classifier-v1.1-20250506.ckpt"
-DEFAULT_CHECKPOINT_VERSION = "tabicl-classifier-v1.1-20250506.ckpt"
+DEFAULT_DATA_ROOT = Path("openml_cc18")
+DEFAULT_MODEL_PATH = "tabicl-classifier-v2-20260212.ckpt"
+DEFAULT_CHECKPOINT_VERSION = "tabicl-classifier-v2-20260212.ckpt"
+DEFAULT_OUT_DIR_ROOT = Path("1b_result")
 CLASSIFICATION_TASKS = {"binclass", "multiclass"}
 CATEGORICAL_MISSING_TOKEN = "__tabicl_missing__"
 
@@ -438,12 +439,21 @@ def first_gpu_id_from_group(value: int | str) -> int:
     return parse_gpu_id_list(normalize_gpu_group(value))[0]
 
 
+def use_rocm_gpu_visibility() -> bool:
+    backend = (os.environ.get("TFM_GPU_BACKEND") or os.environ.get("TABICL_GPU_BACKEND") or "").strip().lower()
+    return backend in {"rocm", "hip", "amd"}
+
+
 def apply_worker_environment_updates(gpu_id: int | str) -> str:
     gpu_id_str = normalize_gpu_group(gpu_id)
-    # Set visibility vars for both CUDA and ROCm stacks so each worker sees one GPU.
-    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id_str
-    os.environ["ROCR_VISIBLE_DEVICES"] = gpu_id_str
-    os.environ["HIP_VISIBLE_DEVICES"] = gpu_id_str
+    if use_rocm_gpu_visibility():
+        os.environ["ROCR_VISIBLE_DEVICES"] = gpu_id_str
+        os.environ["HIP_VISIBLE_DEVICES"] = gpu_id_str
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+    else:
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id_str
+        os.environ.pop("ROCR_VISIBLE_DEVICES", None)
+        os.environ.pop("HIP_VISIBLE_DEVICES", None)
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     return "cuda:0"
@@ -1364,6 +1374,78 @@ def _derive_model_name(model_path: str | None, checkpoint_version: str | None) -
     return Path(str(candidate)).stem
 
 
+def _format_path_value(value: Any) -> str:
+    if value is None:
+        return "none"
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    return str(value)
+
+
+def _derive_tabicl_version_label(args: argparse.Namespace) -> str:
+    if args.models_dir is not None:
+        return f"tabicl-modelpool-{Path(args.models_dir).expanduser().name}"
+
+    source = args.model_path or args.checkpoint_version or DEFAULT_MODEL_PATH
+    stem = Path(str(source)).stem
+    match = re.search(r"(v\d+(?:\.\d+)?(?:-\d{8})?)", stem)
+    if match:
+        return f"tabicl-{match.group(1)}"
+    return stem or "tabicl_model"
+
+
+def _derive_dataset_label(data_root: Path, dataset_dirs: List[Path]) -> str:
+    if len(dataset_dirs) == 1:
+        return dataset_dirs[0].name
+    root_name = data_root.name or "datasets"
+    return f"{root_name}_{len(dataset_dirs)}datasets"
+
+
+def build_auto_out_dir(
+    args: argparse.Namespace,
+    *,
+    data_root: Path,
+    dataset_dirs: List[Path],
+) -> Path:
+    version_label = _derive_tabicl_version_label(args)
+    dataset_label = _derive_dataset_label(data_root, dataset_dirs)
+    model_param_label = "_".join(
+        [
+            f"inferest{args.n_estimators}",
+            f"bs{_format_path_value(args.batch_size)}",
+            f"kv{_format_path_value(args.kv_cache)}",
+            f"amp{_format_path_value(args.use_amp)}",
+            f"fa3{_format_path_value(args.use_fa3)}",
+            f"offload{_format_path_value(args.offload_mode)}",
+        ]
+    )
+
+    if args.ttt_enabled:
+        eval_estimator_label = "_".join(
+            [
+                f"ttt_eval-{args.ttt_eval_metric}",
+                f"finetuneest{args.ttt_n_estimators_finetune}",
+                f"valest{args.ttt_validation_n_estimators}",
+                f"ep{args.ttt_epochs}",
+                f"lr{args.ttt_lr}",
+                f"q{args.ttt_query_ratio}",
+            ]
+        )
+    else:
+        eval_estimator_label = "no_ttt"
+
+    seed_label = f"seed{args.random_state}"
+    name_parts = [
+        version_label,
+        dataset_label,
+        model_param_label,
+        eval_estimator_label,
+        seed_label,
+    ]
+    auto_name = "__".join(_sanitize_path_component(part) for part in name_parts)
+    return DEFAULT_OUT_DIR_ROOT / auto_name
+
+
 def _build_ttt_lr_scheduler(optimizer, config: TTTConfig, total_steps: int):
     try:
         from tabicl.train._optim import get_scheduler
@@ -2085,6 +2167,12 @@ def worker_main(
     ttt_config: TTTConfig,
     verbose: bool,
 ) -> None:
+    def write_result_rows_csv(rows: List[ResultRow]) -> None:
+        out_path = Path(worker_out_csv)
+        tmp_path = out_path.with_name(f".{out_path.name}.tmp.{os.getpid()}")
+        pd.DataFrame([asdict(row) for row in rows]).to_csv(tmp_path, index=False)
+        tmp_path.replace(out_path)
+
     try:
         ensure_runtime_deps()
         device_str = apply_worker_environment_updates(gpu_group)
@@ -2136,8 +2224,9 @@ def worker_main(
                 ),
                 flush=True,
             )
+            write_result_rows_csv(rows)
 
-        pd.DataFrame([asdict(row) for row in rows]).to_csv(worker_out_csv, index=False)
+        write_result_rows_csv(rows)
     except Exception:
         try:
             ready_queue.put(
@@ -2178,6 +2267,123 @@ def worker_main(
             ]
         )
         crash_row.to_csv(worker_out_csv, index=False)
+
+
+def make_worker_failure_row(
+    kind: str,
+    worker_id: int | str,
+    *,
+    assigned_count: int,
+    error: str,
+) -> ResultRow:
+    return ResultRow(
+        dataset_name=f"__{kind}__{worker_id}",
+        dataset_dir="__worker__",
+        task_type=None,
+        n_train=0,
+        n_val=0,
+        n_test=0,
+        n_features=0,
+        n_classes=0,
+        accuracy=None,
+        f1=None,
+        balanced_accuracy=None,
+        roc_auc=None,
+        log_loss=None,
+        fit_seconds=0.0,
+        predict_seconds=0.0,
+        status="fail",
+        error=f"{error}; assigned_count={assigned_count}",
+    )
+
+
+def collect_worker_output_frames(
+    *,
+    worker_csv_paths: List[Path],
+    worker_assigned_counts: List[int],
+    processes: List[mp.Process],
+    dataset_dirs: List[Path],
+) -> tuple[List[Any], List[str]]:
+    ensure_runtime_deps()
+
+    frames: List[Any] = []
+    integrity_errors: List[str] = []
+    failure_rows: List[ResultRow] = []
+
+    for worker_id, worker_csv in enumerate(worker_csv_paths):
+        assigned_count = worker_assigned_counts[worker_id]
+        proc = processes[worker_id]
+        worker_frame = None
+
+        if worker_csv.exists():
+            try:
+                worker_frame = pd.read_csv(worker_csv)
+                frames.append(worker_frame)
+            except Exception as exc:
+                error = f"failed to read {worker_csv}: {type(exc).__name__}: {exc}"
+                integrity_errors.append(f"worker_{worker_id}: {error}")
+                failure_rows.append(
+                    make_worker_failure_row(
+                        "WORKER_BAD_CSV",
+                        worker_id,
+                        assigned_count=assigned_count,
+                        error=error,
+                    )
+                )
+
+        if proc.exitcode not in (0, None):
+            error = f"worker exited with exitcode={proc.exitcode}"
+            completed_count = 0 if worker_frame is None else len(worker_frame)
+            if completed_count < assigned_count:
+                integrity_errors.append(
+                    f"worker_{worker_id}: {error}; completed_count={completed_count}"
+                )
+                failure_rows.append(
+                    make_worker_failure_row(
+                        "WORKER_EXIT",
+                        worker_id,
+                        assigned_count=assigned_count,
+                        error=error,
+                    )
+                )
+
+        if worker_csv.exists():
+            continue
+
+        if assigned_count > 0:
+            error = f"missing worker CSV: {worker_csv}"
+            integrity_errors.append(f"worker_{worker_id}: {error}")
+            failure_rows.append(
+                make_worker_failure_row(
+                    "WORKER_MISSING_CSV",
+                    worker_id,
+                    assigned_count=assigned_count,
+                    error=error,
+                )
+            )
+
+    if failure_rows:
+        frames.append(pd.DataFrame([asdict(row) for row in failure_rows]))
+
+    if not frames and dataset_dirs:
+        error = "no worker results were produced"
+        integrity_errors.append(error)
+        frames.append(
+            pd.DataFrame(
+                [
+                    asdict(
+                        make_worker_failure_row(
+                            "EMPTY_RESULT",
+                            "all",
+                            assigned_count=len(dataset_dirs),
+                            error=error,
+                        )
+                    )
+                ]
+            )
+        )
+
+    return frames, integrity_errors
 
 
 def model_pool_worker_main(
@@ -2447,7 +2653,7 @@ def write_model_pool_outputs(
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run TabICLv2 classification benchmarks on data178 with "
+            "Run TabICLv2 classification benchmarks on dataset roots with "
             "epoch-shuffled chunk TTT and AMD/ROCm multi-GPU workers."
         )
     )
@@ -2455,10 +2661,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-path", default=None)
     parser.add_argument("--models-dir", default=None)
     parser.add_argument("--checkpoint-version", default=DEFAULT_CHECKPOINT_VERSION)
-    parser.add_argument("--out-dir", default="1b_result/iclv1.1_ttt_default")
+    parser.add_argument(
+        "--out-dir",
+        default="baseline/Tabiclv2_ttt_ensemble32_openmlcc18",
+        help=(
+            "Output directory. If omitted, generate one under 1b_result from "
+            "TabICL version, dataset label, model parameters, TTT eval metric, "
+            "estimator counts, and random seed."
+        ),
+    )
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--gpus", default=None)
-    parser.add_argument("--gpu-groups", default="3")
+    parser.add_argument("--gpu-groups", default="0")
     parser.add_argument("--n-estimators", type=int, default=32)
     parser.add_argument("--batch-size", type=parse_optional_int, default=8)
     parser.add_argument("--kv-cache", type=parse_kv_cache, default=False)
@@ -2614,11 +2828,13 @@ def run_single_model_mode(
     start_event = mp.Event()
 
     worker_csv_paths: List[Path] = []
+    worker_assigned_counts: List[int] = []
     processes: List[mp.Process] = []
     for worker_id in range(args.workers):
         assigned_dirs = [str(path.resolve()) for path in dataset_dirs[worker_id::args.workers]]
         worker_csv = out_dir / f"worker_{worker_id}.csv"
         worker_csv_paths.append(worker_csv)
+        worker_assigned_counts.append(len(assigned_dirs))
 
         proc = mp.Process(
             target=worker_main,
@@ -2676,10 +2892,12 @@ def run_single_model_mode(
     for proc in processes:
         proc.join()
 
-    dfs: List[pd.DataFrame] = []
-    for worker_csv in worker_csv_paths:
-        if worker_csv.exists():
-            dfs.append(pd.read_csv(worker_csv))
+    dfs, integrity_errors = collect_worker_output_frames(
+        worker_csv_paths=worker_csv_paths,
+        worker_assigned_counts=worker_assigned_counts,
+        processes=processes,
+        dataset_dirs=dataset_dirs,
+    )
 
     all_df = (
         pd.concat(dfs, ignore_index=True)
@@ -2700,6 +2918,14 @@ def run_single_model_mode(
     if ttt_config.enabled:
         print("ttt_config:")
         print(json.dumps(asdict(ttt_config), indent=2, ensure_ascii=False))
+
+    system_failure_mask = (
+        all_df["dataset_name"].astype(str).str.startswith("__WORKER_")
+        | all_df["dataset_name"].astype(str).str.startswith("__EMPTY_RESULT__")
+    )
+    if integrity_errors or system_failure_mask.any():
+        details = "; ".join(integrity_errors) if integrity_errors else "worker failure rows were produced"
+        raise RuntimeError(f"TabICL TTT worker output integrity check failed: {details}")
 
 
 def run_multi_model_mode(
@@ -2874,14 +3100,20 @@ def main() -> None:
     if not data_root.is_dir():
         raise NotADirectoryError(f"Data root is not a directory: {data_root}")
 
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     dataset_dirs = find_dataset_dirs(data_root)
     if args.max_datasets is not None:
         dataset_dirs = dataset_dirs[: args.max_datasets]
     if not dataset_dirs:
         raise FileNotFoundError(f"No dataset directories found under {data_root}")
+
+    out_dir = (
+        Path(args.out_dir).expanduser()
+        if args.out_dir is not None
+        else build_auto_out_dir(args, data_root=data_root, dataset_dirs=dataset_dirs)
+    )
+    args.out_dir = str(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"out_dir: {out_dir}")
 
     gpu_ids, gpu_groups = resolve_gpu_assignments(args)
 

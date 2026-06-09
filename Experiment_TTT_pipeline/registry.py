@@ -6,6 +6,9 @@ from pathlib import Path
 PACKAGE_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = PACKAGE_ROOT.parent
 
+TABICL_V1_1_CHECKPOINT = "tabicl-classifier-v1.1-20250506.ckpt"
+TABICL_V2_CHECKPOINT = "tabicl-classifier-v2-20260212.ckpt"
+
 
 @dataclass(frozen=True)
 class StrategyScript:
@@ -38,14 +41,31 @@ def repo_path(*parts: str) -> Path:
 MODEL_REGISTRY: dict[str, ModelSpec] = {
     "tabicl": ModelSpec(
         key="tabicl",
-        display_name="TabICL",
+        display_name="TabICL v1.1",
         aliases=("tabicl", "tabicl_v11", "tabiclv1.1"),
         inference=StrategyScript(
             script=repo_path("benchmark.py"),
+            default_args=("--checkpoint-version", TABICL_V1_1_CHECKPOINT),
             gpu_mode="gpus",
         ),
         ttt=StrategyScript(
             script=repo_path("1C_Chunk_TTT.py"),
+            default_args=("--checkpoint-version", TABICL_V1_1_CHECKPOINT),
+            gpu_mode="tabicl_ttt",
+        ),
+    ),
+    "tabiclv2": ModelSpec(
+        key="tabiclv2",
+        display_name="TabICL v2",
+        aliases=("tabiclv2", "tabicl_v2", "iclv2"),
+        inference=StrategyScript(
+            script=repo_path("benchmark.py"),
+            default_args=("--checkpoint-version", TABICL_V2_CHECKPOINT),
+            gpu_mode="gpus",
+        ),
+        ttt=StrategyScript(
+            script=repo_path("1C_Chunk_TTT.py"),
+            default_args=("--checkpoint-version", TABICL_V2_CHECKPOINT),
             gpu_mode="tabicl_ttt",
         ),
     ),
@@ -73,19 +93,6 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         ttt=StrategyScript(
             script=repo_path("baseline_compare", "TabPFN-main", "Tabpfn_1c_ttt.py"),
             default_args=("--model-version", "v2.5", "--ttt"),
-        ),
-    ),
-    "tabpfnv26": ModelSpec(
-        key="tabpfnv26",
-        display_name="TabPFN v2.6",
-        aliases=("tabpfnv26", "tabpfn_v26", "tabpfnv2.6", "tabpfn26"),
-        inference=StrategyScript(
-            script=repo_path("baseline_compare", "TabPFN-main", "benchmark_infer.py"),
-            default_args=("--model-version", "v2.6"),
-        ),
-        ttt=StrategyScript(
-            script=repo_path("baseline_compare", "TabPFN-main", "Tabpfn_1c_ttt.py"),
-            default_args=("--model-version", "v2.6", "--ttt"),
         ),
     ),
     "tabpfnv3": ModelSpec(
@@ -121,20 +128,6 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
             script=repo_path("baseline_compare", "tabular-dl-tabr", "benchmark_infer.py"),
         ),
         ttt=None,
-    ),
-    "tabdpt": ModelSpec(
-        key="tabdpt",
-        display_name="TabDPT",
-        aliases=("tabdpt", "tabdpt-inference"),
-        inference=StrategyScript(
-            script=repo_path("baseline_compare", "TabDPT-inference", "tabdpt_ttt.py"),
-            default_args=("--no-ttt",),
-            seed_arg="--seed",
-        ),
-        ttt=StrategyScript(
-            script=repo_path("baseline_compare", "TabDPT-inference", "tabdpt_ttt.py"),
-            seed_arg="--seed",
-        ),
     ),
     "orion_msp": ModelSpec(
         key="orion_msp",

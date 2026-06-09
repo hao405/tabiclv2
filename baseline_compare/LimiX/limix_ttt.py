@@ -19,6 +19,9 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+BASELINE_COMPARE_ROOT = SCRIPT_DIR.parent
+if str(BASELINE_COMPARE_ROOT) not in sys.path:
+    sys.path.insert(0, str(BASELINE_COMPARE_ROOT))
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
@@ -26,6 +29,7 @@ import numpy as np
 import pandas as pd
 
 import benchmark_infer as base
+import result_naming
 
 
 @dataclass
@@ -36,6 +40,7 @@ class TTTConfig:
     weight_decay: float = 0.0
     epochs: int = 3
     max_chunk_size: int = 20_000
+    accumulation_batch_size: int = 10_000
     min_chunk_size: int = 50
     query_ratio: float = 0.2
     early_stopping: bool = True
@@ -750,6 +755,8 @@ class LimiXTTTAdapter(base.LimiXAdapter):
             return TTTUpdateResult(False, None, 0, 0.0, reason="--ttt-epochs must be >= 1")
         if config.max_chunk_size < 2:
             raise ValueError("--ttt-max-chunk-size must be >= 2")
+        if config.accumulation_batch_size < 1:
+            raise ValueError("--ttt-accumulation-batch-size must be >= 1")
         if not 0.0 < config.query_ratio < 1.0:
             raise ValueError("--ttt-query-ratio must be in (0, 1)")
         if self._has_retrieval_config(predictor):
@@ -802,6 +809,7 @@ class LimiXTTTAdapter(base.LimiXAdapter):
             )
 
         optimizer = torch.optim.AdamW(trainable_params, lr=config.lr, weight_decay=config.weight_decay)
+        accumulation_batch_size = int(config.accumulation_batch_size)
         baseline_metric = None
         best_metric = None
         baseline_accuracy = None
@@ -815,6 +823,19 @@ class LimiXTTTAdapter(base.LimiXAdapter):
         skipped_batches = 0
         skip_reasons: dict[str, int] = {}
 
+        def step_accumulated_gradients(accumulated_samples: int) -> None:
+            if accumulated_samples <= 0:
+                return
+            grad_scale = float(accumulation_batch_size) / float(accumulated_samples)
+            if grad_scale != 1.0:
+                for param in trainable_params:
+                    if param.grad is not None:
+                        param.grad.mul_(grad_scale)
+            if config.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(trainable_params, config.grad_clip)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
         if config.early_stopping and X_val is not None and y_val is not None and len(y_val) > 0:
             baseline_metric = self._evaluate_validation_accuracy(predictor, X_train, y_train, X_val, y_val)
             if baseline_metric is not None:
@@ -825,9 +846,12 @@ class LimiXTTTAdapter(base.LimiXAdapter):
                 if self.args.verbose:
                     print(f"[ttt-val] dataset={dataset_name} baseline_accuracy={best_metric:.6f}", flush=True)
 
+        optimizer.zero_grad(set_to_none=True)
         for epoch_idx in range(config.epochs):
             epoch_loss_sum = 0.0
             epoch_updates = 0
+            accumulated_samples = 0
+            accumulated_loss_sum = 0.0
             for chunk_idx, chunk_indices in enumerate(
                 iter_epoch_chunk_indices(
                     len(y_train),
@@ -852,15 +876,29 @@ class LimiXTTTAdapter(base.LimiXAdapter):
                     skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
                     continue
 
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                if config.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(trainable_params, config.grad_clip)
-                optimizer.step()
+                chunk_samples = int(len(chunk_indices))
+                loss_value = float(loss.detach().cpu())
+                (loss * (float(chunk_samples) / float(accumulation_batch_size))).backward()
+                accumulated_samples += chunk_samples
+                accumulated_loss_sum += loss_value * float(chunk_samples)
+
+                if accumulated_samples >= accumulation_batch_size:
+                    step_loss = accumulated_loss_sum / float(accumulated_samples)
+                    step_accumulated_gradients(accumulated_samples)
+                    update_steps += 1
+                    epoch_updates += 1
+                    last_loss = step_loss
+                    epoch_loss_sum += step_loss
+                    accumulated_samples = 0
+                    accumulated_loss_sum = 0.0
+
+            if accumulated_samples > 0:
+                step_loss = accumulated_loss_sum / float(accumulated_samples)
+                step_accumulated_gradients(accumulated_samples)
                 update_steps += 1
                 epoch_updates += 1
-                last_loss = float(loss.detach().cpu())
-                epoch_loss_sum += last_loss
+                last_loss = step_loss
+                epoch_loss_sum += step_loss
 
             if self.args.verbose and epoch_updates:
                 print(
@@ -1265,6 +1303,8 @@ def build_ttt_config(args: argparse.Namespace) -> TTTConfig:
         raise ValueError("--ttt-epochs must be >= 1")
     if int(args.ttt_max_chunk_size) < 2:
         raise ValueError("--ttt-max-chunk-size must be >= 2")
+    if int(args.ttt_accumulation_batch_size) < 1:
+        raise ValueError("--ttt-accumulation-batch-size must be >= 1")
     if int(args.ttt_min_chunk_size) < 1:
         raise ValueError("--ttt-min-chunk-size must be >= 1")
     if not 0.0 < float(args.ttt_query_ratio) < 1.0:
@@ -1280,6 +1320,7 @@ def build_ttt_config(args: argparse.Namespace) -> TTTConfig:
         weight_decay=float(args.ttt_weight_decay),
         epochs=int(args.ttt_epochs),
         max_chunk_size=int(args.ttt_max_chunk_size),
+        accumulation_batch_size=int(args.ttt_accumulation_batch_size),
         min_chunk_size=int(args.ttt_min_chunk_size),
         query_ratio=float(args.ttt_query_ratio),
         early_stopping=bool(args.ttt_early_stopping),
@@ -1327,12 +1368,20 @@ def evaluate_one_dataset_in_fresh_process(
         daemon=False,
     )
     proc.start()
-    proc.join()
     row_dict: dict[str, Any] | None = None
-    if not result_queue.empty():
-        row_dict = result_queue.get()
-    result_queue.close()
-    result_queue.join_thread()
+    try:
+        proc.join()
+    except BaseException:
+        base.terminate_mp_processes(
+            [proc],
+            reason=f"interrupted child dataset retry for {dataset_dir.name}",
+        )
+        raise
+    finally:
+        if not result_queue.empty():
+            row_dict = result_queue.get()
+        result_queue.close()
+        result_queue.join_thread()
     if row_dict is None:
         return worker_crash_row(
             dataset_dir.name,
@@ -1464,21 +1513,37 @@ def evaluate_one_dataset_with_ddp(
 
     env = os.environ.copy()
     base.bind_ddp_gpu_group(gpu_ids)
-    env["CUDA_VISIBLE_DEVICES"] = os.environ["CUDA_VISIBLE_DEVICES"]
-    env["ROCR_VISIBLE_DEVICES"] = os.environ["ROCR_VISIBLE_DEVICES"]
-    env.pop("HIP_VISIBLE_DEVICES", None)
+    for env_name in ("CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"):
+        if env_name in os.environ:
+            env[env_name] = os.environ[env_name]
+        else:
+            env.pop(env_name, None)
     env.setdefault("OMP_NUM_THREADS", os.environ.get("OMP_NUM_THREADS", "1"))
     env.setdefault("MKL_NUM_THREADS", os.environ.get("MKL_NUM_THREADS", "1"))
 
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             command,
             cwd=str(Path.cwd()),
             env=env,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            check=False,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = process.communicate()
+        except BaseException:
+            base.terminate_subprocess_group(
+                process,
+                reason=f"interrupted DDP subprocess for {dataset_dir.name}",
+            )
+            raise
+        completed = subprocess.CompletedProcess(
+            command,
+            process.returncode,
+            stdout,
+            stderr,
         )
         if args.verbose and completed.stdout.strip():
             print(completed.stdout, end="" if completed.stdout.endswith("\n") else "\n", flush=True)
@@ -1507,12 +1572,11 @@ def evaluate_one_dataset_with_ddp(
 
 def run_retry_failed_datasets_with_ddp(args: argparse.Namespace) -> None:
     data_root = base.resolve_script_path(args.data_root)
-    out_dir = base.resolve_script_path(args.out_dir)
+    raw_model_path_arg = args.model_path
     if not data_root.exists():
         raise FileNotFoundError(f"Data root does not exist: {data_root}")
     if not data_root.is_dir():
         raise NotADirectoryError(f"Data root is not a directory: {data_root}")
-    out_dir.mkdir(parents=True, exist_ok=True)
     if args.workers is not None and int(args.workers) != 1:
         raise ValueError("--retry-failed-datasets-with-ddp requires --workers 1")
     gpu_ids = base.resolve_requested_gpu_ids(args.gpus)
@@ -1534,6 +1598,21 @@ def run_retry_failed_datasets_with_ddp(args: argparse.Namespace) -> None:
         raise FileNotFoundError(
             f"No OOM retry target datasets found under {data_root} for {reference_results_csv}"
         )
+    if args.out_dir is None:
+        checkpoint_stem = result_naming.checkpoint_stem(raw_model_path_arg)
+        model_label = checkpoint_stem.lower() if checkpoint_stem else "limix-16m"
+        out_dir = result_naming.auto_out_dir(
+            model_label=model_label,
+            data_root=data_root,
+            dataset_dirs=all_dataset_dirs,
+            infer_label=result_naming.infer_estimator_label(args, all_if_zero=True),
+            ttt_label=result_naming.ttt_label(args),
+            seed_label=result_naming.seed_label(args),
+        )
+    else:
+        out_dir = base.resolve_script_path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"out_dir: {out_dir}", flush=True)
     if missing_dataset_names:
         print("warning: retry CSV referenced OOM datasets missing under data_root: " + ", ".join(missing_dataset_names), file=sys.stderr, flush=True)
     if skipped_non_oom_names:
@@ -1560,12 +1639,11 @@ def run_retry_failed_datasets_with_ddp(args: argparse.Namespace) -> None:
 
 def run_benchmark(args: argparse.Namespace) -> None:
     data_root = base.resolve_script_path(args.data_root)
-    out_dir = base.resolve_script_path(args.out_dir)
+    raw_model_path_arg = args.model_path
     if not data_root.exists():
         raise FileNotFoundError(f"Data root does not exist: {data_root}")
     if not data_root.is_dir():
         raise NotADirectoryError(f"Data root is not a directory: {data_root}")
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     all_dataset_dirs = base.find_dataset_dirs(data_root)
     dataset_dirs = list(all_dataset_dirs)
@@ -1588,6 +1666,22 @@ def run_benchmark(args: argparse.Namespace) -> None:
         dataset_dirs = dataset_dirs[: args.max_datasets]
     if not dataset_dirs:
         raise FileNotFoundError(f"No dataset directories found under {data_root}")
+    if args.out_dir is None:
+        checkpoint_stem = result_naming.checkpoint_stem(raw_model_path_arg)
+        model_label = checkpoint_stem.lower() if checkpoint_stem else "limix-16m"
+        naming_dataset_dirs = all_dataset_dirs if merge_results_csv is not None else dataset_dirs
+        out_dir = result_naming.auto_out_dir(
+            model_label=model_label,
+            data_root=data_root,
+            dataset_dirs=naming_dataset_dirs,
+            infer_label=result_naming.infer_estimator_label(args, all_if_zero=True),
+            ttt_label=result_naming.ttt_label(args),
+            seed_label=result_naming.seed_label(args),
+        )
+    else:
+        out_dir = base.resolve_script_path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"out_dir: {out_dir}", flush=True)
 
     args.data_root = str(data_root)
     args.out_dir = str(out_dir)
@@ -1605,19 +1699,23 @@ def run_benchmark(args: argparse.Namespace) -> None:
     worker_csvs: list[Path] = []
     processes: list[mp.Process] = []
     args_dict = vars(args).copy()
-    for worker_id in range(args.workers):
-        assigned = [str(path.resolve()) for path in dataset_dirs[worker_id :: args.workers]]
-        worker_csv = out_dir / f"worker_{worker_id}.csv"
-        worker_csvs.append(worker_csv)
-        proc = mp.Process(
-            target=worker_main,
-            args=(worker_id, gpu_ids[worker_id], assigned, str(worker_csv), args_dict),
-            daemon=False,
-        )
-        proc.start()
-        processes.append(proc)
-    for proc in processes:
-        proc.join()
+    try:
+        for worker_id in range(args.workers):
+            assigned = [str(path.resolve()) for path in dataset_dirs[worker_id :: args.workers]]
+            worker_csv = out_dir / f"worker_{worker_id}.csv"
+            worker_csvs.append(worker_csv)
+            proc = mp.Process(
+                target=worker_main,
+                args=(worker_id, gpu_ids[worker_id], assigned, str(worker_csv), args_dict),
+                daemon=False,
+            )
+            proc.start()
+            processes.append(proc)
+        for proc in processes:
+            proc.join()
+    except BaseException:
+        base.terminate_mp_processes(processes, reason="parent benchmark interrupted")
+        raise
 
     frames = [pd.read_csv(path) for path in worker_csvs if path.exists()]
     result_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=RESULT_COLUMNS)
@@ -1638,7 +1736,14 @@ def run_benchmark(args: argparse.Namespace) -> None:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run LimiX chunk/query TTT on data178 classification datasets.")
     parser.add_argument("--data-root", default="../../data178")
-    parser.add_argument("--out-dir", default="limix_results/limix_ttt_epoch30_chunk150")
+    parser.add_argument(
+        "--out-dir",
+        default=None,
+        help=(
+            "Directory for worker CSVs, all_classification_results.csv, and summary.txt. "
+            "If omitted, uses baseline_compare/results/<auto_name>."
+        ),
+    )
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--gpus", default="2,3", help="Comma-separated physical GPU ids, or 'auto'.")
     parser.add_argument("--max-datasets", type=int, default=None)
@@ -1670,7 +1775,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ttt-grad-clip", type=float, default=1.0)
     parser.add_argument("--ttt-weight-decay", type=float, default=0.0)
     parser.add_argument("--ttt-epochs", "--ttt-steps", dest="ttt_epochs", type=int, default=30)
-    parser.add_argument("--ttt-max-chunk-size", type=int, default=150)
+    parser.add_argument("--ttt-max-chunk-size", type=int, default=200)
+    parser.add_argument(
+        "--ttt-accumulation-batch-size",
+        type=int,
+        default=10_000,
+        help="Accumulate chunk gradients until this many raw TTT samples before optimizer.step().",
+    )
     parser.add_argument("--ttt-min-chunk-size", type=int, default=10)
     parser.add_argument("--ttt-query-ratio", type=float, default=0.2)
     parser.add_argument("--ttt-early-stopping", type=parse_bool, default=True)

@@ -23,7 +23,7 @@ import numpy as np
 import torch
 from sklearn.model_selection import StratifiedShuffleSplit, ShuffleSplit
 
-from tabicl._sklearn.preprocessing import EnsembleGenerator
+from tabicl._sklearn.preprocessing import EnsembleGenerator, TransformToNumerical
 
 
 @dataclass
@@ -146,6 +146,12 @@ def _split_ctx_query(
     return ctx_idx, qry_idx
 
 
+def _take_rows(X, indices: np.ndarray):
+    if hasattr(X, "iloc"):
+        return X.iloc[indices]
+    return X[indices]
+
+
 def _build_ensemble_generator(
     *,
     classification: bool,
@@ -194,9 +200,9 @@ def _build_meta_batch(
         query_size = max(query_size, n_classes)
     ctx_idx, qry_idx = _split_ctx_query(y_chunk, query_size=query_size, seed=split_seed, stratify=classification)
 
-    X_ctx = X_chunk[ctx_idx]
+    X_ctx = _take_rows(X_chunk, ctx_idx)
     y_ctx = y_chunk[ctx_idx]
-    X_qry = X_chunk[qry_idx]
+    X_qry = _take_rows(X_chunk, qry_idx)
     y_qry = y_chunk[qry_idx]
 
     y_mean: Optional[float] = None
@@ -208,6 +214,10 @@ def _build_meta_batch(
             y_std = 1e-8
         y_ctx = (y_ctx - y_mean) / y_std
         y_qry = (y_qry - y_mean) / y_std
+
+    x_encoder = TransformToNumerical()
+    X_ctx = x_encoder.fit_transform(X_ctx)
+    X_qry = x_encoder.transform(X_qry)
 
     gen = _build_ensemble_generator(
         classification=classification,
@@ -307,7 +317,7 @@ def iter_epoch_meta_batches(
         sharded = list(enumerate(chunks))
 
     for chunk_idx, indices in sharded:
-        X_chunk = X[indices]
+        X_chunk = _take_rows(X, indices)
         y_chunk = y[indices]
         query_size = max(1, int(len(indices) * query_ratio))
         yield _build_meta_batch(

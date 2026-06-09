@@ -24,7 +24,7 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-DEFAULT_DATA_ROOT = Path("data178")
+DEFAULT_DATA_ROOT = Path("openml_cc18")
 DEFAULT_MODEL_PATH = "tabicl-classifier-v1.1-20250506.ckpt"
 DEFAULT_CHECKPOINT_VERSION = "tabicl-classifier-v1.1-20250506.ckpt"
 CLASSIFICATION_TASKS = {"binclass", "multiclass"}
@@ -301,6 +301,25 @@ def collect_torch_diagnostics() -> Dict[str, object]:
         "ROCR_VISIBLE_DEVICES": os.environ.get("ROCR_VISIBLE_DEVICES"),
         "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES"),
     }
+
+
+def use_rocm_gpu_visibility() -> bool:
+    backend = (os.environ.get("TFM_GPU_BACKEND") or os.environ.get("TABICL_GPU_BACKEND") or "").strip().lower()
+    return backend in {"rocm", "hip", "amd"}
+
+
+def bind_worker_gpu_environment(gpu_id: int | str) -> None:
+    gpu_id_str = str(gpu_id)
+    if use_rocm_gpu_visibility():
+        os.environ["ROCR_VISIBLE_DEVICES"] = gpu_id_str
+        os.environ["HIP_VISIBLE_DEVICES"] = gpu_id_str
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+    else:
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id_str
+        os.environ.pop("ROCR_VISIBLE_DEVICES", None)
+        os.environ.pop("HIP_VISIBLE_DEVICES", None)
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 
 def stable_feature_prefix(context: str, fallback: str) -> str:
@@ -831,18 +850,17 @@ def worker_main(
     model_kwargs: Dict,
     verbose: bool,
 ) -> None:
+    def write_result_rows_csv(rows: List[ResultRow]) -> None:
+        if not rows:
+            return
+        out_path = Path(worker_out_csv)
+        tmp_path = out_path.with_name(f".{out_path.name}.tmp.{os.getpid()}")
+        pd.DataFrame([asdict(row) for row in rows]).to_csv(tmp_path, index=False)
+        tmp_path.replace(out_path)
+
     try:
         ensure_runtime_deps()
-        gpu_id_str = str(gpu_id)
-        # Restrict visibility for both ROCm and CUDA hosts. On AMD boxes
-        # ROCR_VISIBLE_DEVICES is the effective selector, while on NVIDIA/CUDA
-        # hosts we must also set CUDA_VISIBLE_DEVICES to bind each worker to
-        # its assigned physical GPU before using device="cuda:0" internally.
-        os.environ["ROCR_VISIBLE_DEVICES"] = gpu_id_str
-        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id_str
-        os.environ.pop("HIP_VISIBLE_DEVICES", None)
-        os.environ.setdefault("OMP_NUM_THREADS", "1")
-        os.environ.setdefault("MKL_NUM_THREADS", "1")
+        bind_worker_gpu_environment(gpu_id)
 
         import torch
         from tabicl import TabICLClassifier
@@ -894,8 +912,9 @@ def worker_main(
                         f"[worker {worker_id} | gpu {gpu_id}] "
                         f"[fail] {row.dataset_name} error={row.error}"
                     )
+            write_result_rows_csv(rows)
 
-        pd.DataFrame([asdict(row) for row in rows]).to_csv(worker_out_csv, index=False)
+        write_result_rows_csv(rows)
     except Exception:
         try:
             ready_queue.put(
@@ -936,6 +955,123 @@ def worker_main(
         crash_row.to_csv(worker_out_csv, index=False)
 
 
+def make_worker_failure_row(
+    kind: str,
+    worker_id: int | str,
+    *,
+    assigned_count: int,
+    error: str,
+) -> ResultRow:
+    return ResultRow(
+        dataset_name=f"__{kind}__{worker_id}",
+        dataset_dir="__worker__",
+        task_type=None,
+        n_train=0,
+        n_val=0,
+        n_test=0,
+        n_features=0,
+        n_classes=0,
+        accuracy=None,
+        f1=None,
+        balanced_accuracy=None,
+        roc_auc=None,
+        log_loss=None,
+        fit_seconds=0.0,
+        predict_seconds=0.0,
+        status="fail",
+        error=f"{error}; assigned_count={assigned_count}",
+    )
+
+
+def collect_worker_output_frames(
+    *,
+    worker_csv_paths: List[Path],
+    worker_assigned_counts: List[int],
+    processes: List[mp.Process],
+    dataset_dirs: List[Path],
+) -> tuple[List[Any], List[str]]:
+    ensure_runtime_deps()
+
+    frames: List[Any] = []
+    integrity_errors: List[str] = []
+    failure_rows: List[ResultRow] = []
+
+    for worker_id, worker_csv in enumerate(worker_csv_paths):
+        assigned_count = worker_assigned_counts[worker_id]
+        proc = processes[worker_id]
+        worker_frame = None
+
+        if worker_csv.exists():
+            try:
+                worker_frame = pd.read_csv(worker_csv)
+                frames.append(worker_frame)
+            except Exception as exc:
+                error = f"failed to read {worker_csv}: {type(exc).__name__}: {exc}"
+                integrity_errors.append(f"worker_{worker_id}: {error}")
+                failure_rows.append(
+                    make_worker_failure_row(
+                        "WORKER_BAD_CSV",
+                        worker_id,
+                        assigned_count=assigned_count,
+                        error=error,
+                    )
+                )
+
+        if proc.exitcode not in (0, None):
+            error = f"worker exited with exitcode={proc.exitcode}"
+            completed_count = 0 if worker_frame is None else len(worker_frame)
+            if completed_count < assigned_count:
+                integrity_errors.append(
+                    f"worker_{worker_id}: {error}; completed_count={completed_count}"
+                )
+                failure_rows.append(
+                    make_worker_failure_row(
+                        "WORKER_EXIT",
+                        worker_id,
+                        assigned_count=assigned_count,
+                        error=error,
+                    )
+                )
+
+        if worker_csv.exists():
+            continue
+
+        if assigned_count > 0:
+            error = f"missing worker CSV: {worker_csv}"
+            integrity_errors.append(f"worker_{worker_id}: {error}")
+            failure_rows.append(
+                make_worker_failure_row(
+                    "WORKER_MISSING_CSV",
+                    worker_id,
+                    assigned_count=assigned_count,
+                    error=error,
+                )
+            )
+
+    if failure_rows:
+        frames.append(pd.DataFrame([asdict(row) for row in failure_rows]))
+
+    if not frames and dataset_dirs:
+        error = "no worker results were produced"
+        integrity_errors.append(error)
+        frames.append(
+            pd.DataFrame(
+                [
+                    asdict(
+                        make_worker_failure_row(
+                            "EMPTY_RESULT",
+                            "all",
+                            assigned_count=len(dataset_dirs),
+                            error=error,
+                        )
+                    )
+                ]
+            )
+        )
+
+    return frames, integrity_errors
+
+
 def model_pool_worker_main(
     worker_id: int,
     gpu_id: int,
@@ -951,12 +1087,7 @@ def model_pool_worker_main(
 
     try:
         ensure_runtime_deps()
-        # Keep the per-worker device mapping consistent across ROCm and CUDA.
-        os.environ["ROCR_VISIBLE_DEVICES"] = str(gpu_id)
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-        os.environ.pop("HIP_VISIBLE_DEVICES", None)
-        os.environ.setdefault("OMP_NUM_THREADS", "1")
-        os.environ.setdefault("MKL_NUM_THREADS", "1")
+        bind_worker_gpu_environment(gpu_id)
 
         import torch
         from tabicl import TabICLClassifier
@@ -1209,9 +1340,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-path", default=None)
     parser.add_argument("--models-dir", default=None)
     parser.add_argument("--checkpoint-version", default=DEFAULT_CHECKPOINT_VERSION)
-    parser.add_argument("--out-dir", default="baseline/iclv1.1_ensemble32")
-    parser.add_argument("--workers", type=int, default=2)
-    parser.add_argument("--gpus", default="2,3")
+    parser.add_argument("--out-dir", default="baseline/iclv1.1_ensemble32_openmlcc18")
+    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--gpus", default="1")
     parser.add_argument(
         "--n-estimators",
         "--ensemble",
@@ -1446,11 +1577,13 @@ def run_single_model_mode(
     start_event = mp.Event()
 
     worker_csv_paths: List[Path] = []
+    worker_assigned_counts: List[int] = []
     processes: List[mp.Process] = []
     for worker_id in range(args.workers):
         assigned_dirs = [str(path.resolve()) for path in dataset_dirs[worker_id::args.workers]]
         worker_csv = out_dir / f"worker_{worker_id}.csv"
         worker_csv_paths.append(worker_csv)
+        worker_assigned_counts.append(len(assigned_dirs))
 
         proc = mp.Process(
             target=worker_main,
@@ -1506,10 +1639,12 @@ def run_single_model_mode(
     for proc in processes:
         proc.join()
 
-    dfs: List[pd.DataFrame] = []
-    for worker_csv in worker_csv_paths:
-        if worker_csv.exists():
-            dfs.append(pd.read_csv(worker_csv))
+    dfs, integrity_errors = collect_worker_output_frames(
+        worker_csv_paths=worker_csv_paths,
+        worker_assigned_counts=worker_assigned_counts,
+        processes=processes,
+        dataset_dirs=dataset_dirs,
+    )
 
     all_df = (
         pd.concat(dfs, ignore_index=True)
@@ -1527,6 +1662,14 @@ def run_single_model_mode(
     print(f"saved_summary: {summary_txt}")
     print("model_kwargs:")
     print(json.dumps(model_kwargs, indent=2, ensure_ascii=False))
+
+    system_failure_mask = (
+        all_df["dataset_name"].astype(str).str.startswith("__WORKER_")
+        | all_df["dataset_name"].astype(str).str.startswith("__EMPTY_RESULT__")
+    )
+    if integrity_errors or system_failure_mask.any():
+        details = "; ".join(integrity_errors) if integrity_errors else "worker failure rows were produced"
+        print(f"warning: TabICL worker output integrity check failed: {details}")
 
 
 def run_multi_model_mode(

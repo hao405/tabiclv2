@@ -1,0 +1,19 @@
+strategy: ttt
+model_key: tabpfnv3
+reference_dir: tabpfnv3_1c_ttt_epoch30_chunk2000_lr5e-6
+merge_mode: full_data200
+discovered_datasets: 200
+processed_datasets: 200
+ok_count: 194
+failed_count: 6
+skipped_count: 0
+ttt_oom_fallback_count: 0
+avg_accuracy_ok: 0.850574
+avg_f1_ok: 0.841952
+avg_balanced_accuracy_ok: 0.776254
+avg_roc_auc_ok: 0.905782
+avg_log_loss_ok: 0.350922
+avg_fit_seconds_ok: 152.760724
+avg_predict_seconds_ok: 17.258793
+failed_datasets: accelerometer, internet_firewall, one-hundred-plants-margin, one-hundred-plants-shape, one-hundred-plants-texture, shuttle
+skipped_datasets: (none)

@@ -124,13 +124,6 @@ python -m Experiment_TTT_pipeline --strategy inference --models tabpfnv25 \
   --out-root baseline_compare/compare_results_pipeline --workers 1 --gpus auto --verbose
 ```
 
-TabPFN v2.6:
-
-```bash
-python -m Experiment_TTT_pipeline --strategy inference --models tabpfnv26 \
-  --out-root baseline_compare/compare_results_pipeline --workers 1 --gpus auto --verbose
-```
-
 TabPFN v3:
 
 ```bash
@@ -149,13 +142,6 @@ TaBR:
 
 ```bash
 python -m Experiment_TTT_pipeline --strategy inference --models tabr \
-  --out-root baseline_compare/compare_results_pipeline --workers 1 --gpus auto --verbose
-```
-
-TabDPT:
-
-```bash
-python -m Experiment_TTT_pipeline --strategy inference --models tabdpt \
   --out-root baseline_compare/compare_results_pipeline --workers 1 --gpus auto --verbose
 ```
 
@@ -203,13 +189,6 @@ python -m Experiment_TTT_pipeline --strategy ttt --models tabpfnv25 \
   --out-root baseline_compare/compare_results_pipeline --workers 1 --gpus auto --verbose
 ```
 
-TabPFN v2.6:
-
-```bash
-python -m Experiment_TTT_pipeline --strategy ttt --models tabpfnv26 \
-  --out-root baseline_compare/compare_results_pipeline --workers 1 --gpus auto --verbose
-```
-
 TabPFN v3:
 
 ```bash
@@ -221,13 +200,6 @@ LimiX:
 
 ```bash
 python -m Experiment_TTT_pipeline --strategy ttt --models limix \
-  --out-root baseline_compare/compare_results_pipeline --workers 1 --gpus auto --verbose
-```
-
-TabDPT:
-
-```bash
-python -m Experiment_TTT_pipeline --strategy ttt --models tabdpt \
   --out-root baseline_compare/compare_results_pipeline --workers 1 --gpus auto --verbose
 ```
 

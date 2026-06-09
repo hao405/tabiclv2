@@ -18,6 +18,9 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+BASELINE_COMPARE_ROOT = SCRIPT_DIR.parent
+if str(BASELINE_COMPARE_ROOT) not in sys.path:
+    sys.path.insert(0, str(BASELINE_COMPARE_ROOT))
 
 
 def add_sys_path_if_exists(path: Path | None, *, prepend: bool = True) -> None:
@@ -86,6 +89,7 @@ def import_many_class_classifier():
 
 import numpy as np
 import pandas as pd
+import result_naming
 
 CLASSIFICATION_TASKS = {"binclass", "multiclass"}
 CATEGORICAL_MISSING_TOKEN = "__tabicl_missing__"
@@ -1196,10 +1200,21 @@ def resolve_workers_and_gpu_ids(args: argparse.Namespace) -> tuple[int, list[int
     return workers, gpu_ids
 
 
+def use_rocm_gpu_visibility() -> bool:
+    backend = (os.environ.get("TFM_GPU_BACKEND") or os.environ.get("TABICL_GPU_BACKEND") or "").strip().lower()
+    return backend in {"rocm", "hip", "amd"}
+
+
 def bind_worker_gpu(gpu_id: int) -> None:
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    os.environ["ROCR_VISIBLE_DEVICES"] = str(gpu_id)
-    os.environ.pop("HIP_VISIBLE_DEVICES", None)
+    gpu_id_str = str(gpu_id)
+    if use_rocm_gpu_visibility():
+        os.environ["ROCR_VISIBLE_DEVICES"] = gpu_id_str
+        os.environ["HIP_VISIBLE_DEVICES"] = gpu_id_str
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+    else:
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id_str
+        os.environ.pop("ROCR_VISIBLE_DEVICES", None)
+        os.environ.pop("HIP_VISIBLE_DEVICES", None)
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
 
@@ -1264,7 +1279,7 @@ def worker_main(
 
 def run_benchmark(args: argparse.Namespace) -> None:
     data_root = resolve_script_path(args.data_root)
-    out_dir = resolve_script_path(args.out_dir)
+    raw_model_path_arg = args.model_path
     if args.model_version == "v3" and is_auto_model_path_value(args.model_path):
         args.model_path = None
     else:
@@ -1281,7 +1296,6 @@ def run_benchmark(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"Data root does not exist: {data_root}")
     if not data_root.is_dir():
         raise NotADirectoryError(f"Data root is not a directory: {data_root}")
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     all_dataset_dirs = find_dataset_dirs(data_root)
     dataset_dirs = list(all_dataset_dirs)
@@ -1325,6 +1339,23 @@ def run_benchmark(args: argparse.Namespace) -> None:
                 f"No retry target datasets found under {data_root} for {retry_results_csv}"
             )
         raise FileNotFoundError(f"No dataset directories found under {data_root}")
+
+    if args.out_dir is None:
+        checkpoint_stem = result_naming.checkpoint_stem(raw_model_path_arg)
+        model_label = f"tabpfn-{checkpoint_stem}" if checkpoint_stem else f"tabpfn{args.model_version}"
+        naming_dataset_dirs = all_dataset_dirs if merge_results_csv is not None else dataset_dirs
+        out_dir = result_naming.auto_out_dir(
+            model_label=model_label,
+            data_root=data_root,
+            dataset_dirs=naming_dataset_dirs,
+            infer_label=result_naming.infer_estimator_label(args),
+            ttt_label=result_naming.no_ttt_label(),
+            seed_label=result_naming.seed_label(args),
+        )
+    else:
+        out_dir = resolve_script_path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"out_dir: {out_dir}", flush=True)
 
     args.data_root = str(data_root)
     args.out_dir = str(out_dir)
@@ -1394,8 +1425,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--out-dir",
-        default="tabpfnv2.5_results_ensemble8",
-        help="Directory for worker CSVs, all_classification_results.csv, and summary.txt.",
+        default=None,
+        help=(
+            "Directory for worker CSVs, all_classification_results.csv, and summary.txt. "
+            "If omitted, uses baseline_compare/results/<auto_name>."
+        ),
     )
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument(

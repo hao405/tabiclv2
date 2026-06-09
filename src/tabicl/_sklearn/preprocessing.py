@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import random
 import itertools
+import inspect
 from collections import OrderedDict
 from copy import deepcopy
 from typing import List, Optional
@@ -23,6 +24,13 @@ from sklearn.preprocessing import (
 from sklearn.utils.validation import check_is_fitted
 
 from .sklearn_utils import validate_data
+
+
+def _make_numeric_imputer() -> SimpleImputer:
+    kwargs = {}
+    if "keep_empty_features" in inspect.signature(SimpleImputer).parameters:
+        kwargs["keep_empty_features"] = True
+    return SimpleImputer(**kwargs)
 
 
 class RecursionLimitManager:
@@ -100,7 +108,7 @@ class TransformToNumerical(TransformerMixin, BaseEstimator):
         cat_tfm = OrdinalEncoder(
             dtype=np.int64, handle_unknown="use_encoded_value", unknown_value=-1, encoded_missing_value=-1
         )
-        num_tfm = SimpleImputer()
+        num_tfm = _make_numeric_imputer()
 
         if not hasattr(X, "columns"):  # proxy way to check whether X is a dataframe without importing pandas
             # no dataframe
