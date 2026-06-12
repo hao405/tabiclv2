@@ -138,6 +138,20 @@ class TTTSplit:
 
 
 @dataclass
+class ColAttentionSelectionResult:
+    ctx_idx: Any
+    qry_idx: Any
+    split_strategy: str
+    score_sum: float = 0.0
+    score_sumsq: float = 0.0
+    score_count: int = 0
+    selected_attention_count: int = 0
+    selected_random_count: int = 0
+    fallback_reason: Optional[str] = None
+    label_coverage_ok: bool = True
+
+
+@dataclass
 class TTTUpdateResult:
     applied: bool
     loss: Optional[float]
@@ -968,6 +982,229 @@ def _split_ctx_query(y_chunk, *, query_size: int, seed: int) -> tuple[Any, Any, 
         return ctx_idx, qry_idx, f"random_fallback:{type(exc).__name__}"
 
 
+def _label_coverage_ok(y_chunk, qry_idx) -> bool:
+    y_arr = np.asarray(y_chunk).astype(int)
+    qry_arr = np.asarray(qry_idx, dtype=np.int64)
+    if qry_arr.size == 0 or qry_arr.size >= y_arr.size:
+        return False
+    selected = np.zeros(y_arr.size, dtype=bool)
+    selected[qry_arr] = True
+    y_ctx = y_arr[~selected]
+    y_qry = y_arr[selected]
+    return set(y_qry.tolist()).issubset(set(y_ctx.tolist()))
+
+
+def _make_ctx_indices(n: int, qry_idx) -> Any:
+    selected = np.zeros(int(n), dtype=bool)
+    selected[np.asarray(qry_idx, dtype=np.int64)] = True
+    return np.flatnonzero(~selected).astype(np.int64)
+
+
+def _safe_selection_mask(y_chunk) -> Dict[int, int]:
+    y_arr = np.asarray(y_chunk).astype(int)
+    counts: Dict[int, int] = {}
+    for label in y_arr.tolist():
+        counts[int(label)] = counts.get(int(label), 0) + 1
+    return counts
+
+
+def _can_add_query_index(index: int, y_chunk, selected_mask, label_counts: Dict[int, int]) -> bool:
+    label = int(np.asarray(y_chunk)[int(index)])
+    selected_for_label = int(np.sum(selected_mask & (np.asarray(y_chunk).astype(int) == label)))
+    return selected_for_label < int(label_counts.get(label, 0)) - 1
+
+
+def _iter_stratified_random_candidates(y_chunk, candidates, rng) -> List[int]:
+    y_arr = np.asarray(y_chunk).astype(int)
+    groups: Dict[int, List[int]] = {}
+    for idx in np.asarray(candidates, dtype=np.int64).tolist():
+        groups.setdefault(int(y_arr[idx]), []).append(int(idx))
+    for label in list(groups.keys()):
+        groups[label] = rng.permutation(groups[label]).astype(int).tolist()
+
+    labels = rng.permutation(list(groups.keys())).astype(int).tolist() if groups else []
+    ordered: List[int] = []
+    while labels:
+        next_labels: List[int] = []
+        for label in labels:
+            bucket = groups.get(int(label), [])
+            if not bucket:
+                continue
+            ordered.append(int(bucket.pop(0)))
+            if bucket:
+                next_labels.append(int(label))
+        labels = rng.permutation(next_labels).astype(int).tolist() if next_labels else []
+    return ordered
+
+
+def _fallback_random_col_attention_selection(y_chunk, *, query_size: int, seed: int, reason: str) -> ColAttentionSelectionResult:
+    ctx_idx, qry_idx, split_strategy = _split_ctx_query(y_chunk, query_size=query_size, seed=seed)
+    coverage_ok = _label_coverage_ok(y_chunk, qry_idx)
+    return ColAttentionSelectionResult(
+        ctx_idx=np.asarray(ctx_idx, dtype=np.int64),
+        qry_idx=np.asarray(qry_idx, dtype=np.int64),
+        split_strategy=f"fallback_from_col_attention_mix:{split_strategy}",
+        fallback_reason=reason,
+        label_coverage_ok=bool(coverage_ok),
+    )
+
+
+def _select_col_attention_mix_query_indices(
+    y_chunk,
+    col_attention_scores,
+    *,
+    query_size: int,
+    seed: int,
+    col_attn_ratio: float = 0.6,
+    random_ratio: float = 0.4,
+) -> ColAttentionSelectionResult:
+    ensure_runtime_deps()
+
+    y_arr = np.asarray(y_chunk).astype(int)
+    scores = np.asarray(col_attention_scores, dtype=np.float64)
+    n = int(y_arr.shape[0])
+    query_size = max(1, min(int(query_size), n - 1))
+    if n < 2:
+        return ColAttentionSelectionResult(
+            ctx_idx=np.asarray([], dtype=np.int64),
+            qry_idx=np.asarray([], dtype=np.int64),
+            split_strategy="col_attention_mix",
+            fallback_reason="chunk has fewer than two samples",
+            label_coverage_ok=False,
+        )
+    if scores.shape[0] != n:
+        return _fallback_random_col_attention_selection(
+            y_arr,
+            query_size=query_size,
+            seed=seed,
+            reason=f"col_attention_score_shape_mismatch:{scores.shape[0]}!={n}",
+        )
+    if not np.isfinite(scores).any():
+        return _fallback_random_col_attention_selection(
+            y_arr,
+            query_size=query_size,
+            seed=seed,
+            reason="col_attention_scores_all_nonfinite",
+        )
+
+    finite_scores = np.where(np.isfinite(scores), scores, -np.inf)
+    rng = np.random.default_rng(seed)
+    label_counts = _safe_selection_mask(y_arr)
+    selected_mask = np.zeros(n, dtype=bool)
+    selected_attention: List[int] = []
+    selected_random: List[int] = []
+    n_attn = min(query_size, int(round(query_size * float(col_attn_ratio))))
+    n_random = query_size - n_attn
+
+    order = np.argsort(-finite_scores, kind="mergesort").astype(int).tolist()
+    for idx in order:
+        if len(selected_attention) >= n_attn:
+            break
+        if selected_mask[idx]:
+            continue
+        if not _can_add_query_index(idx, y_arr, selected_mask, label_counts):
+            continue
+        selected_mask[idx] = True
+        selected_attention.append(int(idx))
+
+    remaining = np.flatnonzero(~selected_mask).astype(np.int64)
+    for idx in _iter_stratified_random_candidates(y_arr, remaining, rng):
+        if len(selected_random) >= n_random:
+            break
+        if selected_mask[idx]:
+            continue
+        if not _can_add_query_index(idx, y_arr, selected_mask, label_counts):
+            continue
+        selected_mask[idx] = True
+        selected_random.append(int(idx))
+
+    for idx in order:
+        if int(selected_mask.sum()) >= query_size:
+            break
+        if selected_mask[idx]:
+            continue
+        if not _can_add_query_index(idx, y_arr, selected_mask, label_counts):
+            continue
+        selected_mask[idx] = True
+        selected_attention.append(int(idx))
+
+    remaining = np.flatnonzero(~selected_mask).astype(np.int64)
+    for idx in rng.permutation(remaining).astype(int).tolist():
+        if int(selected_mask.sum()) >= query_size:
+            break
+        if not _can_add_query_index(idx, y_arr, selected_mask, label_counts):
+            continue
+        selected_mask[idx] = True
+        selected_random.append(int(idx))
+
+    qry_idx = np.flatnonzero(selected_mask).astype(np.int64)
+    if qry_idx.shape[0] != query_size:
+        return _fallback_random_col_attention_selection(
+            y_arr,
+            query_size=query_size,
+            seed=seed,
+            reason=f"safe_col_attention_mix_insufficient:{qry_idx.shape[0]}/{query_size}",
+        )
+
+    coverage_ok = _label_coverage_ok(y_arr, qry_idx)
+    if not coverage_ok:
+        return _fallback_random_col_attention_selection(
+            y_arr,
+            query_size=query_size,
+            seed=seed,
+            reason="col_attention_mix query labels absent from context",
+        )
+
+    selected_scores = finite_scores[qry_idx]
+    selected_scores = selected_scores[np.isfinite(selected_scores)]
+    return ColAttentionSelectionResult(
+        ctx_idx=_make_ctx_indices(n, qry_idx),
+        qry_idx=qry_idx,
+        split_strategy="col_attention_mix",
+        score_sum=float(selected_scores.sum()) if selected_scores.size else 0.0,
+        score_sumsq=float(np.square(selected_scores).sum()) if selected_scores.size else 0.0,
+        score_count=int(selected_scores.size),
+        selected_attention_count=int(len(selected_attention)),
+        selected_random_count=int(len(selected_random)),
+        fallback_reason=None,
+        label_coverage_ok=True,
+    )
+
+
+def _select_ctx_query_for_chunk(
+    y_chunk,
+    col_attention_scores,
+    *,
+    query_size: int,
+    seed: int,
+    config: TTTConfig,
+) -> ColAttentionSelectionResult:
+    if getattr(config, "c_selection", "col_attention_mix") == "random":
+        ctx_idx, qry_idx, split_strategy = _split_ctx_query(y_chunk, query_size=query_size, seed=seed)
+        return ColAttentionSelectionResult(
+            ctx_idx=np.asarray(ctx_idx, dtype=np.int64),
+            qry_idx=np.asarray(qry_idx, dtype=np.int64),
+            split_strategy=split_strategy,
+            label_coverage_ok=_label_coverage_ok(y_chunk, qry_idx),
+        )
+
+    if col_attention_scores is None:
+        return _fallback_random_col_attention_selection(
+            y_chunk,
+            query_size=query_size,
+            seed=seed,
+            reason="col_attention_scores_unavailable",
+        )
+    return _select_col_attention_mix_query_indices(
+        y_chunk,
+        col_attention_scores,
+        query_size=query_size,
+        seed=seed,
+        col_attn_ratio=float(getattr(config, "col_attn_ratio", 0.6)),
+        random_ratio=float(getattr(config, "random_ratio", 0.4)),
+    )
+
+
 def split_ttt_validation(
     X,
     y,
@@ -1154,6 +1391,154 @@ def _fit_preserving_model_weights(classifier, X, y) -> None:
             classifier._load_model = original_load_model
 
 
+def _get_last_col_attention_module(classifier, *, layer: str = "last"):
+    if layer != "last":
+        raise ValueError("--ttt-col-attn-layer currently supports only: last")
+    base_model = _get_ttt_base_model(classifier)
+    blocks = getattr(getattr(getattr(base_model, "col_embedder", None), "tf_col", None), "blocks", None)
+    if blocks is None or len(blocks) == 0:
+        raise RuntimeError("Cannot locate base_model.col_embedder.tf_col.blocks")
+    block = blocks[-1]
+    return block.multihead_attn2.attn
+
+
+def _accumulate_col_attention_profiles(profile_accumulator, attn_module, hook_args, hook_kwargs) -> None:
+    import torch
+    import torch.nn.functional as torch_F
+
+    query = hook_args[0] if len(hook_args) >= 1 else hook_kwargs.get("query")
+    key = hook_args[1] if len(hook_args) >= 2 else hook_kwargs.get("key")
+    value = hook_args[2] if len(hook_args) >= 3 else hook_kwargs.get("value")
+    cached_kv = hook_kwargs.get("cached_kv")
+    key_padding_mask = hook_kwargs.get("key_padding_mask")
+    attn_mask = hook_kwargs.get("attn_mask")
+    rope = hook_kwargs.get("rope")
+    if query is None:
+        return
+
+    num_heads = int(attn_module.num_heads)
+    *batch_shape, tgt_len, embed_dim = query.shape
+    head_dim = embed_dim // num_heads
+    if head_dim * num_heads != embed_dim:
+        return
+
+    if cached_kv is None:
+        if key is None or value is None:
+            return
+        src_len = int(key.shape[-2])
+        q, k, _v = torch_F._in_projection_packed(
+            query,
+            key,
+            value,
+            attn_module.in_proj_weight,
+            attn_module.in_proj_bias,
+        )
+        q = q.view(*batch_shape, tgt_len, num_heads, head_dim).transpose(-3, -2)
+        k = k.view(*batch_shape, src_len, num_heads, head_dim).transpose(-3, -2)
+        if rope is not None:
+            q = rope.rotate_queries_or_keys(q)
+            k = rope.rotate_queries_or_keys(k)
+    else:
+        src_len = int(cached_kv.key.shape[-2])
+        q_proj_weight = attn_module.in_proj_weight[:embed_dim]
+        q_proj_bias = attn_module.in_proj_bias[:embed_dim] if attn_module.in_proj_bias is not None else None
+        q = torch_F.linear(query, q_proj_weight, q_proj_bias)
+        q = q.view(*batch_shape, tgt_len, num_heads, head_dim).transpose(-3, -2)
+        if rope is not None:
+            q = rope.rotate_queries_or_keys(q)
+        k = cached_kv.key
+
+    ssmax_layer = getattr(attn_module, "ssmax_layer", None)
+    if ssmax_layer is not None:
+        q = ssmax_layer(q, src_len)
+
+    scale = float(head_dim) ** -0.5
+    attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+    if attn_mask is not None:
+        if attn_mask.dim() == 2:
+            attn_mask = attn_mask.expand(*batch_shape, num_heads, tgt_len, src_len)
+        attn_scores = attn_scores + attn_mask
+    if key_padding_mask is not None:
+        key_padding_mask = key_padding_mask.view(*batch_shape, 1, 1, src_len).expand(
+            *batch_shape, num_heads, tgt_len, src_len
+        )
+        attn_scores = attn_scores + key_padding_mask
+
+    attn_weights = torch.softmax(attn_scores, dim=-1)
+    profile = attn_weights.detach().float()
+    reduce_dims = tuple(dim for dim in range(profile.ndim) if dim not in {profile.ndim - 2, profile.ndim - 1})
+    if reduce_dims:
+        profile = profile.mean(dim=reduce_dims)
+    profile_accumulator.append(profile.cpu())
+
+
+def _compute_col_attention_profile_scores(classifier, X_reference, *, expected_train_size: int, layer: str = "last"):
+    ensure_runtime_deps()
+    if X_reference is None or len(X_reference) == 0:
+        return None, "empty_col_attention_reference"
+
+    import torch
+
+    base_model = _get_ttt_base_model(classifier)
+    profiles = []
+    original_training = bool(base_model.training)
+    original_cache = getattr(classifier, "model_kv_cache_", None)
+    hook_handle = None
+    try:
+        attn_module = _get_last_col_attention_module(classifier, layer=layer)
+
+        def _hook(module, args, kwargs):
+            _accumulate_col_attention_profiles(profiles, module, args, kwargs)
+
+        hook_handle = attn_module.register_forward_pre_hook(_hook, with_kwargs=True)
+        classifier.model_kv_cache_ = None
+        base_model.eval()
+        with torch.inference_mode():
+            classifier.predict_proba(X_reference)
+    except Exception as exc:
+        return None, f"col_attention_probe_failed:{type(exc).__name__}:{exc}"
+    finally:
+        if hook_handle is not None:
+            hook_handle.remove()
+        classifier.model_kv_cache_ = original_cache
+        if original_training:
+            base_model.train()
+        else:
+            base_model.eval()
+
+    usable_profiles = [profile for profile in profiles if profile.ndim == 2]
+    if not usable_profiles:
+        return None, "col_attention_probe_empty"
+
+    stacked = []
+    for profile in usable_profiles:
+        if profile.shape[0] >= expected_train_size + 1:
+            stacked.append(profile)
+    if not stacked:
+        return None, "col_attention_probe_no_train_test_rows"
+
+    min_rows = min(int(profile.shape[0]) for profile in stacked)
+    min_cols = min(int(profile.shape[1]) for profile in stacked)
+    if min_rows <= expected_train_size or min_cols <= 0:
+        return None, "col_attention_probe_invalid_profile_shape"
+
+    profile_tensor = torch.stack([profile[:min_rows, :min_cols] for profile in stacked], dim=0).mean(dim=0)
+    train_profiles = profile_tensor[:expected_train_size]
+    ref_profiles = profile_tensor[expected_train_size:]
+    if train_profiles.shape[0] != expected_train_size or ref_profiles.shape[0] == 0:
+        return None, "col_attention_probe_missing_reference_rows"
+
+    train_profiles = train_profiles / train_profiles.norm(dim=1, keepdim=True).clamp_min(1e-12)
+    ref_centroid = ref_profiles.mean(dim=0)
+    ref_centroid = ref_centroid / ref_centroid.norm().clamp_min(1e-12)
+    scores = (train_profiles @ ref_centroid).numpy().astype(np.float64)
+    if scores.shape[0] != expected_train_size:
+        return None, "col_attention_score_length_mismatch"
+    if not np.isfinite(scores).any():
+        return None, "col_attention_scores_nonfinite"
+    return scores, None
+
+
 def _optional_metric_to_float(value: Optional[float]) -> float:
     if value is None:
         return float("nan")
@@ -1241,6 +1626,7 @@ def _build_classification_meta_batch(
     query_size: int,
     epoch_seed: int,
     chunk_idx: int,
+    col_attention_scores=None,
 ) -> MetaBatch:
     try:
         from tabicl._sklearn.preprocessing import EnsembleGenerator
@@ -1253,7 +1639,14 @@ def _build_classification_meta_batch(
     split_seed = int(epoch_seed + chunk_idx * 7919)
     n_classes_in_chunk = int(np.max(y_chunk)) + 1
     query_size = max(int(query_size), n_classes_in_chunk)
-    ctx_idx, qry_idx, split_strategy = _split_ctx_query(y_chunk, query_size=query_size, seed=split_seed)
+    selection = _select_ctx_query_for_chunk(
+        y_chunk,
+        col_attention_scores,
+        query_size=query_size,
+        seed=split_seed,
+        config=config,
+    )
+    ctx_idx, qry_idx, split_strategy = selection.ctx_idx, selection.qry_idx, selection.split_strategy
     y_ctx_raw = np.asarray(y_chunk)[ctx_idx].astype(int)
     y_qry_raw = np.asarray(y_chunk)[qry_idx].astype(int)
 
@@ -1266,6 +1659,8 @@ def _build_classification_meta_batch(
             0,
             "query labels absent from context after "
             f"{split_strategy} split: {','.join(str(item) for item in missing_query_labels)}",
+            col_attn_fallback_reason=selection.fallback_reason,
+            col_attn_label_coverage_ok=False,
         )
 
     local_classes = np.asarray(sorted(set(y_ctx_raw.tolist())), dtype=np.int64)
@@ -1313,6 +1708,13 @@ def _build_classification_meta_batch(
         y_query=torch.from_numpy(np.stack(y_query_list, axis=0)).long(),
         train_size=int(len(ctx_idx)),
         skip_reason=None,
+        col_attn_score_sum=selection.score_sum,
+        col_attn_score_sumsq=selection.score_sumsq,
+        col_attn_score_count=selection.score_count,
+        col_attn_selected_attention_count=selection.selected_attention_count,
+        col_attn_selected_random_count=selection.selected_random_count,
+        col_attn_fallback_reason=selection.fallback_reason,
+        col_attn_label_coverage_ok=selection.label_coverage_ok,
     )
 
 
@@ -1323,6 +1725,7 @@ def iter_epoch_meta_batches(
     *,
     config: TTTConfig,
     epoch_seed: int,
+    col_attention_scores=None,
 ) -> Iterator[MetaBatch]:
     rng = np.random.default_rng(epoch_seed)
     chunks = _chunk_indices(
@@ -1334,6 +1737,9 @@ def iter_epoch_meta_batches(
     for chunk_idx, indices in enumerate(chunks):
         X_chunk = X_encoded[indices]
         y_chunk = y_encoded[indices]
+        chunk_scores = None
+        if col_attention_scores is not None:
+            chunk_scores = np.asarray(col_attention_scores)[indices]
         query_size = max(1, int(len(indices) * config.query_ratio))
         yield _build_classification_meta_batch(
             classifier,
@@ -1343,6 +1749,7 @@ def iter_epoch_meta_batches(
             query_size=query_size,
             epoch_seed=epoch_seed,
             chunk_idx=chunk_idx,
+            col_attention_scores=chunk_scores,
         )
 
 
@@ -1353,6 +1760,13 @@ def move_meta_batch(batch: MetaBatch, device) -> MetaBatch:
         y_query=batch.y_query.to(device, non_blocking=True),
         train_size=batch.train_size,
         skip_reason=batch.skip_reason,
+        col_attn_score_sum=batch.col_attn_score_sum,
+        col_attn_score_sumsq=batch.col_attn_score_sumsq,
+        col_attn_score_count=batch.col_attn_score_count,
+        col_attn_selected_attention_count=batch.col_attn_selected_attention_count,
+        col_attn_selected_random_count=batch.col_attn_selected_random_count,
+        col_attn_fallback_reason=batch.col_attn_fallback_reason,
+        col_attn_label_coverage_ok=batch.col_attn_label_coverage_ok,
     )
 
 
@@ -1544,8 +1958,47 @@ def run_ttt_epoch_chunk_update(
     *,
     model_name: str,
     dataset_name: str,
+    X_col_attn_reference=None,
 ) -> TTTUpdateResult:
     ensure_runtime_deps()
+
+    col_attn_enabled = bool(config.enabled and getattr(config, "c_selection", "col_attention_mix") == "col_attention_mix")
+    col_attn_score_sum = 0.0
+    col_attn_score_sumsq = 0.0
+    col_attn_score_count = 0
+    col_attn_selected_attention_count = 0
+    col_attn_selected_random_count = 0
+    col_attn_fallback_reasons: Dict[str, int] = {}
+    col_attn_label_coverage_ok = True
+
+    def _record_col_attn_fallback(reason: Optional[str]) -> None:
+        if not reason:
+            return
+        text = str(reason)
+        col_attn_fallback_reasons[text] = col_attn_fallback_reasons.get(text, 0) + 1
+
+    def _col_attn_result_kwargs() -> Dict[str, Any]:
+        mean = None
+        std = None
+        if col_attn_score_count > 0:
+            mean = float(col_attn_score_sum / col_attn_score_count)
+            var = max(0.0, float(col_attn_score_sumsq / col_attn_score_count) - mean * mean)
+            std = float(np.sqrt(var))
+        fallback_reason = None
+        if col_attn_fallback_reasons:
+            top_reasons = sorted(col_attn_fallback_reasons.items(), key=lambda item: (-item[1], item[0]))[:3]
+            fallback_reason = "; ".join(f"{count}x {text}" for text, count in top_reasons)
+        return {
+            "col_attn_enabled": col_attn_enabled,
+            "col_attn_ratio": float(config.col_attn_ratio) if col_attn_enabled else None,
+            "col_attn_random_ratio": float(config.random_ratio) if col_attn_enabled else None,
+            "col_attn_score_mean": mean,
+            "col_attn_score_std": std,
+            "col_attn_selected_attention_count": int(col_attn_selected_attention_count),
+            "col_attn_selected_random_count": int(col_attn_selected_random_count),
+            "col_attn_fallback_reason": fallback_reason,
+            "col_attn_label_coverage_ok": bool(col_attn_label_coverage_ok),
+        }
 
     if config.scheduler not in {"constant", "cosine_warmup"}:
         raise ValueError("--ttt-scheduler must be one of: constant, cosine_warmup")
@@ -1558,6 +2011,7 @@ def run_ttt_epoch_chunk_update(
             reason="--ttt-epochs must be >= 1",
             epochs=0,
             chunks_per_epoch=0,
+            **_col_attn_result_kwargs(),
         )
     if config.micro_batch_size < 1:
         raise ValueError("--ttt-micro-batch-size must be >= 1")
@@ -1576,6 +2030,7 @@ def run_ttt_epoch_chunk_update(
             ),
             epochs=0,
             chunks_per_epoch=0,
+            **_col_attn_result_kwargs(),
         )
 
     import torch
@@ -1592,6 +2047,7 @@ def run_ttt_epoch_chunk_update(
             reason="No trainable parameters selected for TTT",
             epochs=0,
             chunks_per_epoch=0,
+            **_col_attn_result_kwargs(),
         )
 
     optimizer = torch.optim.AdamW(trainable_params, lr=config.lr, weight_decay=config.weight_decay)
@@ -1600,6 +2056,30 @@ def run_ttt_epoch_chunk_update(
 
     X_encoded = classifier.X_encoder_.transform(X_train)
     y_encoded = classifier.y_encoder_.transform(y_train)
+    col_attention_scores = None
+    if col_attn_enabled:
+        col_attention_scores, probe_reason = _compute_col_attention_profile_scores(
+            classifier,
+            X_col_attn_reference,
+            expected_train_size=int(len(y_encoded)),
+            layer=config.col_attn_layer,
+        )
+        if probe_reason:
+            _record_col_attn_fallback(probe_reason)
+            print(
+                f"[ttt-col-attn] model={model_name} dataset={dataset_name} "
+                f"probe_failed reason={probe_reason}; selection will fallback per chunk",
+                flush=True,
+            )
+        else:
+            finite_scores = np.asarray(col_attention_scores, dtype=np.float64)
+            finite_scores = finite_scores[np.isfinite(finite_scores)]
+            print(
+                f"[ttt-col-attn] model={model_name} dataset={dataset_name} "
+                f"profile_scores={len(finite_scores)} "
+                f"mean={float(finite_scores.mean()):.6f} std={float(finite_scores.std()):.6f}",
+                flush=True,
+            )
     chunks_per_epoch = count_ttt_chunks(
         int(len(y_encoded)),
         max_chunk_size=config.max_chunk_size,
@@ -1643,6 +2123,7 @@ def run_ttt_epoch_chunk_update(
                 reason="Need at least two encoded training samples for chunk TTT",
                 epochs=0,
                 chunks_per_epoch=chunks_per_epoch,
+                **_col_attn_result_kwargs(),
             )
 
         if config.early_stopping and X_val is not None and y_val is not None and len(y_val) > 0:
@@ -1671,11 +2152,19 @@ def run_ttt_epoch_chunk_update(
                 y_encoded,
                 config=config,
                 epoch_seed=epoch_seed,
+                col_attention_scores=col_attention_scores,
             ):
+                _record_col_attn_fallback(batch.col_attn_fallback_reason)
+                col_attn_label_coverage_ok = col_attn_label_coverage_ok and bool(batch.col_attn_label_coverage_ok)
                 if batch.skip_reason:
                     skipped_batches += 1
                     skip_reasons[batch.skip_reason] = skip_reasons.get(batch.skip_reason, 0) + 1
                     continue
+                col_attn_score_sum += float(batch.col_attn_score_sum)
+                col_attn_score_sumsq += float(batch.col_attn_score_sumsq)
+                col_attn_score_count += int(batch.col_attn_score_count)
+                col_attn_selected_attention_count += int(batch.col_attn_selected_attention_count)
+                col_attn_selected_random_count += int(batch.col_attn_selected_random_count)
 
                 batch = move_meta_batch(batch, device)
                 optimizer.zero_grad(set_to_none=True)
@@ -1784,6 +2273,7 @@ def run_ttt_epoch_chunk_update(
                 val_best_accuracy=best_accuracy,
                 best_epoch=best_epoch,
                 stopped_early=stopped_early,
+                **_col_attn_result_kwargs(),
             )
 
         if best_state is not None:
@@ -1817,6 +2307,7 @@ def run_ttt_epoch_chunk_update(
         val_best_accuracy=best_accuracy,
         best_epoch=best_epoch,
         stopped_early=stopped_early,
+        **_col_attn_result_kwargs(),
     )
 
 
@@ -2062,6 +2553,17 @@ def evaluate_one_dataset(
         ttt_stopped_early = False
         ttt_oom_fallback = False
         ttt_fallback_reason = None
+        ttt_col_attn_enabled = bool(
+            ttt_config.enabled and getattr(ttt_config, "c_selection", "col_attention_mix") == "col_attention_mix"
+        )
+        ttt_col_attn_ratio = float(ttt_config.col_attn_ratio) if ttt_col_attn_enabled else None
+        ttt_col_attn_random_ratio = float(ttt_config.random_ratio) if ttt_col_attn_enabled else None
+        ttt_col_attn_score_mean = None
+        ttt_col_attn_score_std = None
+        ttt_col_attn_selected_attention_count = 0
+        ttt_col_attn_selected_random_count = 0
+        ttt_col_attn_fallback_reason = None
+        ttt_col_attn_label_coverage_ok = True
         n_train_b = 0
         n_holdout_c = 0
 
@@ -2075,6 +2577,13 @@ def evaluate_one_dataset(
                 ttt_split_reason = "full train set chunked per epoch"
                 if ttt_validation_reason:
                     ttt_split_reason += f" | validation={ttt_validation_reason}"
+                if ttt_col_attn_enabled:
+                    ttt_split_reason += (
+                        " | c_selection=col_attention_mix"
+                        f" source={ttt_config.col_attn_source}"
+                        f" ratio={ttt_config.col_attn_ratio:.3f}"
+                        f" random_ratio={ttt_config.random_ratio:.3f}"
+                    )
                 n_train_b = int(len(y_ttt_train))
                 n_holdout_c = 0
                 ttt_attempt_start = time.time()
@@ -2088,6 +2597,7 @@ def evaluate_one_dataset(
                         ttt_config,
                         model_name=model_name,
                         dataset_name=dataset_dir.name,
+                        X_col_attn_reference=X_test,
                     )
                 except Exception as ttt_exc:
                     if not is_oom_exception(ttt_exc):
@@ -2116,8 +2626,22 @@ def evaluate_one_dataset(
                     ttt_val_best_accuracy = ttt_result.val_best_accuracy
                     ttt_best_epoch = ttt_result.best_epoch
                     ttt_stopped_early = ttt_result.stopped_early
+                    ttt_col_attn_enabled = ttt_result.col_attn_enabled
+                    ttt_col_attn_ratio = ttt_result.col_attn_ratio
+                    ttt_col_attn_random_ratio = ttt_result.col_attn_random_ratio
+                    ttt_col_attn_score_mean = ttt_result.col_attn_score_mean
+                    ttt_col_attn_score_std = ttt_result.col_attn_score_std
+                    ttt_col_attn_selected_attention_count = ttt_result.col_attn_selected_attention_count
+                    ttt_col_attn_selected_random_count = ttt_result.col_attn_selected_random_count
+                    ttt_col_attn_fallback_reason = ttt_result.col_attn_fallback_reason
+                    ttt_col_attn_label_coverage_ok = ttt_result.col_attn_label_coverage_ok
                     if ttt_result.reason:
                         ttt_split_reason = append_ttt_reason(ttt_split_reason, ttt_result.reason)
+                    if ttt_col_attn_fallback_reason:
+                        ttt_split_reason = append_ttt_reason(
+                            ttt_split_reason,
+                            f"col_attention_fallback={ttt_col_attn_fallback_reason}",
+                        )
 
                     if ttt_applied:
                         _fit_preserving_model_weights(classifier, X_train, y_train)
@@ -2181,6 +2705,15 @@ def evaluate_one_dataset(
             ttt_stopped_early=ttt_stopped_early,
             ttt_oom_fallback=ttt_oom_fallback,
             ttt_fallback_reason=ttt_fallback_reason,
+            ttt_col_attn_enabled=ttt_col_attn_enabled,
+            ttt_col_attn_ratio=ttt_col_attn_ratio,
+            ttt_col_attn_random_ratio=ttt_col_attn_random_ratio,
+            ttt_col_attn_score_mean=ttt_col_attn_score_mean,
+            ttt_col_attn_score_std=ttt_col_attn_score_std,
+            ttt_col_attn_selected_attention_count=ttt_col_attn_selected_attention_count,
+            ttt_col_attn_selected_random_count=ttt_col_attn_selected_random_count,
+            ttt_col_attn_fallback_reason=ttt_col_attn_fallback_reason,
+            ttt_col_attn_label_coverage_ok=ttt_col_attn_label_coverage_ok,
         )
     except Exception as exc:
         return ResultRow(
