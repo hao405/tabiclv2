@@ -24,7 +24,7 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-DEFAULT_DATA_ROOT = Path("data200_by_rows/small_lt2000")
+DEFAULT_DATA_ROOT = Path("decrease_dataset")
 DEFAULT_MODEL_PATH = "tabicl-classifier-v2-20260212.ckpt"
 DEFAULT_CHECKPOINT_VERSION = "tabicl-classifier-v2-20260212.ckpt"
 DEFAULT_OUT_DIR_ROOT = Path("1b_result")
@@ -59,6 +59,10 @@ class ResultRow:
     n_holdout_c: int = 0
     n_test_d: int = 0
     ttt_loss: Optional[float] = None
+    ttt_l2_sp_lambda: Optional[float] = None
+    ttt_l2_sp_loss: Optional[float] = None
+    ttt_ce_loss: Optional[float] = None
+    ttt_total_loss: Optional[float] = None
     ttt_steps: int = 0
     ttt_lr: Optional[float] = None
     ttt_applied: bool = False
@@ -90,6 +94,7 @@ class TTTConfig:
     dtype: str = "float32"
     micro_batch_size: int = 1
     weight_decay: float = 0.01
+    l2_sp_lambda: float = 1e-4
     epochs: int = 30
     steps: int = 30
     max_chunk_size: int = 10_000
@@ -129,6 +134,10 @@ class TTTUpdateResult:
     loss: Optional[float]
     steps: int
     update_seconds: float
+    l2_sp_lambda: Optional[float] = None
+    l2_sp_loss: Optional[float] = None
+    ce_loss: Optional[float] = None
+    total_loss: Optional[float] = None
     reason: Optional[str] = None
     epochs: int = 0
     chunks_per_epoch: int = 0
@@ -373,6 +382,10 @@ def format_dataset_result_log(
             f"ttt_applied={row.ttt_applied} "
             f"ttt_update={row.ttt_update_seconds:.3f}s "
             f"ttt_loss={format_optional_float(row.ttt_loss)} "
+            f"ttt_ce_loss={format_optional_float(row.ttt_ce_loss)} "
+            f"ttt_l2_sp_loss={format_optional_float(row.ttt_l2_sp_loss)} "
+            f"ttt_total_loss={format_optional_float(row.ttt_total_loss)} "
+            f"ttt_l2_sp_lambda={format_optional_float(row.ttt_l2_sp_lambda)} "
             f"ttt_steps={row.ttt_steps} "
             f"ttt_epochs={row.ttt_epochs} "
             f"ttt_mode={row.ttt_batch_mode} "
@@ -826,6 +839,8 @@ def build_ttt_config(args: argparse.Namespace) -> TTTConfig:
         raise ValueError("--ttt-min-delta must be >= 0")
     if float(args.ttt_warmup_proportion) < 0:
         raise ValueError("--ttt-warmup-proportion must be >= 0")
+    if float(args.ttt_l2_sp_lambda) < 0:
+        raise ValueError("--ttt-l2-sp-lambda must be >= 0")
     if not 0.0 < float(args.ttt_validation_fraction) < 1.0:
         raise ValueError("--ttt-validation-fraction must be in (0, 1)")
     if int(args.ttt_validation_n_estimators) < 1:
@@ -843,6 +858,7 @@ def build_ttt_config(args: argparse.Namespace) -> TTTConfig:
         dtype=str(args.ttt_dtype),
         micro_batch_size=int(args.ttt_micro_batch_size),
         weight_decay=float(args.ttt_weight_decay),
+        l2_sp_lambda=float(args.ttt_l2_sp_lambda),
         epochs=int(args.ttt_epochs),
         steps=int(args.ttt_epochs),
         max_chunk_size=int(args.ttt_max_chunk_size),
@@ -1428,6 +1444,7 @@ def build_auto_out_dir(
                 f"valest{args.ttt_validation_n_estimators}",
                 f"ep{args.ttt_epochs}",
                 f"lr{args.ttt_lr}",
+                f"l2sp{args.ttt_l2_sp_lambda}",
                 f"q{args.ttt_query_ratio}",
             ]
         )
@@ -1544,6 +1561,7 @@ def run_ttt_epoch_chunk_update(
             epochs=0,
             chunks_per_epoch=0,
         )
+    l2_sp_refs = [param.detach().clone() for param in trainable_params]
 
     optimizer = torch.optim.AdamW(trainable_params, lr=config.lr, weight_decay=config.weight_decay)
     forward_model, data_parallel_world_size = _build_ttt_forward_model(classifier, config)
@@ -1573,6 +1591,9 @@ def run_ttt_epoch_chunk_update(
         )
 
     last_loss = None
+    last_ce_loss = None
+    last_l2_sp_loss = None
+    last_total_loss = None
     update_steps = 0
     skipped_batches = 0
     skip_reasons: Dict[str, int] = {}
@@ -1631,6 +1652,8 @@ def run_ttt_epoch_chunk_update(
                 batch = move_meta_batch(batch, device)
                 optimizer.zero_grad(set_to_none=True)
                 batch_loss = 0.0
+                batch_ce_loss = 0.0
+                batch_l2_sp_loss = 0.0
                 total_views = int(batch.X.shape[0])
 
                 for start_idx in range(0, total_views, effective_micro_batch_size):
@@ -1642,11 +1665,23 @@ def run_ttt_epoch_chunk_update(
                         logits = forward_model(X_batch, y_train_batch.float())
                         n_classes = int(y_train_batch.max().item()) + 1
                         logits_used = logits[..., :n_classes].reshape(-1, n_classes)
-                        loss = F.cross_entropy(logits_used, y_query_batch.long().reshape(-1))
+                        ce_loss = F.cross_entropy(logits_used, y_query_batch.long().reshape(-1))
+                        if config.l2_sp_lambda > 0:
+                            l2_sp_loss = sum(
+                                (param - ref.to(device=param.device, dtype=param.dtype)).pow(2).sum()
+                                for param, ref in zip(trainable_params, l2_sp_refs)
+                            )
+                        else:
+                            l2_sp_loss = ce_loss.new_zeros(())
+                        loss = ce_loss + float(config.l2_sp_lambda) * l2_sp_loss
                         scaled_loss = loss * (X_batch.shape[0] / total_views)
 
                     scaler.scale(scaled_loss).backward()
                     batch_loss += float(scaled_loss.detach().cpu())
+                    batch_ce_loss += float((ce_loss * (X_batch.shape[0] / total_views)).detach().cpu())
+                    batch_l2_sp_loss += float(
+                        (l2_sp_loss * (X_batch.shape[0] / total_views)).detach().cpu()
+                    )
 
                 if config.grad_clip > 0:
                     scaler.unscale_(optimizer)
@@ -1658,13 +1693,18 @@ def run_ttt_epoch_chunk_update(
                 epoch_updates += 1
                 epoch_loss_sum += batch_loss
                 last_loss = batch_loss
+                last_ce_loss = batch_ce_loss
+                last_l2_sp_loss = batch_l2_sp_loss
+                last_total_loss = batch_loss
                 current_lr = scheduler.get_last_lr()[0]
 
                 if update_steps % 3 == 0:
                     print(
                         f"[ttt-loss] model={model_name} dataset={dataset_name} "
                         f"epoch={epoch_idx + 1}/{config.epochs} step={update_steps} "
-                        f"loss={batch_loss:.6f} lr={current_lr:.2e}",
+                        f"total_loss={batch_loss:.6f} ce_loss={batch_ce_loss:.6f} "
+                        f"l2_sp_loss={batch_l2_sp_loss:.6f} "
+                        f"l2_sp_lambda={config.l2_sp_lambda:.2e} lr={current_lr:.2e}",
                         flush=True,
                     )
                 if _should_save_ttt_ckpt_step(config, update_steps):
@@ -1680,7 +1720,7 @@ def run_ttt_epoch_chunk_update(
                 print(
                     f"[ttt-loss] model={model_name} dataset={dataset_name} "
                     f"epoch={epoch_idx + 1}/{config.epochs} "
-                    f"mean_loss={epoch_loss_sum / epoch_updates:.6f} "
+                    f"mean_total_loss={epoch_loss_sum / epoch_updates:.6f} "
                     f"updates={epoch_updates} lr={scheduler.get_last_lr()[0]:.2e}",
                     flush=True,
                 )
@@ -1758,6 +1798,10 @@ def run_ttt_epoch_chunk_update(
         loss=last_loss,
         steps=update_steps,
         update_seconds=time.time() - update_start,
+        l2_sp_lambda=float(config.l2_sp_lambda),
+        l2_sp_loss=last_l2_sp_loss,
+        ce_loss=last_ce_loss,
+        total_loss=last_total_loss,
         reason=None,
         epochs=config.epochs,
         chunks_per_epoch=chunks_per_epoch,
@@ -1995,6 +2039,10 @@ def evaluate_one_dataset(
         classes = pd.unique(pd.Series(np.concatenate([np.asarray(y_train), np.asarray(y_test)], axis=0)))
 
         ttt_loss = None
+        ttt_l2_sp_lambda = ttt_config.l2_sp_lambda if ttt_config.enabled else None
+        ttt_l2_sp_loss = None
+        ttt_ce_loss = None
+        ttt_total_loss = None
         ttt_steps = 0
         ttt_lr = ttt_config.lr if ttt_config.enabled else None
         ttt_applied = False
@@ -2054,6 +2102,10 @@ def evaluate_one_dataset(
                     classifier.fit(X_train, y_train)
                 else:
                     ttt_loss = ttt_result.loss
+                    ttt_l2_sp_lambda = ttt_result.l2_sp_lambda
+                    ttt_l2_sp_loss = ttt_result.l2_sp_loss
+                    ttt_ce_loss = ttt_result.ce_loss
+                    ttt_total_loss = ttt_result.total_loss
                     ttt_steps = ttt_result.steps
                     ttt_applied = ttt_result.applied
                     ttt_update_seconds = float(ttt_result.update_seconds)
@@ -2114,6 +2166,10 @@ def evaluate_one_dataset(
             n_holdout_c=n_holdout_c,
             n_test_d=int(len(y_test)),
             ttt_loss=ttt_loss,
+            ttt_l2_sp_lambda=ttt_l2_sp_lambda,
+            ttt_l2_sp_loss=ttt_l2_sp_loss,
+            ttt_ce_loss=ttt_ce_loss,
+            ttt_total_loss=ttt_total_loss,
             ttt_steps=ttt_steps,
             ttt_lr=ttt_lr,
             ttt_applied=ttt_applied,
@@ -2654,7 +2710,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Run TabICLv2 classification benchmarks on dataset roots with "
-            "epoch-shuffled chunk TTT and AMD/ROCm multi-GPU workers."
+            "full-module epoch-shuffled chunk TTT, L2-SP regularization, "
+            "and AMD/ROCm multi-GPU workers."
         )
     )
     parser.add_argument("--data-root", default=str(DEFAULT_DATA_ROOT))
@@ -2663,16 +2720,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-version", default=DEFAULT_CHECKPOINT_VERSION)
     parser.add_argument(
         "--out-dir",
-        default="result/compare/Tabiclv2_ttt_ensemble32_small_lt2000",
+        default="result/L2_sp/Tabiclv2_ttt_data_decrease",
         help=(
             "Output directory. If omitted, generate one under 1b_result from "
             "TabICL version, dataset label, model parameters, TTT eval metric, "
             "estimator counts, and random seed."
         ),
     )
-    parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--gpus", default=None)
-    parser.add_argument("--gpu-groups", default="2;3")
+    parser.add_argument("--gpu-groups", default="0")
     parser.add_argument("--n-estimators", type=int, default=32)
     parser.add_argument("--batch-size", type=parse_optional_int, default=8)
     parser.add_argument("--kv-cache", type=parse_kv_cache, default=False)
@@ -2712,6 +2769,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--ttt-weight-decay", type=float, default=0.01)
+    parser.add_argument(
+        "--ttt-l2-sp-lambda",
+        type=float,
+        default=1e-4,
+        help=(
+            "L2-SP regularization strength against the per-dataset TTT starting "
+            "weights. Use 0 to disable the L2-SP penalty while keeping output fields."
+        ),
+    )
     parser.add_argument(
         "--ttt-epochs",
         "--ttt-steps",

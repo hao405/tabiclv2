@@ -77,6 +77,15 @@ class ResultRow:
     ttt_stopped_early: bool = False
     ttt_oom_fallback: bool = False
     ttt_fallback_reason: Optional[str] = None
+    ttt_col_attn_enabled: bool = False
+    ttt_col_attn_ratio: Optional[float] = None
+    ttt_col_attn_random_ratio: Optional[float] = None
+    ttt_col_attn_score_mean: Optional[float] = None
+    ttt_col_attn_score_std: Optional[float] = None
+    ttt_col_attn_selected_attention_count: int = 0
+    ttt_col_attn_selected_random_count: int = 0
+    ttt_col_attn_fallback_reason: Optional[str] = None
+    ttt_col_attn_label_coverage_ok: bool = True
 
 
 @dataclass
@@ -113,6 +122,11 @@ class TTTConfig:
     save_ckpt_every: int = 2
     save_ckpt_start_step: Optional[int] = None
     ckpt_root: Optional[str] = None
+    c_selection: str = "col_attention_mix"
+    col_attn_ratio: float = 0.6
+    random_ratio: float = 0.4
+    col_attn_source: str = "test"
+    col_attn_layer: str = "last"
 
 
 @dataclass
@@ -140,6 +154,15 @@ class TTTUpdateResult:
     val_best_accuracy: Optional[float] = None
     best_epoch: int = 0
     stopped_early: bool = False
+    col_attn_enabled: bool = False
+    col_attn_ratio: Optional[float] = None
+    col_attn_random_ratio: Optional[float] = None
+    col_attn_score_mean: Optional[float] = None
+    col_attn_score_std: Optional[float] = None
+    col_attn_selected_attention_count: int = 0
+    col_attn_selected_random_count: int = 0
+    col_attn_fallback_reason: Optional[str] = None
+    col_attn_label_coverage_ok: bool = True
 
 
 @dataclass
@@ -155,6 +178,13 @@ class MetaBatch:
     y_query: Any
     train_size: int
     skip_reason: Optional[str] = None
+    col_attn_score_sum: float = 0.0
+    col_attn_score_sumsq: float = 0.0
+    col_attn_score_count: int = 0
+    col_attn_selected_attention_count: int = 0
+    col_attn_selected_random_count: int = 0
+    col_attn_fallback_reason: Optional[str] = None
+    col_attn_label_coverage_ok: bool = True
 
 
 @dataclass
@@ -832,6 +862,20 @@ def build_ttt_config(args: argparse.Namespace) -> TTTConfig:
         raise ValueError("--ttt-validation-n-estimators must be >= 1")
     if str(args.ttt_eval_metric) not in {"roc_auc", "log_loss", "accuracy"}:
         raise ValueError("--ttt-eval-metric must be one of: roc_auc, log_loss, accuracy")
+    if str(args.ttt_c_selection) not in {"col_attention_mix", "random"}:
+        raise ValueError("--ttt-c-selection must be one of: col_attention_mix, random")
+    if str(args.ttt_col_attn_source) != "test":
+        raise ValueError("--ttt-col-attn-source currently supports only: test")
+    if str(args.ttt_col_attn_layer) != "last":
+        raise ValueError("--ttt-col-attn-layer currently supports only: last")
+    col_attn_ratio = float(args.ttt_col_attn_ratio)
+    random_ratio = float(args.ttt_random_ratio)
+    if not 0.0 <= col_attn_ratio <= 1.0:
+        raise ValueError("--ttt-col-attn-ratio must be in [0, 1]")
+    if not 0.0 <= random_ratio <= 1.0:
+        raise ValueError("--ttt-random-ratio must be in [0, 1]")
+    if abs((col_attn_ratio + random_ratio) - 1.0) > 1e-6:
+        raise ValueError("--ttt-col-attn-ratio and --ttt-random-ratio must sum to 1")
 
     return TTTConfig(
         enabled=bool(args.ttt_enabled),
@@ -866,6 +910,11 @@ def build_ttt_config(args: argparse.Namespace) -> TTTConfig:
             int(args.ttt_save_ckpt_start_step) if args.ttt_save_ckpt_start_step is not None else None
         ),
         ckpt_root=str((Path(args.out_dir).expanduser() / "ttt_ckpts").resolve()),
+        c_selection=str(args.ttt_c_selection),
+        col_attn_ratio=col_attn_ratio,
+        random_ratio=random_ratio,
+        col_attn_source=str(args.ttt_col_attn_source),
+        col_attn_layer=str(args.ttt_col_attn_layer),
     )
 
 

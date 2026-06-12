@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import math
 import multiprocessing as mp
 import os
 import queue
@@ -77,6 +78,24 @@ class ResultRow:
     ttt_stopped_early: bool = False
     ttt_oom_fallback: bool = False
     ttt_fallback_reason: Optional[str] = None
+    ttt_c_selection: Optional[str] = None
+    ttt_c_source: Optional[str] = None
+    ttt_c_metric: Optional[str] = None
+    ttt_c_f_distance_mean: Optional[float] = None
+    ttt_c_f_distance_std: Optional[float] = None
+    ttt_c_fallback_reason: Optional[str] = None
+    ttt_c_label_coverage_ok: bool = True
+    ttt_upper_enabled: bool = False
+    ttt_upper_selection: Optional[str] = None
+    ttt_upper_pool_size: int = 0
+    ttt_upper_final_epochs: int = 0
+    ttt_upper_shift_score: Optional[float] = None
+    ttt_upper_alpha: Optional[float] = None
+    ttt_upper_alpha_reason: Optional[str] = None
+    ttt_upper_stage1_steps: int = 0
+    ttt_upper_stage2_steps: int = 0
+    ttt_upper_fallback_reason: Optional[str] = None
+    ttt_upper_used_test_features: bool = False
 
 
 @dataclass
@@ -94,7 +113,7 @@ class TTTConfig:
     steps: int = 30
     max_chunk_size: int = 10_000
     min_chunk_size: int = 50
-    query_ratio: float = 0.2
+    query_ratio: float = 0.3
     n_estimators_finetune: int = 2
     early_stopping: bool = True
     patience: int = 8
@@ -113,6 +132,19 @@ class TTTConfig:
     save_ckpt_every: int = 2
     save_ckpt_start_step: Optional[int] = None
     ckpt_root: Optional[str] = None
+    c_selection: str = "f_hybrid_upper"
+    c_source: str = "test"
+    c_metric: str = "standardized_l2"
+    c_candidate_multiplier: int = 5
+    c_class_balance: bool = True
+    upper_final_epochs: int = 10
+    upper_selection: str = "f_hybrid_upper"
+    upper_alpha_grid: str = "0,0.25,0.5,0.75,1.0"
+    upper_pool_ratio: float = 0.5
+    upper_density_weight: float = 0.25
+    upper_mmd_weight: float = 0.35
+    upper_distance_weight: float = 0.40
+    rollback_gate: str = "validation"
 
 
 @dataclass
@@ -140,6 +172,21 @@ class TTTUpdateResult:
     val_best_accuracy: Optional[float] = None
     best_epoch: int = 0
     stopped_early: bool = False
+    c_distance_mean: Optional[float] = None
+    c_distance_std: Optional[float] = None
+    c_fallback_reason: Optional[str] = None
+    c_label_coverage_ok: bool = True
+    upper_enabled: bool = False
+    upper_selection: Optional[str] = None
+    upper_pool_size: int = 0
+    upper_final_epochs: int = 0
+    upper_shift_score: Optional[float] = None
+    upper_alpha: Optional[float] = None
+    upper_alpha_reason: Optional[str] = None
+    upper_stage1_steps: int = 0
+    upper_stage2_steps: int = 0
+    upper_fallback_reason: Optional[str] = None
+    upper_used_test_features: bool = False
 
 
 @dataclass
@@ -155,6 +202,50 @@ class MetaBatch:
     y_query: Any
     train_size: int
     skip_reason: Optional[str] = None
+    c_distance_sum: float = 0.0
+    c_distance_sumsq: float = 0.0
+    c_distance_count: int = 0
+    c_fallback_reason: Optional[str] = None
+    c_label_coverage_ok: bool = True
+    used_upper: bool = False
+
+
+@dataclass
+class CSelectionContext:
+    reference: Any
+    metric: str
+    mean: Any = None
+    scale: Any = None
+    target_mean: Any = None
+    target_var: Any = None
+    train_reference: Any = None
+    candidate_scores: Any = None
+    candidate_pool: Any = None
+    shift_score: Optional[float] = None
+    upper_pool_size: int = 0
+    upper_fallback_reason: Optional[str] = None
+
+
+@dataclass
+class CSelectionResult:
+    ctx_idx: Any
+    qry_idx: Any
+    split_strategy: str
+    distance_sum: float = 0.0
+    distance_sumsq: float = 0.0
+    distance_count: int = 0
+    fallback_reason: Optional[str] = None
+    label_coverage_ok: bool = True
+    used_upper: bool = False
+
+
+@dataclass
+class UpperState:
+    theta0: Dict[str, Any]
+    best_state: Optional[Dict[str, Any]] = None
+    best_epoch: int = 0
+    best_metric: Optional[float] = None
+    best_accuracy: Optional[float] = None
 
 
 @dataclass
@@ -392,6 +483,21 @@ def parse_optional_int(value: str) -> int | None:
     if lowered == "none":
         return None
     return int(value)
+
+
+def parse_alpha_grid(value: str) -> List[float]:
+    alphas: List[float] = []
+    for raw_item in str(value).split(","):
+        raw_item = raw_item.strip()
+        if not raw_item:
+            continue
+        alpha = float(raw_item)
+        if alpha < 0.0 or alpha > 1.0:
+            raise ValueError("--ttt-upper-alpha-grid values must be in [0, 1]")
+        alphas.append(alpha)
+    if not alphas:
+        raise ValueError("--ttt-upper-alpha-grid must contain at least one value")
+    return sorted(set(float(alpha) for alpha in alphas))
 
 
 def parse_auto_bool(value: str) -> bool | str:
@@ -832,6 +938,35 @@ def build_ttt_config(args: argparse.Namespace) -> TTTConfig:
         raise ValueError("--ttt-validation-n-estimators must be >= 1")
     if str(args.ttt_eval_metric) not in {"roc_auc", "log_loss", "accuracy"}:
         raise ValueError("--ttt-eval-metric must be one of: roc_auc, log_loss, accuracy")
+    valid_c_selections = {"random", "stratified_random", "f_nearest", "f_mmd", "f_density_mixed", "f_hybrid_upper"}
+    if str(args.ttt_c_selection) not in valid_c_selections:
+        raise ValueError(
+            "--ttt-c-selection must be one of: random, stratified_random, "
+            "f_nearest, f_mmd, f_density_mixed, f_hybrid_upper"
+        )
+    if str(args.ttt_c_source) not in {"none", "validation", "test"}:
+        raise ValueError("--ttt-c-source must be one of: none, validation, test")
+    if str(args.ttt_c_metric) not in {"tabicl_encoded_l2", "standardized_l2"}:
+        raise ValueError("--ttt-c-metric must be one of: tabicl_encoded_l2, standardized_l2")
+    if int(args.ttt_c_candidate_multiplier) < 1:
+        raise ValueError("--ttt-c-candidate-multiplier must be >= 1")
+    if str(args.ttt_c_selection) in {"f_nearest", "f_mmd", "f_density_mixed", "f_hybrid_upper"} and str(args.ttt_c_source) == "none":
+        raise ValueError("F-aware --ttt-c-selection requires --ttt-c-source validation or test")
+    if int(args.ttt_upper_final_epochs) < 0:
+        raise ValueError("--ttt-upper-final-epochs must be >= 0")
+    if str(args.ttt_upper_selection) not in {"f_hybrid_upper", "f_mmd_only", "f_nearest_only"}:
+        raise ValueError("--ttt-upper-selection must be one of: f_hybrid_upper, f_mmd_only, f_nearest_only")
+    parse_alpha_grid(str(args.ttt_upper_alpha_grid))
+    if not 0.0 < float(args.ttt_upper_pool_ratio) <= 1.0:
+        raise ValueError("--ttt-upper-pool-ratio must be in (0, 1]")
+    if float(args.ttt_upper_density_weight) < 0:
+        raise ValueError("--ttt-upper-density-weight must be >= 0")
+    if float(args.ttt_upper_mmd_weight) < 0:
+        raise ValueError("--ttt-upper-mmd-weight must be >= 0")
+    if float(args.ttt_upper_distance_weight) < 0:
+        raise ValueError("--ttt-upper-distance-weight must be >= 0")
+    if str(args.ttt_rollback_gate) not in {"validation", "none"}:
+        raise ValueError("--ttt-rollback-gate must be one of: validation, none")
 
     return TTTConfig(
         enabled=bool(args.ttt_enabled),
@@ -866,6 +1001,19 @@ def build_ttt_config(args: argparse.Namespace) -> TTTConfig:
             int(args.ttt_save_ckpt_start_step) if args.ttt_save_ckpt_start_step is not None else None
         ),
         ckpt_root=str((Path(args.out_dir).expanduser() / "ttt_ckpts").resolve()),
+        c_selection=str(args.ttt_c_selection),
+        c_source=str(args.ttt_c_source),
+        c_metric=str(args.ttt_c_metric),
+        c_candidate_multiplier=int(args.ttt_c_candidate_multiplier),
+        c_class_balance=bool(args.ttt_c_class_balance),
+        upper_final_epochs=int(args.ttt_upper_final_epochs),
+        upper_selection=str(args.ttt_upper_selection),
+        upper_alpha_grid=str(args.ttt_upper_alpha_grid),
+        upper_pool_ratio=float(args.ttt_upper_pool_ratio),
+        upper_density_weight=float(args.ttt_upper_density_weight),
+        upper_mmd_weight=float(args.ttt_upper_mmd_weight),
+        upper_distance_weight=float(args.ttt_upper_distance_weight),
+        rollback_gate=str(args.ttt_rollback_gate),
     )
 
 
@@ -917,6 +1065,457 @@ def _split_ctx_query(y_chunk, *, query_size: int, seed: int) -> tuple[Any, Any, 
         splitter = ShuffleSplit(n_splits=1, test_size=query_size, random_state=seed)
         ctx_idx, qry_idx = next(splitter.split(dummy_X, y_chunk))
         return ctx_idx, qry_idx, f"random_fallback:{type(exc).__name__}"
+
+
+def _row_l2_distances(X_rows, reference_rows) -> Any:
+    if reference_rows is None or len(reference_rows) == 0:
+        return np.zeros(len(X_rows), dtype=np.float64)
+
+    X_arr = np.asarray(X_rows, dtype=np.float64)
+    ref_arr = np.asarray(reference_rows, dtype=np.float64)
+    if X_arr.ndim == 1:
+        X_arr = X_arr.reshape(-1, 1)
+    if ref_arr.ndim == 1:
+        ref_arr = ref_arr.reshape(-1, 1)
+
+    centroid = np.nanmean(ref_arr, axis=0)
+    distances = np.linalg.norm(np.nan_to_num(X_arr - centroid, nan=0.0), axis=1)
+    return distances.astype(np.float64, copy=False)
+
+
+def _normalize_score(values) -> Any:
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size == 0:
+        return arr
+    finite = np.isfinite(arr)
+    if not finite.any():
+        return np.zeros_like(arr, dtype=np.float64)
+    min_value = float(np.nanmin(arr[finite]))
+    max_value = float(np.nanmax(arr[finite]))
+    if max_value <= min_value + 1e-12:
+        return np.zeros_like(arr, dtype=np.float64)
+    normalized = (arr - min_value) / (max_value - min_value)
+    return np.nan_to_num(normalized, nan=1.0, posinf=1.0, neginf=0.0)
+
+
+def _density_proxy_distances(X_rows, *, max_reference: int = 1024) -> Any:
+    X_arr = np.asarray(X_rows, dtype=np.float64)
+    if X_arr.ndim == 1:
+        X_arr = X_arr.reshape(-1, 1)
+    n_samples = int(X_arr.shape[0])
+    if n_samples <= 1:
+        return np.zeros(n_samples, dtype=np.float64)
+
+    if n_samples > max_reference:
+        ref_positions = np.linspace(0, n_samples - 1, num=max_reference, dtype=int)
+        reference = X_arr[ref_positions]
+    else:
+        reference = X_arr
+
+    density = np.zeros(n_samples, dtype=np.float64)
+    block_size = 512
+    for start in range(0, n_samples, block_size):
+        end = min(start + block_size, n_samples)
+        diff = X_arr[start:end, None, :] - reference[None, :, :]
+        distances = np.linalg.norm(np.nan_to_num(diff, nan=0.0), axis=2)
+        if reference.shape[0] > 1:
+            distances.sort(axis=1)
+            kth = min(5, reference.shape[0] - 1)
+            density[start:end] = distances[:, kth]
+        else:
+            density[start:end] = distances[:, 0]
+    return density
+
+
+def _build_upper_candidate_scores(train_rows, reference_context: CSelectionContext, config: TTTConfig) -> tuple[Any, Any, float, int]:
+    train_arr = np.asarray(train_rows, dtype=np.float64)
+    if train_arr.ndim == 1:
+        train_arr = train_arr.reshape(-1, 1)
+    if train_arr.shape[0] == 0:
+        return np.asarray([], dtype=np.float64), np.asarray([], dtype=int), 0.0, 0
+
+    target_mean = np.asarray(reference_context.target_mean, dtype=np.float64)
+    target_var = np.asarray(reference_context.target_var, dtype=np.float64)
+    distance = _row_l2_distances(train_arr, reference_context.reference)
+    mmd_proxy = np.mean((train_arr - target_mean) ** 2 + 0.25 * ((train_arr - target_mean) ** 2 - target_var) ** 2, axis=1)
+    density_proxy = _density_proxy_distances(train_arr)
+
+    total_weight = (
+        float(config.upper_distance_weight)
+        + float(config.upper_mmd_weight)
+        + float(config.upper_density_weight)
+    )
+    if total_weight <= 0:
+        total_weight = 1.0
+
+    scores = (
+        float(config.upper_distance_weight) * _normalize_score(distance)
+        + float(config.upper_mmd_weight) * _normalize_score(mmd_proxy)
+        + float(config.upper_density_weight) * _normalize_score(density_proxy)
+    ) / total_weight
+
+    pool_size = max(1, int(math.ceil(train_arr.shape[0] * float(config.upper_pool_ratio))))
+    order = np.argsort(scores, kind="stable").astype(int)
+    candidate_pool = order[:pool_size]
+    shift_score = float(
+        np.mean(_normalize_score(distance))
+        + np.mean(_normalize_score(mmd_proxy))
+        + np.mean(_normalize_score(density_proxy))
+    ) / 3.0
+    return scores.astype(np.float64, copy=False), candidate_pool.astype(int, copy=False), shift_score, int(pool_size)
+
+
+def _standardize_for_selection(X_train, X_reference) -> tuple[Any, Any, Any, Any]:
+    train_arr = np.asarray(X_train, dtype=np.float64)
+    ref_arr = np.asarray(X_reference, dtype=np.float64)
+    if train_arr.ndim == 1:
+        train_arr = train_arr.reshape(-1, 1)
+    if ref_arr.ndim == 1:
+        ref_arr = ref_arr.reshape(-1, 1)
+
+    mean = np.nanmean(train_arr, axis=0)
+    scale = np.nanstd(train_arr, axis=0)
+    scale = np.where(np.isfinite(scale) & (scale > 1e-12), scale, 1.0)
+    return (
+        np.nan_to_num((train_arr - mean) / scale, nan=0.0),
+        np.nan_to_num((ref_arr - mean) / scale, nan=0.0),
+        mean,
+        scale,
+    )
+
+
+def build_c_selection_context(
+    classifier,
+    X_train,
+    X_reference,
+    config: TTTConfig,
+) -> CSelectionContext | None:
+    if X_reference is None or len(X_reference) == 0:
+        return None
+    if config.c_source == "none" or config.c_selection in {"random", "stratified_random"}:
+        return None
+
+    train_encoded = classifier.X_encoder_.transform(X_train)
+    reference_encoded = classifier.X_encoder_.transform(X_reference)
+    if config.c_metric == "tabicl_encoded_l2":
+        train_reference = np.asarray(train_encoded, dtype=np.float64)
+        if train_reference.ndim == 1:
+            train_reference = train_reference.reshape(-1, 1)
+        train_reference = np.nan_to_num(train_reference, nan=0.0)
+        reference = np.asarray(reference_encoded, dtype=np.float64)
+        if reference.ndim == 1:
+            reference = reference.reshape(-1, 1)
+        reference = np.nan_to_num(reference, nan=0.0)
+        context = CSelectionContext(
+            reference=reference,
+            metric=config.c_metric,
+            target_mean=np.nanmean(reference, axis=0),
+            target_var=np.nanvar(reference, axis=0),
+            train_reference=train_reference,
+        )
+        if config.upper_final_epochs > 0:
+            scores, pool, shift_score, pool_size = _build_upper_candidate_scores(train_reference, context, config)
+            context.candidate_scores = scores
+            context.candidate_pool = pool
+            context.shift_score = shift_score
+            context.upper_pool_size = pool_size
+        return context
+
+    X_train_std, reference_std, mean, scale = _standardize_for_selection(train_encoded, reference_encoded)
+    context = CSelectionContext(
+        reference=reference_std,
+        metric=config.c_metric,
+        mean=mean,
+        scale=scale,
+        target_mean=np.nanmean(reference_std, axis=0),
+        target_var=np.nanvar(reference_std, axis=0),
+        train_reference=X_train_std,
+    )
+    if config.upper_final_epochs > 0:
+        scores, pool, shift_score, pool_size = _build_upper_candidate_scores(X_train_std, context, config)
+        context.candidate_scores = scores
+        context.candidate_pool = pool
+        context.shift_score = shift_score
+        context.upper_pool_size = pool_size
+    return context
+
+
+def transform_chunk_for_c_selection(X_chunk, context: CSelectionContext | None) -> Any:
+    X_arr = np.asarray(X_chunk, dtype=np.float64)
+    if X_arr.ndim == 1:
+        X_arr = X_arr.reshape(-1, 1)
+    if context is None:
+        return np.nan_to_num(X_arr, nan=0.0)
+    if context.metric == "standardized_l2":
+        return np.nan_to_num((X_arr - context.mean) / context.scale, nan=0.0)
+    return np.nan_to_num(X_arr, nan=0.0)
+
+
+def _has_query_label_coverage(y_chunk, ctx_idx, qry_idx) -> bool:
+    y_arr = np.asarray(y_chunk)
+    ctx_labels = set(y_arr[np.asarray(ctx_idx, dtype=int)].astype(int).tolist())
+    qry_labels = set(y_arr[np.asarray(qry_idx, dtype=int)].astype(int).tolist())
+    return qry_labels.issubset(ctx_labels)
+
+
+def _class_balanced_order(order, y_chunk, query_size: int) -> list[int]:
+    y_arr = np.asarray(y_chunk).astype(int)
+    labels, counts = np.unique(y_arr, return_counts=True)
+    selected: list[int] = []
+    selected_set: set[int] = set()
+    per_label_cap = {label: max(0, int(count) - 1) for label, count in zip(labels.astype(int), counts)}
+    selected_per_label = {label: 0 for label in per_label_cap}
+
+    for idx in order:
+        idx = int(idx)
+        if idx in selected_set:
+            continue
+        label = int(y_arr[idx])
+        if selected_per_label.get(label, 0) >= per_label_cap.get(label, 0):
+            continue
+        selected.append(idx)
+        selected_set.add(idx)
+        selected_per_label[label] = selected_per_label.get(label, 0) + 1
+        if len(selected) >= query_size:
+            return selected
+    return selected
+
+
+def _mmd_greedy_order(
+    X_chunk_for_selection,
+    reference_context: CSelectionContext | None,
+    candidate_indices,
+    *,
+    max_items: int,
+    y_chunk=None,
+) -> list[int]:
+    X_arr = np.asarray(X_chunk_for_selection, dtype=np.float64)
+    if reference_context is None or reference_context.target_mean is None:
+        return [int(idx) for idx in candidate_indices[:max_items]]
+
+    target_mean = np.asarray(reference_context.target_mean, dtype=np.float64)
+    target_var = np.asarray(reference_context.target_var, dtype=np.float64)
+    remaining = [int(idx) for idx in candidate_indices]
+    selected: list[int] = []
+    current_sum = np.zeros(X_arr.shape[1], dtype=np.float64)
+    current_sumsq = np.zeros(X_arr.shape[1], dtype=np.float64)
+    y_arr = None if y_chunk is None else np.asarray(y_chunk).astype(int)
+    selected_per_label: dict[int, int] = {}
+    per_label_cap: dict[int, int] = {}
+    if y_arr is not None:
+        labels, counts = np.unique(y_arr, return_counts=True)
+        per_label_cap = {int(label): max(0, int(count) - 1) for label, count in zip(labels, counts)}
+        selected_per_label = {label: 0 for label in per_label_cap}
+
+    for _ in range(min(int(max_items), len(remaining))):
+        best_pos = None
+        best_score = None
+        next_n = len(selected) + 1
+        for pos, idx in enumerate(remaining):
+            if y_arr is not None:
+                label = int(y_arr[idx])
+                if selected_per_label.get(label, 0) >= per_label_cap.get(label, 0):
+                    continue
+            row = X_arr[idx]
+            cand_mean = (current_sum + row) / next_n
+            cand_var = (current_sumsq + row * row) / next_n - cand_mean * cand_mean
+            score = float(np.mean((cand_mean - target_mean) ** 2) + 0.25 * np.mean((cand_var - target_var) ** 2))
+            if best_score is None or score < best_score:
+                best_score = score
+                best_pos = pos
+        if best_pos is None:
+            break
+        idx = remaining.pop(best_pos)
+        selected.append(idx)
+        if y_arr is not None:
+            label = int(y_arr[idx])
+            selected_per_label[label] = selected_per_label.get(label, 0) + 1
+        row = X_arr[idx]
+        current_sum += row
+        current_sumsq += row * row
+    return selected
+
+
+def _select_faware_query_indices(
+    y_chunk,
+    X_chunk_for_selection,
+    *,
+    query_size: int,
+    seed: int,
+    config: TTTConfig,
+    selection_context: CSelectionContext | None,
+    global_indices=None,
+    use_upper: bool = False,
+) -> CSelectionResult | None:
+    if selection_context is None or selection_context.reference is None or len(selection_context.reference) == 0:
+        return None
+
+    n = len(y_chunk)
+    query_size = max(1, min(int(query_size), n - 1))
+    distances = _row_l2_distances(X_chunk_for_selection, selection_context.reference)
+    order = np.argsort(distances, kind="stable").astype(int).tolist()
+    rng = np.random.default_rng(seed)
+
+    candidate_limit = min(n, max(query_size, query_size * int(config.c_candidate_multiplier)))
+    if use_upper and config.upper_selection == "f_hybrid_upper":
+        if (
+            global_indices is not None
+            and selection_context.candidate_scores is not None
+            and selection_context.candidate_pool is not None
+        ):
+            global_arr = np.asarray(global_indices, dtype=int)
+            pool_set = set(np.asarray(selection_context.candidate_pool, dtype=int).tolist())
+            local_candidates = [idx for idx, global_idx in enumerate(global_arr.tolist()) if int(global_idx) in pool_set]
+            if local_candidates:
+                score_arr = np.asarray(selection_context.candidate_scores, dtype=np.float64)
+                ranked = sorted(local_candidates, key=lambda idx: float(score_arr[int(global_arr[int(idx)])]))
+            else:
+                ranked = order[:candidate_limit]
+        else:
+            ranked = order[:candidate_limit]
+        ranked = _mmd_greedy_order(
+            X_chunk_for_selection,
+            selection_context,
+            ranked[:candidate_limit],
+            max_items=query_size,
+            y_chunk=y_chunk if config.c_class_balance else None,
+        )
+    elif use_upper and config.upper_selection == "f_nearest_only":
+        ranked = order
+    elif config.c_selection == "f_mmd" or (use_upper and config.upper_selection == "f_mmd_only"):
+        candidate_order = order[:candidate_limit]
+        ranked = _mmd_greedy_order(
+            X_chunk_for_selection,
+            selection_context,
+            candidate_order,
+            max_items=query_size,
+            y_chunk=y_chunk if config.c_class_balance else None,
+        )
+    elif config.c_selection == "f_density_mixed":
+        nearest_count = int(math.ceil(query_size * 0.5))
+        selected_near = order[:nearest_count]
+        selected_set = set(selected_near)
+        random_pool = [idx for idx in range(n) if idx not in selected_set]
+        rng.shuffle(random_pool)
+        ranked = selected_near + random_pool
+    else:
+        ranked = order
+
+    if config.c_class_balance:
+        qry_list = _class_balanced_order(ranked, y_chunk, query_size)
+    else:
+        qry_list = [int(idx) for idx in ranked[:query_size]]
+
+    if len(qry_list) < query_size:
+        return CSelectionResult(
+            ctx_idx=np.array([], dtype=int),
+            qry_idx=np.array([], dtype=int),
+            split_strategy=f"{config.c_selection}:fallback",
+            fallback_reason=f"{config.c_selection} produced only {len(qry_list)}/{query_size} query rows",
+            label_coverage_ok=False,
+        )
+
+    qry_idx = np.asarray(qry_list[:query_size], dtype=int)
+    qry_set = set(qry_idx.tolist())
+    ctx_idx = np.asarray([idx for idx in range(n) if idx not in qry_set], dtype=int)
+    coverage_ok = _has_query_label_coverage(y_chunk, ctx_idx, qry_idx)
+    selected_distances = distances[qry_idx]
+    return CSelectionResult(
+        ctx_idx=ctx_idx,
+        qry_idx=qry_idx,
+        split_strategy=(
+            f"f_hybrid_upper:{config.upper_selection}:{config.c_source}:{config.c_metric}"
+            if use_upper
+            else f"{config.c_selection}:{config.c_source}:{config.c_metric}"
+        ),
+        distance_sum=float(np.sum(selected_distances)),
+        distance_sumsq=float(np.sum(selected_distances * selected_distances)),
+        distance_count=int(len(selected_distances)),
+        fallback_reason=None if coverage_ok else f"{config.c_selection} query labels absent from context",
+        label_coverage_ok=coverage_ok,
+        used_upper=bool(use_upper),
+    )
+
+
+def _replace_config(config: TTTConfig, **changes):
+    try:
+        return replace(config, **changes)
+    except TypeError:
+        copied = SimpleNamespace(**vars(config))
+        for key, value in changes.items():
+            setattr(copied, key, value)
+        return copied
+
+
+def _select_ctx_query_for_chunk(
+    y_chunk,
+    X_chunk_for_selection,
+    *,
+    query_size: int,
+    seed: int,
+    config: TTTConfig,
+    selection_context: CSelectionContext | None,
+    global_indices=None,
+    use_upper: bool = False,
+) -> CSelectionResult:
+    if use_upper or config.c_selection in {"f_nearest", "f_mmd", "f_density_mixed", "f_hybrid_upper"}:
+        selected = _select_faware_query_indices(
+            y_chunk,
+            X_chunk_for_selection,
+            query_size=query_size,
+            seed=seed,
+            config=config,
+            selection_context=selection_context,
+            global_indices=global_indices,
+            use_upper=use_upper,
+        )
+        if selected is not None and selected.label_coverage_ok:
+            return selected
+        fallback_reason = (
+            selected.fallback_reason if selected is not None and selected.fallback_reason else "missing F-aware selection context"
+        )
+        if use_upper:
+            fallback_config = _replace_config(config, c_selection="f_mmd")
+            selected = _select_faware_query_indices(
+                y_chunk,
+                X_chunk_for_selection,
+                query_size=query_size,
+                seed=seed,
+                config=fallback_config,
+                selection_context=selection_context,
+                global_indices=global_indices,
+                use_upper=False,
+            )
+            if selected is not None and selected.label_coverage_ok:
+                selected.split_strategy = f"{selected.split_strategy}:fallback_from_f_hybrid_upper"
+                selected.fallback_reason = fallback_reason
+                return selected
+    else:
+        fallback_reason = None
+
+    ctx_idx, qry_idx, split_strategy = _split_ctx_query(y_chunk, query_size=query_size, seed=seed)
+    if not _has_query_label_coverage(y_chunk, ctx_idx, qry_idx):
+        distances = np.zeros(len(y_chunk), dtype=np.float64)
+        if selection_context is not None and selection_context.reference is not None:
+            distances = _row_l2_distances(X_chunk_for_selection, selection_context.reference)
+        safe_order = np.argsort(distances, kind="stable").astype(int).tolist()
+        safe_qry = _class_balanced_order(safe_order, y_chunk, query_size)
+        if len(safe_qry) >= query_size:
+            safe_qry_idx = np.asarray(safe_qry[:query_size], dtype=int)
+            safe_qry_set = set(safe_qry_idx.tolist())
+            safe_ctx_idx = np.asarray([idx for idx in range(len(y_chunk)) if idx not in safe_qry_set], dtype=int)
+            if _has_query_label_coverage(y_chunk, safe_ctx_idx, safe_qry_idx):
+                ctx_idx = safe_ctx_idx
+                qry_idx = safe_qry_idx
+                split_strategy = f"{split_strategy}:coverage_repaired"
+    return CSelectionResult(
+        ctx_idx=np.asarray(ctx_idx, dtype=int),
+        qry_idx=np.asarray(qry_idx, dtype=int),
+        split_strategy=split_strategy if fallback_reason is None else f"{split_strategy}:fallback_from_{config.c_selection}",
+        fallback_reason=fallback_reason,
+        label_coverage_ok=_has_query_label_coverage(y_chunk, ctx_idx, qry_idx),
+        used_upper=False,
+    )
 
 
 def split_ttt_validation(
@@ -1183,6 +1782,68 @@ def _evaluate_ttt_validation_metrics(
             classifier.n_estimators = original_n_estimators
 
 
+def _clone_model_state_cpu(model) -> Dict[str, Any]:
+    return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+
+def _interpolate_state_dict(theta0: Dict[str, Any], theta1: Dict[str, Any], alpha: float) -> Dict[str, Any]:
+    import torch
+
+    out: Dict[str, Any] = {}
+    for key, value0 in theta0.items():
+        value1 = theta1[key]
+        if torch.is_floating_point(value0):
+            out[key] = value0 + float(alpha) * (value1 - value0)
+        else:
+            out[key] = value1.clone()
+    return out
+
+
+def _select_trust_region_alpha(
+    classifier,
+    base_model,
+    theta0: Dict[str, Any],
+    theta1: Dict[str, Any],
+    X_train,
+    y_train,
+    X_val,
+    y_val,
+    config: TTTConfig,
+) -> tuple[float, str, Optional[float], Optional[float]]:
+    if config.rollback_gate == "none":
+        return 1.0, "rollback_gate=none", None, None
+    if X_val is None or y_val is None or len(y_val) == 0:
+        return 0.5, "no_validation", None, None
+
+    alpha_grid = parse_alpha_grid(config.upper_alpha_grid)
+    best_alpha = float(alpha_grid[0])
+    best_metric: Optional[float] = None
+    best_accuracy: Optional[float] = None
+    best_state = None
+    for alpha in alpha_grid:
+        state = _interpolate_state_dict(theta0, theta1, alpha)
+        base_model.load_state_dict(state)
+        val_result = _evaluate_ttt_validation_metrics(classifier, X_train, y_train, X_val, y_val, config)
+        if val_result is None:
+            continue
+        metric = float(val_result.primary)
+        if not _metric_is_valid(metric):
+            continue
+        if best_metric is None or metric > best_metric:
+            best_alpha = float(alpha)
+            best_metric = metric
+            best_accuracy = val_result.secondary.get("accuracy")
+            best_state = state
+
+    if best_state is not None:
+        base_model.load_state_dict(best_state)
+        return best_alpha, f"validation_best_{config.eval_metric}", best_metric, best_accuracy
+
+    fallback_state = _interpolate_state_dict(theta0, theta1, 0.5)
+    base_model.load_state_dict(fallback_state)
+    return 0.5, "validation_metric_unavailable", None, None
+
+
 def _build_classification_meta_batch(
     classifier,
     X_chunk,
@@ -1192,6 +1853,9 @@ def _build_classification_meta_batch(
     query_size: int,
     epoch_seed: int,
     chunk_idx: int,
+    selection_context: CSelectionContext | None = None,
+    global_indices=None,
+    use_upper: bool = False,
 ) -> MetaBatch:
     try:
         from tabicl._sklearn.preprocessing import EnsembleGenerator
@@ -1204,7 +1868,23 @@ def _build_classification_meta_batch(
     split_seed = int(epoch_seed + chunk_idx * 7919)
     n_classes_in_chunk = int(np.max(y_chunk)) + 1
     query_size = max(int(query_size), n_classes_in_chunk)
-    ctx_idx, qry_idx, split_strategy = _split_ctx_query(y_chunk, query_size=query_size, seed=split_seed)
+    X_chunk_for_selection = transform_chunk_for_c_selection(X_chunk, selection_context)
+    selection_config = config
+    if config.c_selection == "f_hybrid_upper" and not use_upper:
+        selection_config = _replace_config(config, c_selection="f_mmd")
+    selection_result = _select_ctx_query_for_chunk(
+        y_chunk,
+        X_chunk_for_selection,
+        query_size=query_size,
+        seed=split_seed,
+        config=selection_config,
+        selection_context=selection_context,
+        global_indices=global_indices,
+        use_upper=use_upper,
+    )
+    ctx_idx = selection_result.ctx_idx
+    qry_idx = selection_result.qry_idx
+    split_strategy = selection_result.split_strategy
     y_ctx_raw = np.asarray(y_chunk)[ctx_idx].astype(int)
     y_qry_raw = np.asarray(y_chunk)[qry_idx].astype(int)
 
@@ -1217,6 +1897,12 @@ def _build_classification_meta_batch(
             0,
             "query labels absent from context after "
             f"{split_strategy} split: {','.join(str(item) for item in missing_query_labels)}",
+            c_distance_sum=selection_result.distance_sum,
+            c_distance_sumsq=selection_result.distance_sumsq,
+            c_distance_count=selection_result.distance_count,
+            c_fallback_reason=selection_result.fallback_reason,
+            c_label_coverage_ok=False,
+            used_upper=selection_result.used_upper,
         )
 
     local_classes = np.asarray(sorted(set(y_ctx_raw.tolist())), dtype=np.int64)
@@ -1264,6 +1950,12 @@ def _build_classification_meta_batch(
         y_query=torch.from_numpy(np.stack(y_query_list, axis=0)).long(),
         train_size=int(len(ctx_idx)),
         skip_reason=None,
+        c_distance_sum=selection_result.distance_sum,
+        c_distance_sumsq=selection_result.distance_sumsq,
+        c_distance_count=selection_result.distance_count,
+        c_fallback_reason=selection_result.fallback_reason,
+        c_label_coverage_ok=selection_result.label_coverage_ok,
+        used_upper=selection_result.used_upper,
     )
 
 
@@ -1274,6 +1966,8 @@ def iter_epoch_meta_batches(
     *,
     config: TTTConfig,
     epoch_seed: int,
+    selection_context: CSelectionContext | None = None,
+    use_upper: bool = False,
 ) -> Iterator[MetaBatch]:
     rng = np.random.default_rng(epoch_seed)
     chunks = _chunk_indices(
@@ -1294,6 +1988,9 @@ def iter_epoch_meta_batches(
             query_size=query_size,
             epoch_seed=epoch_seed,
             chunk_idx=chunk_idx,
+            selection_context=selection_context,
+            global_indices=indices,
+            use_upper=use_upper,
         )
 
 
@@ -1304,6 +2001,12 @@ def move_meta_batch(batch: MetaBatch, device) -> MetaBatch:
         y_query=batch.y_query.to(device, non_blocking=True),
         train_size=batch.train_size,
         skip_reason=batch.skip_reason,
+        c_distance_sum=batch.c_distance_sum,
+        c_distance_sumsq=batch.c_distance_sumsq,
+        c_distance_count=batch.c_distance_count,
+        c_fallback_reason=batch.c_fallback_reason,
+        c_label_coverage_ok=batch.c_label_coverage_ok,
+        used_upper=batch.used_upper,
     )
 
 
@@ -1429,6 +2132,10 @@ def build_auto_out_dir(
                 f"ep{args.ttt_epochs}",
                 f"lr{args.ttt_lr}",
                 f"q{args.ttt_query_ratio}",
+                f"c{args.ttt_c_selection}",
+                f"csrc{args.ttt_c_source}",
+                f"upper{args.ttt_upper_selection}",
+                f"ufinal{args.ttt_upper_final_epochs}",
             ]
         )
     else:
@@ -1495,6 +2202,7 @@ def run_ttt_epoch_chunk_update(
     *,
     model_name: str,
     dataset_name: str,
+    X_c_reference=None,
 ) -> TTTUpdateResult:
     ensure_runtime_deps()
 
@@ -1533,6 +2241,7 @@ def run_ttt_epoch_chunk_update(
     import torch.nn.functional as F
 
     base_model = _get_ttt_base_model(classifier)
+    theta0_state = _clone_model_state_cpu(base_model)
     trainable_params = _configure_ttt_trainable_params(classifier, config)
     if not trainable_params:
         return TTTUpdateResult(
@@ -1551,6 +2260,7 @@ def run_ttt_epoch_chunk_update(
 
     X_encoded = classifier.X_encoder_.transform(X_train)
     y_encoded = classifier.y_encoder_.transform(y_train)
+    selection_context = build_c_selection_context(classifier, X_train, X_c_reference, config)
     chunks_per_epoch = count_ttt_chunks(
         int(len(y_encoded)),
         max_chunk_size=config.max_chunk_size,
@@ -1584,6 +2294,21 @@ def run_ttt_epoch_chunk_update(
     best_state = None
     patience_counter = 0
     stopped_early = False
+    c_distance_sum = 0.0
+    c_distance_sumsq = 0.0
+    c_distance_count = 0
+    c_fallback_reasons: Dict[str, int] = {}
+    c_label_coverage_ok = True
+    upper_stage1_steps = 0
+    upper_stage2_steps = 0
+    upper_enabled = bool(config.upper_final_epochs > 0 and config.c_source == "test")
+    upper_alpha: Optional[float] = None
+    upper_alpha_reason: Optional[str] = None
+    upper_pool_size = 0
+    upper_shift_score: Optional[float] = None
+    if selection_context is not None:
+        upper_pool_size = int(selection_context.upper_pool_size or 0)
+        upper_shift_score = selection_context.shift_score
     try:
         if X_encoded.shape[0] < 2 or chunks_per_epoch == 0:
             return TTTUpdateResult(
@@ -1611,18 +2336,42 @@ def run_ttt_epoch_chunk_update(
                 )
 
         last_saved_step = 0
+        upper_final_epochs = min(int(config.upper_final_epochs), int(config.epochs))
+        adaptive_query_ratio = float(config.query_ratio)
+        if upper_enabled and upper_shift_score is not None:
+            if upper_shift_score < 0.20:
+                upper_final_epochs = min(upper_final_epochs, max(1, int(math.ceil(config.epochs * 0.25))))
+                adaptive_query_ratio = max(0.10, float(config.query_ratio) * 0.5)
+            elif upper_shift_score > 0.65:
+                upper_final_epochs = max(upper_final_epochs, int(math.ceil(config.epochs * 0.5)))
+                upper_final_epochs = min(upper_final_epochs, int(config.epochs))
+                adaptive_query_ratio = min(0.50, float(config.query_ratio) * 1.25)
+        upper_start_epoch = max(0, int(config.epochs) - upper_final_epochs)
         for epoch_idx in range(config.epochs):
             _set_ttt_train_mode(classifier)
             epoch_seed = config.random_state + epoch_idx
             epoch_loss_sum = 0.0
             epoch_updates = 0
+            use_upper_epoch = bool(upper_enabled and epoch_idx >= upper_start_epoch)
+            epoch_config = config
+            if use_upper_epoch and adaptive_query_ratio != float(config.query_ratio):
+                epoch_config = _replace_config(config, query_ratio=adaptive_query_ratio)
             for batch in iter_epoch_meta_batches(
                 classifier,
                 X_encoded,
                 y_encoded,
-                config=config,
+                config=epoch_config,
                 epoch_seed=epoch_seed,
+                selection_context=selection_context,
+                use_upper=use_upper_epoch,
             ):
+                if batch.c_distance_count:
+                    c_distance_sum += float(batch.c_distance_sum)
+                    c_distance_sumsq += float(batch.c_distance_sumsq)
+                    c_distance_count += int(batch.c_distance_count)
+                if batch.c_fallback_reason:
+                    c_fallback_reasons[batch.c_fallback_reason] = c_fallback_reasons.get(batch.c_fallback_reason, 0) + 1
+                c_label_coverage_ok = c_label_coverage_ok and bool(batch.c_label_coverage_ok)
                 if batch.skip_reason:
                     skipped_batches += 1
                     skip_reasons[batch.skip_reason] = skip_reasons.get(batch.skip_reason, 0) + 1
@@ -1656,6 +2405,10 @@ def run_ttt_epoch_chunk_update(
                 scheduler.step()
                 update_steps += 1
                 epoch_updates += 1
+                if batch.used_upper:
+                    upper_stage2_steps += 1
+                else:
+                    upper_stage1_steps += 1
                 epoch_loss_sum += batch_loss
                 last_loss = batch_loss
                 current_lr = scheduler.get_last_lr()[0]
@@ -1705,7 +2458,7 @@ def run_ttt_epoch_chunk_update(
                         f"patience={patience_counter}/{config.patience}",
                         flush=True,
                     )
-                    if patience_counter >= config.patience:
+                    if patience_counter >= config.patience and (not upper_enabled or epoch_idx >= upper_start_epoch):
                         stopped_early = True
                         print(
                             f"[ttt-early-stop] model={model_name} dataset={dataset_name} "
@@ -1735,10 +2488,57 @@ def run_ttt_epoch_chunk_update(
                 val_best_accuracy=best_accuracy,
                 best_epoch=best_epoch,
                 stopped_early=stopped_early,
+                c_distance_mean=(
+                    c_distance_sum / c_distance_count if c_distance_count > 0 else None
+                ),
+                c_distance_std=(
+                    math.sqrt(max(0.0, c_distance_sumsq / c_distance_count - (c_distance_sum / c_distance_count) ** 2))
+                    if c_distance_count > 0
+                    else None
+                ),
+                c_fallback_reason=(
+                    "; ".join(f"{count}x {text}" for text, count in sorted(c_fallback_reasons.items(), key=lambda item: (-item[1], item[0]))[:3])
+                    if c_fallback_reasons
+                    else None
+                ),
+                c_label_coverage_ok=c_label_coverage_ok,
+                upper_enabled=upper_enabled,
+                upper_selection=config.upper_selection,
+                upper_pool_size=upper_pool_size,
+                upper_final_epochs=upper_final_epochs,
+                upper_shift_score=upper_shift_score,
+                upper_alpha=upper_alpha,
+                upper_alpha_reason=upper_alpha_reason,
+                upper_stage1_steps=upper_stage1_steps,
+                upper_stage2_steps=upper_stage2_steps,
+                upper_fallback_reason=(
+                    "; ".join(f"{count}x {text}" for text, count in sorted(c_fallback_reasons.items(), key=lambda item: (-item[1], item[0]))[:3])
+                    if c_fallback_reasons
+                    else None
+                ),
+                upper_used_test_features=bool(config.c_source == "test"),
             )
 
         if best_state is not None:
             base_model.load_state_dict(best_state)
+
+        if upper_enabled:
+            theta1_state = _clone_model_state_cpu(base_model)
+            upper_alpha, upper_alpha_reason, alpha_metric, alpha_accuracy = _select_trust_region_alpha(
+                classifier,
+                base_model,
+                theta0_state,
+                theta1_state,
+                X_train,
+                y_train,
+                X_val,
+                y_val,
+                config,
+            )
+            if alpha_metric is not None:
+                best_metric = alpha_metric
+            if alpha_accuracy is not None:
+                best_accuracy = alpha_accuracy
 
         if _should_save_ttt_final_ckpt(config, update_steps) and last_saved_step != update_steps:
             ckpt_path = _save_ttt_model_ckpt(classifier, config, model_name, dataset_name, update_steps)
@@ -1768,6 +2568,35 @@ def run_ttt_epoch_chunk_update(
         val_best_accuracy=best_accuracy,
         best_epoch=best_epoch,
         stopped_early=stopped_early,
+        c_distance_mean=(
+            c_distance_sum / c_distance_count if c_distance_count > 0 else None
+        ),
+        c_distance_std=(
+            math.sqrt(max(0.0, c_distance_sumsq / c_distance_count - (c_distance_sum / c_distance_count) ** 2))
+            if c_distance_count > 0
+            else None
+        ),
+        c_fallback_reason=(
+            "; ".join(f"{count}x {text}" for text, count in sorted(c_fallback_reasons.items(), key=lambda item: (-item[1], item[0]))[:3])
+            if c_fallback_reasons
+            else None
+        ),
+        c_label_coverage_ok=c_label_coverage_ok,
+        upper_enabled=upper_enabled,
+        upper_selection=config.upper_selection,
+        upper_pool_size=upper_pool_size,
+        upper_final_epochs=upper_final_epochs,
+        upper_shift_score=upper_shift_score,
+        upper_alpha=upper_alpha,
+        upper_alpha_reason=upper_alpha_reason,
+        upper_stage1_steps=upper_stage1_steps,
+        upper_stage2_steps=upper_stage2_steps,
+        upper_fallback_reason=(
+            "; ".join(f"{count}x {text}" for text, count in sorted(c_fallback_reasons.items(), key=lambda item: (-item[1], item[0]))[:3])
+            if c_fallback_reasons
+            else None
+        ),
+        upper_used_test_features=bool(config.c_source == "test"),
     )
 
 
@@ -2013,6 +2842,24 @@ def evaluate_one_dataset(
         ttt_stopped_early = False
         ttt_oom_fallback = False
         ttt_fallback_reason = None
+        ttt_c_selection = ttt_config.c_selection if ttt_config.enabled else None
+        ttt_c_source = ttt_config.c_source if ttt_config.enabled else None
+        ttt_c_metric = ttt_config.c_metric if ttt_config.enabled else None
+        ttt_c_f_distance_mean = None
+        ttt_c_f_distance_std = None
+        ttt_c_fallback_reason = None
+        ttt_c_label_coverage_ok = True
+        ttt_upper_enabled = bool(ttt_config.enabled and ttt_config.c_source == "test" and ttt_config.upper_final_epochs > 0)
+        ttt_upper_selection = ttt_config.upper_selection if ttt_upper_enabled else None
+        ttt_upper_pool_size = 0
+        ttt_upper_final_epochs = int(ttt_config.upper_final_epochs) if ttt_upper_enabled else 0
+        ttt_upper_shift_score = None
+        ttt_upper_alpha = None
+        ttt_upper_alpha_reason = None
+        ttt_upper_stage1_steps = 0
+        ttt_upper_stage2_steps = 0
+        ttt_upper_fallback_reason = None
+        ttt_upper_used_test_features = bool(ttt_upper_enabled)
         n_train_b = 0
         n_holdout_c = 0
 
@@ -2026,8 +2873,25 @@ def evaluate_one_dataset(
                 ttt_split_reason = "full train set chunked per epoch"
                 if ttt_validation_reason:
                     ttt_split_reason += f" | validation={ttt_validation_reason}"
+                if ttt_config.c_selection != "random" or ttt_config.c_source != "none":
+                    ttt_split_reason += (
+                        f" | c_selection={ttt_config.c_selection}"
+                        f" c_source={ttt_config.c_source}"
+                        f" c_metric={ttt_config.c_metric}"
+                    )
+                if ttt_upper_enabled:
+                    ttt_split_reason += (
+                        f" | upper_selection={ttt_config.upper_selection}"
+                        f" upper_final_epochs={ttt_config.upper_final_epochs}"
+                        f" rollback_gate={ttt_config.rollback_gate}"
+                    )
                 n_train_b = int(len(y_ttt_train))
                 n_holdout_c = 0
+                X_c_reference = None
+                if ttt_config.c_source == "validation":
+                    X_c_reference = X_ttt_val
+                elif ttt_config.c_source == "test":
+                    X_c_reference = X_test
                 ttt_attempt_start = time.time()
                 try:
                     ttt_result = run_ttt_epoch_chunk_update(
@@ -2039,6 +2903,7 @@ def evaluate_one_dataset(
                         ttt_config,
                         model_name=model_name,
                         dataset_name=dataset_dir.name,
+                        X_c_reference=X_c_reference,
                     )
                 except Exception as ttt_exc:
                     if not is_oom_exception(ttt_exc):
@@ -2067,8 +2932,39 @@ def evaluate_one_dataset(
                     ttt_val_best_accuracy = ttt_result.val_best_accuracy
                     ttt_best_epoch = ttt_result.best_epoch
                     ttt_stopped_early = ttt_result.stopped_early
+                    ttt_c_f_distance_mean = ttt_result.c_distance_mean
+                    ttt_c_f_distance_std = ttt_result.c_distance_std
+                    ttt_c_fallback_reason = ttt_result.c_fallback_reason
+                    ttt_c_label_coverage_ok = ttt_result.c_label_coverage_ok
+                    ttt_upper_enabled = ttt_result.upper_enabled
+                    ttt_upper_selection = ttt_result.upper_selection
+                    ttt_upper_pool_size = ttt_result.upper_pool_size
+                    ttt_upper_final_epochs = ttt_result.upper_final_epochs
+                    ttt_upper_shift_score = ttt_result.upper_shift_score
+                    ttt_upper_alpha = ttt_result.upper_alpha
+                    ttt_upper_alpha_reason = ttt_result.upper_alpha_reason
+                    ttt_upper_stage1_steps = ttt_result.upper_stage1_steps
+                    ttt_upper_stage2_steps = ttt_result.upper_stage2_steps
+                    ttt_upper_fallback_reason = ttt_result.upper_fallback_reason
+                    ttt_upper_used_test_features = ttt_result.upper_used_test_features
                     if ttt_result.reason:
                         ttt_split_reason = append_ttt_reason(ttt_split_reason, ttt_result.reason)
+                    if ttt_c_fallback_reason:
+                        ttt_split_reason = append_ttt_reason(
+                            ttt_split_reason,
+                            f"C-selection fallback: {ttt_c_fallback_reason}",
+                        )
+                    if ttt_upper_alpha_reason:
+                        ttt_split_reason = append_ttt_reason(
+                            ttt_split_reason,
+                            f"upper_alpha={format_optional_float(ttt_upper_alpha)} reason={ttt_upper_alpha_reason}",
+                        )
+                    if ttt_upper_shift_score is not None:
+                        ttt_split_reason = append_ttt_reason(
+                            ttt_split_reason,
+                            f"upper_shift_score={format_optional_float(ttt_upper_shift_score)} "
+                            f"actual_upper_final_epochs={ttt_upper_final_epochs}",
+                        )
 
                     if ttt_applied:
                         _fit_preserving_model_weights(classifier, X_train, y_train)
@@ -2132,6 +3028,24 @@ def evaluate_one_dataset(
             ttt_stopped_early=ttt_stopped_early,
             ttt_oom_fallback=ttt_oom_fallback,
             ttt_fallback_reason=ttt_fallback_reason,
+            ttt_c_selection=ttt_c_selection,
+            ttt_c_source=ttt_c_source,
+            ttt_c_metric=ttt_c_metric,
+            ttt_c_f_distance_mean=ttt_c_f_distance_mean,
+            ttt_c_f_distance_std=ttt_c_f_distance_std,
+            ttt_c_fallback_reason=ttt_c_fallback_reason,
+            ttt_c_label_coverage_ok=ttt_c_label_coverage_ok,
+            ttt_upper_enabled=ttt_upper_enabled,
+            ttt_upper_selection=ttt_upper_selection,
+            ttt_upper_pool_size=ttt_upper_pool_size,
+            ttt_upper_final_epochs=ttt_upper_final_epochs,
+            ttt_upper_shift_score=ttt_upper_shift_score,
+            ttt_upper_alpha=ttt_upper_alpha,
+            ttt_upper_alpha_reason=ttt_upper_alpha_reason,
+            ttt_upper_stage1_steps=ttt_upper_stage1_steps,
+            ttt_upper_stage2_steps=ttt_upper_stage2_steps,
+            ttt_upper_fallback_reason=ttt_upper_fallback_reason,
+            ttt_upper_used_test_features=ttt_upper_used_test_features,
         )
     except Exception as exc:
         return ResultRow(
@@ -2545,6 +3459,11 @@ def write_summary(
         if len(ok_df)
         else pd.DataFrame()
     )
+    upper_df = (
+        ok_df[truthy_column_mask(ok_df, "ttt_upper_enabled")].copy()
+        if len(ok_df) and "ttt_upper_enabled" in ok_df.columns
+        else pd.DataFrame()
+    )
 
     def mean_line(label: str, column: str) -> str:
         if len(ok_df) and column in ok_df.columns and ok_df[column].notna().any():
@@ -2558,6 +3477,7 @@ def write_summary(
         f"failed_count: {len(failed_df)}",
         f"skipped_count: {len(skipped_df)}",
         f"ttt_oom_fallback_count: {len(oom_fallback_df)}",
+        f"ttt_upper_enabled_count: {len(upper_df)}",
         mean_line("avg_accuracy_ok", "accuracy"),
         mean_line("avg_f1_ok", "f1"),
         mean_line("avg_balanced_accuracy_ok", "balanced_accuracy"),
@@ -2565,6 +3485,15 @@ def write_summary(
         mean_line("avg_log_loss_ok", "log_loss"),
         f"wall_seconds: {wall_seconds:.3f}",
     ]
+    if len(upper_df):
+        if "ttt_upper_stage2_steps" in upper_df.columns:
+            lines.append(f"ttt_upper_stage2_steps_sum: {pd.to_numeric(upper_df['ttt_upper_stage2_steps'], errors='coerce').sum():.0f}")
+        if "ttt_upper_alpha" in upper_df.columns and upper_df["ttt_upper_alpha"].notna().any():
+            lines.append(f"ttt_upper_alpha_avg: {pd.to_numeric(upper_df['ttt_upper_alpha'], errors='coerce').mean():.6f}")
+        if "ttt_upper_shift_score" in upper_df.columns and upper_df["ttt_upper_shift_score"].notna().any():
+            lines.append(f"ttt_upper_shift_score_avg: {pd.to_numeric(upper_df['ttt_upper_shift_score'], errors='coerce').mean():.6f}")
+    else:
+        lines.append("ttt_upper_stage2_steps_sum: 0")
 
     if len(failed_df):
         failed_names = ", ".join(failed_df["dataset_name"].astype(str).tolist())
@@ -2663,7 +3592,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-version", default=DEFAULT_CHECKPOINT_VERSION)
     parser.add_argument(
         "--out-dir",
-        default="result/compare/Tabiclv2_ttt_ensemble32_small_lt2000",
+        default="result/compare/Faware_c_upper_ttt_lt2000",
         help=(
             "Output directory. If omitted, generate one under 1b_result from "
             "TabICL version, dataset label, model parameters, TTT eval metric, "
@@ -2722,7 +3651,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--ttt-max-chunk-size", type=int, default=10000)
     parser.add_argument("--ttt-min-chunk-size", type=int, default=50)
-    parser.add_argument("--ttt-query-ratio", type=float, default=0.2)
+    parser.add_argument("--ttt-query-ratio", type=float, default=0.3)
     parser.add_argument("--ttt-n-estimators-finetune", type=int, default=2)
     parser.add_argument("--ttt-early-stopping", type=parse_bool, default=True)
     parser.add_argument("--ttt-patience", type=int, default=8)
@@ -2733,6 +3662,48 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ttt-freeze-col", type=parse_bool, default=False)
     parser.add_argument("--ttt-freeze-row", type=parse_bool, default=False)
     parser.add_argument("--ttt-freeze-icl", type=parse_bool, default=False)
+    parser.add_argument(
+        "--ttt-c-selection",
+        choices=["random", "stratified_random", "f_nearest", "f_mmd", "f_density_mixed", "f_hybrid_upper"],
+        default="f_hybrid_upper",
+        help=(
+            "How to choose the per-chunk query C used for TTT. random preserves "
+            "the original 1C_Chunk_TTT.py split behavior; f_* strategies choose C "
+            "by matching an unlabeled validation/test reference distribution."
+        ),
+    )
+    parser.add_argument(
+        "--ttt-c-source",
+        choices=["none", "validation", "test"],
+        default="test",
+        help=(
+            "Unlabeled reference split used by f_* C-selection. Use validation for "
+            "inductive/proxy experiments and test only for transductive F-aware TTT."
+        ),
+    )
+    parser.add_argument(
+        "--ttt-c-metric",
+        choices=["tabicl_encoded_l2", "standardized_l2"],
+        default="standardized_l2",
+        help=(
+            "Distance space for F-aware C-selection. Both options start from the "
+            "TabICL numerical encoder; standardized_l2 additionally z-scores the encoded features."
+        ),
+    )
+    parser.add_argument("--ttt-c-candidate-multiplier", type=int, default=5)
+    parser.add_argument("--ttt-c-class-balance", type=parse_bool, default=True)
+    parser.add_argument("--ttt-upper-final-epochs", type=int, default=10)
+    parser.add_argument(
+        "--ttt-upper-selection",
+        choices=["f_hybrid_upper", "f_mmd_only", "f_nearest_only"],
+        default="f_hybrid_upper",
+    )
+    parser.add_argument("--ttt-upper-alpha-grid", default="0,0.25,0.5,0.75,1.0")
+    parser.add_argument("--ttt-upper-pool-ratio", type=float, default=0.5)
+    parser.add_argument("--ttt-upper-density-weight", type=float, default=0.25)
+    parser.add_argument("--ttt-upper-mmd-weight", type=float, default=0.35)
+    parser.add_argument("--ttt-upper-distance-weight", type=float, default=0.40)
+    parser.add_argument("--ttt-rollback-gate", choices=["validation", "none"], default="validation")
     parser.add_argument(
         "--ttt-save-ckpt",
         type=parse_bool,

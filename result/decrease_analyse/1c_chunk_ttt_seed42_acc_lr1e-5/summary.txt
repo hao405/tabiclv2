@@ -1,0 +1,19 @@
+discovered_datasets: 35
+processed_datasets: 35
+ok_count: 35
+failed_count: 0
+skipped_count: 0
+ttt_oom_fallback_count: 0
+avg_accuracy_ok: 0.843713
+avg_f1_ok: 0.836084
+avg_balanced_accuracy_ok: 0.781774
+avg_roc_auc_ok: 0.904310
+avg_log_loss_ok: 0.355533
+wall_seconds: 0.000
+failed_datasets: (none)
+skipped_datasets: (none)
+ttt_oom_fallback_datasets: (none)
+source_result_dir: result/1c_result_v2/1c_chunk_ttt_seed42_acc_lr1e-5
+matched_baseline_dir: result/decrease_analyse/iclv2_loss35_baseline
+matched_by: dataset_name
+worker_files: worker_0.csv(18), worker_1.csv(17)
