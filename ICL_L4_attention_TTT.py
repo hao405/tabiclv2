@@ -77,15 +77,15 @@ class ResultRow:
     ttt_stopped_early: bool = False
     ttt_oom_fallback: bool = False
     ttt_fallback_reason: Optional[str] = None
-    ttt_col_attn_enabled: bool = False
-    ttt_col_attn_ratio: Optional[float] = None
-    ttt_col_attn_random_ratio: Optional[float] = None
-    ttt_col_attn_score_mean: Optional[float] = None
-    ttt_col_attn_score_std: Optional[float] = None
-    ttt_col_attn_selected_attention_count: int = 0
-    ttt_col_attn_selected_random_count: int = 0
-    ttt_col_attn_fallback_reason: Optional[str] = None
-    ttt_col_attn_label_coverage_ok: bool = True
+    ttt_icl_attn_enabled: bool = False
+    ttt_icl_attn_ratio: Optional[float] = None
+    ttt_icl_attn_random_ratio: Optional[float] = None
+    ttt_icl_attn_score_mean: Optional[float] = None
+    ttt_icl_attn_score_std: Optional[float] = None
+    ttt_icl_attn_selected_attention_count: int = 0
+    ttt_icl_attn_selected_random_count: int = 0
+    ttt_icl_attn_fallback_reason: Optional[str] = None
+    ttt_icl_attn_label_coverage_ok: bool = True
 
 
 @dataclass
@@ -122,11 +122,11 @@ class TTTConfig:
     save_ckpt_every: int = 2
     save_ckpt_start_step: Optional[int] = None
     ckpt_root: Optional[str] = None
-    c_selection: str = "col_attention_mix"
-    col_attn_ratio: float = 0.6
+    c_selection: str = "icl_attention_mix"
+    icl_attn_ratio: float = 0.6
     random_ratio: float = 0.4
-    col_attn_source: str = "test"
-    col_attn_layer: str = "last"
+    icl_attn_source: str = "test"
+    icl_attn_layer: int = 4
 
 
 @dataclass
@@ -138,7 +138,7 @@ class TTTSplit:
 
 
 @dataclass
-class ColAttentionSelectionResult:
+class ICLAttentionSelectionResult:
     ctx_idx: Any
     qry_idx: Any
     split_strategy: str
@@ -168,15 +168,15 @@ class TTTUpdateResult:
     val_best_accuracy: Optional[float] = None
     best_epoch: int = 0
     stopped_early: bool = False
-    col_attn_enabled: bool = False
-    col_attn_ratio: Optional[float] = None
-    col_attn_random_ratio: Optional[float] = None
-    col_attn_score_mean: Optional[float] = None
-    col_attn_score_std: Optional[float] = None
-    col_attn_selected_attention_count: int = 0
-    col_attn_selected_random_count: int = 0
-    col_attn_fallback_reason: Optional[str] = None
-    col_attn_label_coverage_ok: bool = True
+    icl_attn_enabled: bool = False
+    icl_attn_ratio: Optional[float] = None
+    icl_attn_random_ratio: Optional[float] = None
+    icl_attn_score_mean: Optional[float] = None
+    icl_attn_score_std: Optional[float] = None
+    icl_attn_selected_attention_count: int = 0
+    icl_attn_selected_random_count: int = 0
+    icl_attn_fallback_reason: Optional[str] = None
+    icl_attn_label_coverage_ok: bool = True
 
 
 @dataclass
@@ -192,13 +192,13 @@ class MetaBatch:
     y_query: Any
     train_size: int
     skip_reason: Optional[str] = None
-    col_attn_score_sum: float = 0.0
-    col_attn_score_sumsq: float = 0.0
-    col_attn_score_count: int = 0
-    col_attn_selected_attention_count: int = 0
-    col_attn_selected_random_count: int = 0
-    col_attn_fallback_reason: Optional[str] = None
-    col_attn_label_coverage_ok: bool = True
+    icl_attn_score_sum: float = 0.0
+    icl_attn_score_sumsq: float = 0.0
+    icl_attn_score_count: int = 0
+    icl_attn_selected_attention_count: int = 0
+    icl_attn_selected_random_count: int = 0
+    icl_attn_fallback_reason: Optional[str] = None
+    icl_attn_label_coverage_ok: bool = True
 
 
 @dataclass
@@ -876,20 +876,20 @@ def build_ttt_config(args: argparse.Namespace) -> TTTConfig:
         raise ValueError("--ttt-validation-n-estimators must be >= 1")
     if str(args.ttt_eval_metric) not in {"roc_auc", "log_loss", "accuracy"}:
         raise ValueError("--ttt-eval-metric must be one of: roc_auc, log_loss, accuracy")
-    if str(args.ttt_c_selection) not in {"col_attention_mix", "random"}:
-        raise ValueError("--ttt-c-selection must be one of: col_attention_mix, random")
-    if str(args.ttt_col_attn_source) != "test":
-        raise ValueError("--ttt-col-attn-source currently supports only: test")
-    if str(args.ttt_col_attn_layer) != "last":
-        raise ValueError("--ttt-col-attn-layer currently supports only: last")
-    col_attn_ratio = float(args.ttt_col_attn_ratio)
+    if str(args.ttt_c_selection) not in {"icl_attention_mix", "random"}:
+        raise ValueError("--ttt-c-selection must be one of: icl_attention_mix, random")
+    if str(args.ttt_icl_attn_source) != "test":
+        raise ValueError("--ttt-icl-attn-source currently supports only: test")
+    if int(args.ttt_icl_attn_layer) < 1:
+        raise ValueError("--ttt-icl-attn-layer must be a 1-based layer index >= 1")
+    icl_attn_ratio = float(args.ttt_icl_attn_ratio)
     random_ratio = float(args.ttt_random_ratio)
-    if not 0.0 <= col_attn_ratio <= 1.0:
-        raise ValueError("--ttt-col-attn-ratio must be in [0, 1]")
+    if not 0.0 <= icl_attn_ratio <= 1.0:
+        raise ValueError("--ttt-icl-attn-ratio must be in [0, 1]")
     if not 0.0 <= random_ratio <= 1.0:
         raise ValueError("--ttt-random-ratio must be in [0, 1]")
-    if abs((col_attn_ratio + random_ratio) - 1.0) > 1e-6:
-        raise ValueError("--ttt-col-attn-ratio and --ttt-random-ratio must sum to 1")
+    if abs((icl_attn_ratio + random_ratio) - 1.0) > 1e-6:
+        raise ValueError("--ttt-icl-attn-ratio and --ttt-random-ratio must sum to 1")
 
     return TTTConfig(
         enabled=bool(args.ttt_enabled),
@@ -925,10 +925,10 @@ def build_ttt_config(args: argparse.Namespace) -> TTTConfig:
         ),
         ckpt_root=str((Path(args.out_dir).expanduser() / "ttt_ckpts").resolve()),
         c_selection=str(args.ttt_c_selection),
-        col_attn_ratio=col_attn_ratio,
+        icl_attn_ratio=icl_attn_ratio,
         random_ratio=random_ratio,
-        col_attn_source=str(args.ttt_col_attn_source),
-        col_attn_layer=str(args.ttt_col_attn_layer),
+        icl_attn_source=str(args.ttt_icl_attn_source),
+        icl_attn_layer=int(args.ttt_icl_attn_layer),
     )
 
 
@@ -1037,54 +1037,54 @@ def _iter_stratified_random_candidates(y_chunk, candidates, rng) -> List[int]:
     return ordered
 
 
-def _fallback_random_col_attention_selection(y_chunk, *, query_size: int, seed: int, reason: str) -> ColAttentionSelectionResult:
+def _fallback_random_icl_attention_selection(y_chunk, *, query_size: int, seed: int, reason: str) -> ICLAttentionSelectionResult:
     ctx_idx, qry_idx, split_strategy = _split_ctx_query(y_chunk, query_size=query_size, seed=seed)
     coverage_ok = _label_coverage_ok(y_chunk, qry_idx)
-    return ColAttentionSelectionResult(
+    return ICLAttentionSelectionResult(
         ctx_idx=np.asarray(ctx_idx, dtype=np.int64),
         qry_idx=np.asarray(qry_idx, dtype=np.int64),
-        split_strategy=f"fallback_from_col_attention_mix:{split_strategy}",
+        split_strategy=f"fallback_from_icl_attention_mix:{split_strategy}",
         fallback_reason=reason,
         label_coverage_ok=bool(coverage_ok),
     )
 
 
-def _select_col_attention_mix_query_indices(
+def _select_icl_attention_mix_query_indices(
     y_chunk,
-    col_attention_scores,
+    icl_attention_scores,
     *,
     query_size: int,
     seed: int,
-    col_attn_ratio: float = 0.6,
+    icl_attn_ratio: float = 0.6,
     random_ratio: float = 0.4,
-) -> ColAttentionSelectionResult:
+) -> ICLAttentionSelectionResult:
     ensure_runtime_deps()
 
     y_arr = np.asarray(y_chunk).astype(int)
-    scores = np.asarray(col_attention_scores, dtype=np.float64)
+    scores = np.asarray(icl_attention_scores, dtype=np.float64)
     n = int(y_arr.shape[0])
     query_size = max(1, min(int(query_size), n - 1))
     if n < 2:
-        return ColAttentionSelectionResult(
+        return ICLAttentionSelectionResult(
             ctx_idx=np.asarray([], dtype=np.int64),
             qry_idx=np.asarray([], dtype=np.int64),
-            split_strategy="col_attention_mix",
+            split_strategy="icl_attention_mix",
             fallback_reason="chunk has fewer than two samples",
             label_coverage_ok=False,
         )
     if scores.shape[0] != n:
-        return _fallback_random_col_attention_selection(
+        return _fallback_random_icl_attention_selection(
             y_arr,
             query_size=query_size,
             seed=seed,
-            reason=f"col_attention_score_shape_mismatch:{scores.shape[0]}!={n}",
+            reason=f"icl_attention_score_shape_mismatch:{scores.shape[0]}!={n}",
         )
     if not np.isfinite(scores).any():
-        return _fallback_random_col_attention_selection(
+        return _fallback_random_icl_attention_selection(
             y_arr,
             query_size=query_size,
             seed=seed,
-            reason="col_attention_scores_all_nonfinite",
+            reason="icl_attention_scores_all_nonfinite",
         )
 
     finite_scores = np.where(np.isfinite(scores), scores, -np.inf)
@@ -1093,7 +1093,7 @@ def _select_col_attention_mix_query_indices(
     selected_mask = np.zeros(n, dtype=bool)
     selected_attention: List[int] = []
     selected_random: List[int] = []
-    n_attn = min(query_size, int(round(query_size * float(col_attn_ratio))))
+    n_attn = min(query_size, int(round(query_size * float(icl_attn_ratio))))
     n_random = query_size - n_attn
 
     order = np.argsort(-finite_scores, kind="mergesort").astype(int).tolist()
@@ -1139,28 +1139,28 @@ def _select_col_attention_mix_query_indices(
 
     qry_idx = np.flatnonzero(selected_mask).astype(np.int64)
     if qry_idx.shape[0] != query_size:
-        return _fallback_random_col_attention_selection(
+        return _fallback_random_icl_attention_selection(
             y_arr,
             query_size=query_size,
             seed=seed,
-            reason=f"safe_col_attention_mix_insufficient:{qry_idx.shape[0]}/{query_size}",
+            reason=f"safe_icl_attention_mix_insufficient:{qry_idx.shape[0]}/{query_size}",
         )
 
     coverage_ok = _label_coverage_ok(y_arr, qry_idx)
     if not coverage_ok:
-        return _fallback_random_col_attention_selection(
+        return _fallback_random_icl_attention_selection(
             y_arr,
             query_size=query_size,
             seed=seed,
-            reason="col_attention_mix query labels absent from context",
+            reason="icl_attention_mix query labels absent from context",
         )
 
     selected_scores = finite_scores[qry_idx]
     selected_scores = selected_scores[np.isfinite(selected_scores)]
-    return ColAttentionSelectionResult(
+    return ICLAttentionSelectionResult(
         ctx_idx=_make_ctx_indices(n, qry_idx),
         qry_idx=qry_idx,
-        split_strategy="col_attention_mix",
+        split_strategy="icl_attention_mix",
         score_sum=float(selected_scores.sum()) if selected_scores.size else 0.0,
         score_sumsq=float(np.square(selected_scores).sum()) if selected_scores.size else 0.0,
         score_count=int(selected_scores.size),
@@ -1173,34 +1173,34 @@ def _select_col_attention_mix_query_indices(
 
 def _select_ctx_query_for_chunk(
     y_chunk,
-    col_attention_scores,
+    icl_attention_scores,
     *,
     query_size: int,
     seed: int,
     config: TTTConfig,
-) -> ColAttentionSelectionResult:
-    if getattr(config, "c_selection", "col_attention_mix") == "random":
+) -> ICLAttentionSelectionResult:
+    if getattr(config, "c_selection", "icl_attention_mix") == "random":
         ctx_idx, qry_idx, split_strategy = _split_ctx_query(y_chunk, query_size=query_size, seed=seed)
-        return ColAttentionSelectionResult(
+        return ICLAttentionSelectionResult(
             ctx_idx=np.asarray(ctx_idx, dtype=np.int64),
             qry_idx=np.asarray(qry_idx, dtype=np.int64),
             split_strategy=split_strategy,
             label_coverage_ok=_label_coverage_ok(y_chunk, qry_idx),
         )
 
-    if col_attention_scores is None:
-        return _fallback_random_col_attention_selection(
+    if icl_attention_scores is None:
+        return _fallback_random_icl_attention_selection(
             y_chunk,
             query_size=query_size,
             seed=seed,
-            reason="col_attention_scores_unavailable",
+            reason="icl_attention_scores_unavailable",
         )
-    return _select_col_attention_mix_query_indices(
+    return _select_icl_attention_mix_query_indices(
         y_chunk,
-        col_attention_scores,
+        icl_attention_scores,
         query_size=query_size,
         seed=seed,
-        col_attn_ratio=float(getattr(config, "col_attn_ratio", 0.6)),
+        icl_attn_ratio=float(getattr(config, "icl_attn_ratio", 0.6)),
         random_ratio=float(getattr(config, "random_ratio", 0.4)),
     )
 
@@ -1391,18 +1391,26 @@ def _fit_preserving_model_weights(classifier, X, y) -> None:
             classifier._load_model = original_load_model
 
 
-def _get_last_col_attention_module(classifier, *, layer: str = "last"):
-    if layer != "last":
-        raise ValueError("--ttt-col-attn-layer currently supports only: last")
+def _get_icl_attention_module(classifier, *, layer: int = 4):
+    layer_idx = int(layer) - 1
+    if layer_idx < 0:
+        raise ValueError("--ttt-icl-attn-layer must be a 1-based layer index >= 1")
     base_model = _get_ttt_base_model(classifier)
-    blocks = getattr(getattr(getattr(base_model, "col_embedder", None), "tf_col", None), "blocks", None)
-    if blocks is None or len(blocks) == 0:
-        raise RuntimeError("Cannot locate base_model.col_embedder.tf_col.blocks")
-    block = blocks[-1]
-    return block.multihead_attn2.attn
+    blocks = getattr(getattr(getattr(base_model, "icl_predictor", None), "tf_icl", None), "blocks", None)
+    if blocks is None:
+        raise RuntimeError("Cannot locate base_model.icl_predictor.tf_icl.blocks")
+    if layer_idx >= len(blocks):
+        raise RuntimeError(
+            f"--ttt-icl-attn-layer={layer} exceeds available ICL blocks ({len(blocks)})"
+        )
+    block = blocks[layer_idx]
+    attn_module = getattr(block, "attn", None)
+    if attn_module is None:
+        raise RuntimeError(f"Cannot locate attention module on ICL block {layer}")
+    return attn_module
 
 
-def _accumulate_col_attention_profiles(profile_accumulator, attn_module, hook_args, hook_kwargs) -> None:
+def _accumulate_icl_attention_profiles(profile_accumulator, attn_module, hook_args, hook_kwargs) -> None:
     import torch
     import torch.nn.functional as torch_F
 
@@ -1472,10 +1480,10 @@ def _accumulate_col_attention_profiles(profile_accumulator, attn_module, hook_ar
     profile_accumulator.append(profile.cpu())
 
 
-def _compute_col_attention_profile_scores(classifier, X_reference, *, expected_train_size: int, layer: str = "last"):
+def _compute_icl_attention_profile_scores(classifier, X_reference, *, expected_train_size: int, layer: int = 4):
     ensure_runtime_deps()
     if X_reference is None or len(X_reference) == 0:
-        return None, "empty_col_attention_reference"
+        return None, "empty_icl_attention_reference"
 
     import torch
 
@@ -1485,10 +1493,10 @@ def _compute_col_attention_profile_scores(classifier, X_reference, *, expected_t
     original_cache = getattr(classifier, "model_kv_cache_", None)
     hook_handle = None
     try:
-        attn_module = _get_last_col_attention_module(classifier, layer=layer)
+        attn_module = _get_icl_attention_module(classifier, layer=layer)
 
         def _hook(module, args, kwargs):
-            _accumulate_col_attention_profiles(profiles, module, args, kwargs)
+            _accumulate_icl_attention_profiles(profiles, module, args, kwargs)
 
         hook_handle = attn_module.register_forward_pre_hook(_hook, with_kwargs=True)
         classifier.model_kv_cache_ = None
@@ -1496,7 +1504,7 @@ def _compute_col_attention_profile_scores(classifier, X_reference, *, expected_t
         with torch.inference_mode():
             classifier.predict_proba(X_reference)
     except Exception as exc:
-        return None, f"col_attention_probe_failed:{type(exc).__name__}:{exc}"
+        return None, f"icl_attention_probe_failed:{type(exc).__name__}:{exc}"
     finally:
         if hook_handle is not None:
             hook_handle.remove()
@@ -1508,34 +1516,34 @@ def _compute_col_attention_profile_scores(classifier, X_reference, *, expected_t
 
     usable_profiles = [profile for profile in profiles if profile.ndim == 2]
     if not usable_profiles:
-        return None, "col_attention_probe_empty"
+        return None, "icl_attention_probe_empty"
 
     stacked = []
     for profile in usable_profiles:
         if profile.shape[0] >= expected_train_size + 1:
             stacked.append(profile)
     if not stacked:
-        return None, "col_attention_probe_no_train_test_rows"
+        return None, "icl_attention_probe_no_train_test_rows"
 
     min_rows = min(int(profile.shape[0]) for profile in stacked)
     min_cols = min(int(profile.shape[1]) for profile in stacked)
     if min_rows <= expected_train_size or min_cols <= 0:
-        return None, "col_attention_probe_invalid_profile_shape"
+        return None, "icl_attention_probe_invalid_profile_shape"
 
     profile_tensor = torch.stack([profile[:min_rows, :min_cols] for profile in stacked], dim=0).mean(dim=0)
     train_profiles = profile_tensor[:expected_train_size]
     ref_profiles = profile_tensor[expected_train_size:]
     if train_profiles.shape[0] != expected_train_size or ref_profiles.shape[0] == 0:
-        return None, "col_attention_probe_missing_reference_rows"
+        return None, "icl_attention_probe_missing_reference_rows"
 
     train_profiles = train_profiles / train_profiles.norm(dim=1, keepdim=True).clamp_min(1e-12)
     ref_centroid = ref_profiles.mean(dim=0)
     ref_centroid = ref_centroid / ref_centroid.norm().clamp_min(1e-12)
     scores = (train_profiles @ ref_centroid).numpy().astype(np.float64)
     if scores.shape[0] != expected_train_size:
-        return None, "col_attention_score_length_mismatch"
+        return None, "icl_attention_score_length_mismatch"
     if not np.isfinite(scores).any():
-        return None, "col_attention_scores_nonfinite"
+        return None, "icl_attention_scores_nonfinite"
     return scores, None
 
 
@@ -1626,7 +1634,7 @@ def _build_classification_meta_batch(
     query_size: int,
     epoch_seed: int,
     chunk_idx: int,
-    col_attention_scores=None,
+    icl_attention_scores=None,
 ) -> MetaBatch:
     try:
         from tabicl._sklearn.preprocessing import EnsembleGenerator
@@ -1641,7 +1649,7 @@ def _build_classification_meta_batch(
     query_size = max(int(query_size), n_classes_in_chunk)
     selection = _select_ctx_query_for_chunk(
         y_chunk,
-        col_attention_scores,
+        icl_attention_scores,
         query_size=query_size,
         seed=split_seed,
         config=config,
@@ -1659,8 +1667,8 @@ def _build_classification_meta_batch(
             0,
             "query labels absent from context after "
             f"{split_strategy} split: {','.join(str(item) for item in missing_query_labels)}",
-            col_attn_fallback_reason=selection.fallback_reason,
-            col_attn_label_coverage_ok=False,
+            icl_attn_fallback_reason=selection.fallback_reason,
+            icl_attn_label_coverage_ok=False,
         )
 
     local_classes = np.asarray(sorted(set(y_ctx_raw.tolist())), dtype=np.int64)
@@ -1708,13 +1716,13 @@ def _build_classification_meta_batch(
         y_query=torch.from_numpy(np.stack(y_query_list, axis=0)).long(),
         train_size=int(len(ctx_idx)),
         skip_reason=None,
-        col_attn_score_sum=selection.score_sum,
-        col_attn_score_sumsq=selection.score_sumsq,
-        col_attn_score_count=selection.score_count,
-        col_attn_selected_attention_count=selection.selected_attention_count,
-        col_attn_selected_random_count=selection.selected_random_count,
-        col_attn_fallback_reason=selection.fallback_reason,
-        col_attn_label_coverage_ok=selection.label_coverage_ok,
+        icl_attn_score_sum=selection.score_sum,
+        icl_attn_score_sumsq=selection.score_sumsq,
+        icl_attn_score_count=selection.score_count,
+        icl_attn_selected_attention_count=selection.selected_attention_count,
+        icl_attn_selected_random_count=selection.selected_random_count,
+        icl_attn_fallback_reason=selection.fallback_reason,
+        icl_attn_label_coverage_ok=selection.label_coverage_ok,
     )
 
 
@@ -1725,7 +1733,7 @@ def iter_epoch_meta_batches(
     *,
     config: TTTConfig,
     epoch_seed: int,
-    col_attention_scores=None,
+    icl_attention_scores=None,
 ) -> Iterator[MetaBatch]:
     rng = np.random.default_rng(epoch_seed)
     chunks = _chunk_indices(
@@ -1738,8 +1746,8 @@ def iter_epoch_meta_batches(
         X_chunk = X_encoded[indices]
         y_chunk = y_encoded[indices]
         chunk_scores = None
-        if col_attention_scores is not None:
-            chunk_scores = np.asarray(col_attention_scores)[indices]
+        if icl_attention_scores is not None:
+            chunk_scores = np.asarray(icl_attention_scores)[indices]
         query_size = max(1, int(len(indices) * config.query_ratio))
         yield _build_classification_meta_batch(
             classifier,
@@ -1749,7 +1757,7 @@ def iter_epoch_meta_batches(
             query_size=query_size,
             epoch_seed=epoch_seed,
             chunk_idx=chunk_idx,
-            col_attention_scores=chunk_scores,
+            icl_attention_scores=chunk_scores,
         )
 
 
@@ -1760,13 +1768,13 @@ def move_meta_batch(batch: MetaBatch, device) -> MetaBatch:
         y_query=batch.y_query.to(device, non_blocking=True),
         train_size=batch.train_size,
         skip_reason=batch.skip_reason,
-        col_attn_score_sum=batch.col_attn_score_sum,
-        col_attn_score_sumsq=batch.col_attn_score_sumsq,
-        col_attn_score_count=batch.col_attn_score_count,
-        col_attn_selected_attention_count=batch.col_attn_selected_attention_count,
-        col_attn_selected_random_count=batch.col_attn_selected_random_count,
-        col_attn_fallback_reason=batch.col_attn_fallback_reason,
-        col_attn_label_coverage_ok=batch.col_attn_label_coverage_ok,
+        icl_attn_score_sum=batch.icl_attn_score_sum,
+        icl_attn_score_sumsq=batch.icl_attn_score_sumsq,
+        icl_attn_score_count=batch.icl_attn_score_count,
+        icl_attn_selected_attention_count=batch.icl_attn_selected_attention_count,
+        icl_attn_selected_random_count=batch.icl_attn_selected_random_count,
+        icl_attn_fallback_reason=batch.icl_attn_fallback_reason,
+        icl_attn_label_coverage_ok=batch.icl_attn_label_coverage_ok,
     )
 
 
@@ -1958,46 +1966,46 @@ def run_ttt_epoch_chunk_update(
     *,
     model_name: str,
     dataset_name: str,
-    X_col_attn_reference=None,
+    X_icl_attn_reference=None,
 ) -> TTTUpdateResult:
     ensure_runtime_deps()
 
-    col_attn_enabled = bool(config.enabled and getattr(config, "c_selection", "col_attention_mix") == "col_attention_mix")
-    col_attn_score_sum = 0.0
-    col_attn_score_sumsq = 0.0
-    col_attn_score_count = 0
-    col_attn_selected_attention_count = 0
-    col_attn_selected_random_count = 0
-    col_attn_fallback_reasons: Dict[str, int] = {}
-    col_attn_label_coverage_ok = True
+    icl_attn_enabled = bool(config.enabled and getattr(config, "c_selection", "icl_attention_mix") == "icl_attention_mix")
+    icl_attn_score_sum = 0.0
+    icl_attn_score_sumsq = 0.0
+    icl_attn_score_count = 0
+    icl_attn_selected_attention_count = 0
+    icl_attn_selected_random_count = 0
+    icl_attn_fallback_reasons: Dict[str, int] = {}
+    icl_attn_label_coverage_ok = True
 
-    def _record_col_attn_fallback(reason: Optional[str]) -> None:
+    def _record_icl_attn_fallback(reason: Optional[str]) -> None:
         if not reason:
             return
         text = str(reason)
-        col_attn_fallback_reasons[text] = col_attn_fallback_reasons.get(text, 0) + 1
+        icl_attn_fallback_reasons[text] = icl_attn_fallback_reasons.get(text, 0) + 1
 
-    def _col_attn_result_kwargs() -> Dict[str, Any]:
+    def _icl_attn_result_kwargs() -> Dict[str, Any]:
         mean = None
         std = None
-        if col_attn_score_count > 0:
-            mean = float(col_attn_score_sum / col_attn_score_count)
-            var = max(0.0, float(col_attn_score_sumsq / col_attn_score_count) - mean * mean)
+        if icl_attn_score_count > 0:
+            mean = float(icl_attn_score_sum / icl_attn_score_count)
+            var = max(0.0, float(icl_attn_score_sumsq / icl_attn_score_count) - mean * mean)
             std = float(np.sqrt(var))
         fallback_reason = None
-        if col_attn_fallback_reasons:
-            top_reasons = sorted(col_attn_fallback_reasons.items(), key=lambda item: (-item[1], item[0]))[:3]
+        if icl_attn_fallback_reasons:
+            top_reasons = sorted(icl_attn_fallback_reasons.items(), key=lambda item: (-item[1], item[0]))[:3]
             fallback_reason = "; ".join(f"{count}x {text}" for text, count in top_reasons)
         return {
-            "col_attn_enabled": col_attn_enabled,
-            "col_attn_ratio": float(config.col_attn_ratio) if col_attn_enabled else None,
-            "col_attn_random_ratio": float(config.random_ratio) if col_attn_enabled else None,
-            "col_attn_score_mean": mean,
-            "col_attn_score_std": std,
-            "col_attn_selected_attention_count": int(col_attn_selected_attention_count),
-            "col_attn_selected_random_count": int(col_attn_selected_random_count),
-            "col_attn_fallback_reason": fallback_reason,
-            "col_attn_label_coverage_ok": bool(col_attn_label_coverage_ok),
+            "icl_attn_enabled": icl_attn_enabled,
+            "icl_attn_ratio": float(config.icl_attn_ratio) if icl_attn_enabled else None,
+            "icl_attn_random_ratio": float(config.random_ratio) if icl_attn_enabled else None,
+            "icl_attn_score_mean": mean,
+            "icl_attn_score_std": std,
+            "icl_attn_selected_attention_count": int(icl_attn_selected_attention_count),
+            "icl_attn_selected_random_count": int(icl_attn_selected_random_count),
+            "icl_attn_fallback_reason": fallback_reason,
+            "icl_attn_label_coverage_ok": bool(icl_attn_label_coverage_ok),
         }
 
     if config.scheduler not in {"constant", "cosine_warmup"}:
@@ -2011,7 +2019,7 @@ def run_ttt_epoch_chunk_update(
             reason="--ttt-epochs must be >= 1",
             epochs=0,
             chunks_per_epoch=0,
-            **_col_attn_result_kwargs(),
+            **_icl_attn_result_kwargs(),
         )
     if config.micro_batch_size < 1:
         raise ValueError("--ttt-micro-batch-size must be >= 1")
@@ -2030,7 +2038,7 @@ def run_ttt_epoch_chunk_update(
             ),
             epochs=0,
             chunks_per_epoch=0,
-            **_col_attn_result_kwargs(),
+            **_icl_attn_result_kwargs(),
         )
 
     import torch
@@ -2047,7 +2055,7 @@ def run_ttt_epoch_chunk_update(
             reason="No trainable parameters selected for TTT",
             epochs=0,
             chunks_per_epoch=0,
-            **_col_attn_result_kwargs(),
+            **_icl_attn_result_kwargs(),
         )
 
     optimizer = torch.optim.AdamW(trainable_params, lr=config.lr, weight_decay=config.weight_decay)
@@ -2056,26 +2064,26 @@ def run_ttt_epoch_chunk_update(
 
     X_encoded = classifier.X_encoder_.transform(X_train)
     y_encoded = classifier.y_encoder_.transform(y_train)
-    col_attention_scores = None
-    if col_attn_enabled:
-        col_attention_scores, probe_reason = _compute_col_attention_profile_scores(
+    icl_attention_scores = None
+    if icl_attn_enabled:
+        icl_attention_scores, probe_reason = _compute_icl_attention_profile_scores(
             classifier,
-            X_col_attn_reference,
+            X_icl_attn_reference,
             expected_train_size=int(len(y_encoded)),
-            layer=config.col_attn_layer,
+            layer=config.icl_attn_layer,
         )
         if probe_reason:
-            _record_col_attn_fallback(probe_reason)
+            _record_icl_attn_fallback(probe_reason)
             print(
-                f"[ttt-col-attn] model={model_name} dataset={dataset_name} "
+                f"[ttt-icl-attn] model={model_name} dataset={dataset_name} "
                 f"probe_failed reason={probe_reason}; selection will fallback per chunk",
                 flush=True,
             )
         else:
-            finite_scores = np.asarray(col_attention_scores, dtype=np.float64)
+            finite_scores = np.asarray(icl_attention_scores, dtype=np.float64)
             finite_scores = finite_scores[np.isfinite(finite_scores)]
             print(
-                f"[ttt-col-attn] model={model_name} dataset={dataset_name} "
+                f"[ttt-icl-attn] model={model_name} dataset={dataset_name} "
                 f"profile_scores={len(finite_scores)} "
                 f"mean={float(finite_scores.mean()):.6f} std={float(finite_scores.std()):.6f}",
                 flush=True,
@@ -2123,7 +2131,7 @@ def run_ttt_epoch_chunk_update(
                 reason="Need at least two encoded training samples for chunk TTT",
                 epochs=0,
                 chunks_per_epoch=chunks_per_epoch,
-                **_col_attn_result_kwargs(),
+                **_icl_attn_result_kwargs(),
             )
 
         if config.early_stopping and X_val is not None and y_val is not None and len(y_val) > 0:
@@ -2152,19 +2160,19 @@ def run_ttt_epoch_chunk_update(
                 y_encoded,
                 config=config,
                 epoch_seed=epoch_seed,
-                col_attention_scores=col_attention_scores,
+                icl_attention_scores=icl_attention_scores,
             ):
-                _record_col_attn_fallback(batch.col_attn_fallback_reason)
-                col_attn_label_coverage_ok = col_attn_label_coverage_ok and bool(batch.col_attn_label_coverage_ok)
+                _record_icl_attn_fallback(batch.icl_attn_fallback_reason)
+                icl_attn_label_coverage_ok = icl_attn_label_coverage_ok and bool(batch.icl_attn_label_coverage_ok)
                 if batch.skip_reason:
                     skipped_batches += 1
                     skip_reasons[batch.skip_reason] = skip_reasons.get(batch.skip_reason, 0) + 1
                     continue
-                col_attn_score_sum += float(batch.col_attn_score_sum)
-                col_attn_score_sumsq += float(batch.col_attn_score_sumsq)
-                col_attn_score_count += int(batch.col_attn_score_count)
-                col_attn_selected_attention_count += int(batch.col_attn_selected_attention_count)
-                col_attn_selected_random_count += int(batch.col_attn_selected_random_count)
+                icl_attn_score_sum += float(batch.icl_attn_score_sum)
+                icl_attn_score_sumsq += float(batch.icl_attn_score_sumsq)
+                icl_attn_score_count += int(batch.icl_attn_score_count)
+                icl_attn_selected_attention_count += int(batch.icl_attn_selected_attention_count)
+                icl_attn_selected_random_count += int(batch.icl_attn_selected_random_count)
 
                 batch = move_meta_batch(batch, device)
                 optimizer.zero_grad(set_to_none=True)
@@ -2273,7 +2281,7 @@ def run_ttt_epoch_chunk_update(
                 val_best_accuracy=best_accuracy,
                 best_epoch=best_epoch,
                 stopped_early=stopped_early,
-                **_col_attn_result_kwargs(),
+                **_icl_attn_result_kwargs(),
             )
 
         if best_state is not None:
@@ -2307,7 +2315,7 @@ def run_ttt_epoch_chunk_update(
         val_best_accuracy=best_accuracy,
         best_epoch=best_epoch,
         stopped_early=stopped_early,
-        **_col_attn_result_kwargs(),
+        **_icl_attn_result_kwargs(),
     )
 
 
@@ -2553,17 +2561,17 @@ def evaluate_one_dataset(
         ttt_stopped_early = False
         ttt_oom_fallback = False
         ttt_fallback_reason = None
-        ttt_col_attn_enabled = bool(
-            ttt_config.enabled and getattr(ttt_config, "c_selection", "col_attention_mix") == "col_attention_mix"
+        ttt_icl_attn_enabled = bool(
+            ttt_config.enabled and getattr(ttt_config, "c_selection", "icl_attention_mix") == "icl_attention_mix"
         )
-        ttt_col_attn_ratio = float(ttt_config.col_attn_ratio) if ttt_col_attn_enabled else None
-        ttt_col_attn_random_ratio = float(ttt_config.random_ratio) if ttt_col_attn_enabled else None
-        ttt_col_attn_score_mean = None
-        ttt_col_attn_score_std = None
-        ttt_col_attn_selected_attention_count = 0
-        ttt_col_attn_selected_random_count = 0
-        ttt_col_attn_fallback_reason = None
-        ttt_col_attn_label_coverage_ok = True
+        ttt_icl_attn_ratio = float(ttt_config.icl_attn_ratio) if ttt_icl_attn_enabled else None
+        ttt_icl_attn_random_ratio = float(ttt_config.random_ratio) if ttt_icl_attn_enabled else None
+        ttt_icl_attn_score_mean = None
+        ttt_icl_attn_score_std = None
+        ttt_icl_attn_selected_attention_count = 0
+        ttt_icl_attn_selected_random_count = 0
+        ttt_icl_attn_fallback_reason = None
+        ttt_icl_attn_label_coverage_ok = True
         n_train_b = 0
         n_holdout_c = 0
 
@@ -2577,11 +2585,11 @@ def evaluate_one_dataset(
                 ttt_split_reason = "full train set chunked per epoch"
                 if ttt_validation_reason:
                     ttt_split_reason += f" | validation={ttt_validation_reason}"
-                if ttt_col_attn_enabled:
+                if ttt_icl_attn_enabled:
                     ttt_split_reason += (
-                        " | c_selection=col_attention_mix"
-                        f" source={ttt_config.col_attn_source}"
-                        f" ratio={ttt_config.col_attn_ratio:.3f}"
+                        " | c_selection=icl_attention_mix"
+                        f" source={ttt_config.icl_attn_source}"
+                        f" ratio={ttt_config.icl_attn_ratio:.3f}"
                         f" random_ratio={ttt_config.random_ratio:.3f}"
                     )
                 n_train_b = int(len(y_ttt_train))
@@ -2597,7 +2605,7 @@ def evaluate_one_dataset(
                         ttt_config,
                         model_name=model_name,
                         dataset_name=dataset_dir.name,
-                        X_col_attn_reference=X_test,
+                        X_icl_attn_reference=X_test,
                     )
                 except Exception as ttt_exc:
                     if not is_oom_exception(ttt_exc):
@@ -2626,21 +2634,21 @@ def evaluate_one_dataset(
                     ttt_val_best_accuracy = ttt_result.val_best_accuracy
                     ttt_best_epoch = ttt_result.best_epoch
                     ttt_stopped_early = ttt_result.stopped_early
-                    ttt_col_attn_enabled = ttt_result.col_attn_enabled
-                    ttt_col_attn_ratio = ttt_result.col_attn_ratio
-                    ttt_col_attn_random_ratio = ttt_result.col_attn_random_ratio
-                    ttt_col_attn_score_mean = ttt_result.col_attn_score_mean
-                    ttt_col_attn_score_std = ttt_result.col_attn_score_std
-                    ttt_col_attn_selected_attention_count = ttt_result.col_attn_selected_attention_count
-                    ttt_col_attn_selected_random_count = ttt_result.col_attn_selected_random_count
-                    ttt_col_attn_fallback_reason = ttt_result.col_attn_fallback_reason
-                    ttt_col_attn_label_coverage_ok = ttt_result.col_attn_label_coverage_ok
+                    ttt_icl_attn_enabled = ttt_result.icl_attn_enabled
+                    ttt_icl_attn_ratio = ttt_result.icl_attn_ratio
+                    ttt_icl_attn_random_ratio = ttt_result.icl_attn_random_ratio
+                    ttt_icl_attn_score_mean = ttt_result.icl_attn_score_mean
+                    ttt_icl_attn_score_std = ttt_result.icl_attn_score_std
+                    ttt_icl_attn_selected_attention_count = ttt_result.icl_attn_selected_attention_count
+                    ttt_icl_attn_selected_random_count = ttt_result.icl_attn_selected_random_count
+                    ttt_icl_attn_fallback_reason = ttt_result.icl_attn_fallback_reason
+                    ttt_icl_attn_label_coverage_ok = ttt_result.icl_attn_label_coverage_ok
                     if ttt_result.reason:
                         ttt_split_reason = append_ttt_reason(ttt_split_reason, ttt_result.reason)
-                    if ttt_col_attn_fallback_reason:
+                    if ttt_icl_attn_fallback_reason:
                         ttt_split_reason = append_ttt_reason(
                             ttt_split_reason,
-                            f"col_attention_fallback={ttt_col_attn_fallback_reason}",
+                            f"icl_attention_fallback={ttt_icl_attn_fallback_reason}",
                         )
 
                     if ttt_applied:
@@ -2705,15 +2713,15 @@ def evaluate_one_dataset(
             ttt_stopped_early=ttt_stopped_early,
             ttt_oom_fallback=ttt_oom_fallback,
             ttt_fallback_reason=ttt_fallback_reason,
-            ttt_col_attn_enabled=ttt_col_attn_enabled,
-            ttt_col_attn_ratio=ttt_col_attn_ratio,
-            ttt_col_attn_random_ratio=ttt_col_attn_random_ratio,
-            ttt_col_attn_score_mean=ttt_col_attn_score_mean,
-            ttt_col_attn_score_std=ttt_col_attn_score_std,
-            ttt_col_attn_selected_attention_count=ttt_col_attn_selected_attention_count,
-            ttt_col_attn_selected_random_count=ttt_col_attn_selected_random_count,
-            ttt_col_attn_fallback_reason=ttt_col_attn_fallback_reason,
-            ttt_col_attn_label_coverage_ok=ttt_col_attn_label_coverage_ok,
+            ttt_icl_attn_enabled=ttt_icl_attn_enabled,
+            ttt_icl_attn_ratio=ttt_icl_attn_ratio,
+            ttt_icl_attn_random_ratio=ttt_icl_attn_random_ratio,
+            ttt_icl_attn_score_mean=ttt_icl_attn_score_mean,
+            ttt_icl_attn_score_std=ttt_icl_attn_score_std,
+            ttt_icl_attn_selected_attention_count=ttt_icl_attn_selected_attention_count,
+            ttt_icl_attn_selected_random_count=ttt_icl_attn_selected_random_count,
+            ttt_icl_attn_fallback_reason=ttt_icl_attn_fallback_reason,
+            ttt_icl_attn_label_coverage_ok=ttt_icl_attn_label_coverage_ok,
         )
     except Exception as exc:
         return ResultRow(
@@ -3245,7 +3253,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-version", default=DEFAULT_CHECKPOINT_VERSION)
     parser.add_argument(
         "--out-dir",
-        default="result/compare/Tabiclv2_ttt_ensemble32_small_lt2000",
+        default="result/lt2000_compare/iclattention_ttt_ensemble32_small_lt2000",
         help=(
             "Output directory. If omitted, generate one under 1b_result from "
             "TabICL version, dataset label, model parameters, TTT eval metric, "
@@ -3315,6 +3323,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ttt-freeze-col", type=parse_bool, default=False)
     parser.add_argument("--ttt-freeze-row", type=parse_bool, default=False)
     parser.add_argument("--ttt-freeze-icl", type=parse_bool, default=False)
+    parser.add_argument(
+        "--ttt-c-selection",
+        choices=["icl_attention_mix", "random"],
+        default="icl_attention_mix",
+        help=(
+            "Chunk C/query selection strategy. icl_attention_mix selects the configured "
+            "attention-ratio part of C by F/test ICL attention-profile similarity and "
+            "the remaining random-ratio part by label-stratified random sampling."
+        ),
+    )
+    parser.add_argument(
+        "--ttt-icl-attn-ratio",
+        type=float,
+        default=0.6,
+        help="Fraction of each chunk query C selected by ICL attention profile similarity.",
+    )
+    parser.add_argument(
+        "--ttt-random-ratio",
+        type=float,
+        default=0.4,
+        help="Fraction of each chunk query C selected by label-stratified random sampling.",
+    )
+    parser.add_argument(
+        "--ttt-icl-attn-source",
+        choices=["test"],
+        default="test",
+        help="Unlabeled reference split used for the ICL attention profile probe. Only test/F is supported.",
+    )
+    parser.add_argument(
+        "--ttt-icl-attn-layer",
+        type=int,
+        default=4,
+        help="1-based ICL transformer block used for the attention profile probe.",
+    )
     parser.add_argument(
         "--ttt-save-ckpt",
         type=parse_bool,
