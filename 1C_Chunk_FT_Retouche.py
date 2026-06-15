@@ -3018,7 +3018,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-version", default=DEFAULT_CHECKPOINT_VERSION)
     parser.add_argument(
         "--out-dir",
-        default="result/compare/Tabiclv2_ttt_ensemble32_small_lt2000",
+        default="result/Retouche_compare/Retouche_ensemble32_small_lt2000",
         help=(
             "Output directory. If omitted, generate one under 1b_result from "
             "TabICL version, dataset label, model parameters, TTT eval metric, "
@@ -3027,7 +3027,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--gpus", default=None)
-    parser.add_argument("--gpu-groups", default="2;3")
+    parser.add_argument("--gpu-groups", default="0;1")
     parser.add_argument("--n-estimators", type=int, default=32)
     parser.add_argument("--batch-size", type=parse_optional_int, default=8)
     parser.add_argument("--kv-cache", type=parse_kv_cache, default=False)
@@ -3072,7 +3072,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--ttt-steps",
         dest="ttt_epochs",
         type=int,
-        default=150,
+        default=30,
         help="Number of epoch-shuffled chunk TTT passes. --ttt-steps is kept as a compatibility alias.",
     )
     parser.add_argument("--ttt-max-chunk-size", type=int, default=10000)

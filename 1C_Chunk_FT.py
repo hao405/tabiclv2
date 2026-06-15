@@ -370,17 +370,17 @@ def format_dataset_result_log(
             f"log_loss={format_optional_float(row.log_loss)} "
             f"fit={row.fit_seconds:.3f}s "
             f"predict={row.predict_seconds:.3f}s "
-            f"ttt_applied={row.ttt_applied} "
-            f"ttt_update={row.ttt_update_seconds:.3f}s "
-            f"ttt_loss={format_optional_float(row.ttt_loss)} "
-            f"ttt_steps={row.ttt_steps} "
-            f"ttt_epochs={row.ttt_epochs} "
-            f"ttt_mode={row.ttt_batch_mode} "
-            f"ttt_val_metric={row.ttt_val_eval_metric} "
-            f"ttt_val_best={format_optional_float(row.ttt_val_best_metric)} "
-            f"ttt_best_epoch={row.ttt_best_epoch} "
-            f"ttt_stopped_early={row.ttt_stopped_early} "
-            f"ttt_oom_fallback={row.ttt_oom_fallback}"
+            f"ft_applied={row.ttt_applied} "
+            f"ft_update={row.ttt_update_seconds:.3f}s "
+            f"ft_loss={format_optional_float(row.ttt_loss)} "
+            f"ft_steps={row.ttt_steps} "
+            f"ft_epochs={row.ttt_epochs} "
+            f"ft_mode={row.ttt_batch_mode} "
+            f"ft_val_metric={row.ttt_val_eval_metric} "
+            f"ft_val_best={format_optional_float(row.ttt_val_best_metric)} "
+            f"ft_best_epoch={row.ttt_best_epoch} "
+            f"ft_stopped_early={row.ttt_stopped_early} "
+            f"ft_oom_fallback={row.ttt_oom_fallback}"
         )
     if row.status == "skip":
         return f"{prefix} [skip] {row.dataset_name} reason={row.error}"
@@ -865,7 +865,7 @@ def build_ttt_config(args: argparse.Namespace) -> TTTConfig:
         save_ckpt_start_step=(
             int(args.ttt_save_ckpt_start_step) if args.ttt_save_ckpt_start_step is not None else None
         ),
-        ckpt_root=str((Path(args.out_dir).expanduser() / "ttt_ckpts").resolve()),
+        ckpt_root=str((Path(args.out_dir).expanduser() / "ft_ckpts").resolve()),
     )
 
 
@@ -1174,7 +1174,7 @@ def _evaluate_ttt_validation_metrics(
         elif config.eval_metric == "accuracy":
             primary = accuracy
         else:
-            raise ValueError(f"Unsupported TTT eval metric: {config.eval_metric!r}")
+            raise ValueError(f"Unsupported FT eval metric: {config.eval_metric!r}")
         return TTTValidationResult(primary=float(primary), secondary=secondary)
     except (ValueError, RuntimeError):
         return TTTValidationResult(primary=float("nan"), secondary={})
@@ -1315,7 +1315,7 @@ def _sanitize_path_component(value: str) -> str:
 
 def _build_ttt_ckpt_path(config: TTTConfig, model_name: str, dataset_name: str, step_idx: int) -> Path:
     if not config.ckpt_root:
-        raise ValueError("TTT checkpoint root is not configured")
+        raise ValueError("FT checkpoint root is not configured")
     return (
         Path(config.ckpt_root)
         / _sanitize_path_component(model_name)
@@ -1329,7 +1329,7 @@ def _save_ttt_model_ckpt(classifier, config: TTTConfig, model_name: str, dataset
 
     model_config = getattr(classifier, "model_config_", None)
     if model_config is None:
-        raise RuntimeError("TTT checkpoint save requested before model_config_ is available")
+        raise RuntimeError("FT checkpoint save requested before model_config_ is available")
 
     base_model = _get_ttt_base_model(classifier)
     ckpt_path = _build_ttt_ckpt_path(config, model_name, dataset_name, step_idx)
@@ -1423,7 +1423,7 @@ def build_auto_out_dir(
     if args.ttt_enabled:
         eval_estimator_label = "_".join(
             [
-                f"ttt_eval-{args.ttt_eval_metric}",
+                f"ft_eval-{args.ttt_eval_metric}",
                 f"finetuneest{args.ttt_n_estimators_finetune}",
                 f"valest{args.ttt_validation_n_estimators}",
                 f"ep{args.ttt_epochs}",
@@ -1432,7 +1432,7 @@ def build_auto_out_dir(
             ]
         )
     else:
-        eval_estimator_label = "no_ttt"
+        eval_estimator_label = "no_ft"
 
     seed_label = f"seed{args.random_state}"
     name_parts = [
@@ -1522,7 +1522,7 @@ def run_ttt_epoch_chunk_update(
             steps=0,
             update_seconds=time.time() - update_start,
             reason=(
-                f"TTT training skipped because n_classes={classifier.n_classes_} "
+                f"FT training skipped because n_classes={classifier.n_classes_} "
                 f"exceeds model max_classes={classifier.model_.max_classes}"
             ),
             epochs=0,
@@ -1540,7 +1540,7 @@ def run_ttt_epoch_chunk_update(
             loss=None,
             steps=0,
             update_seconds=time.time() - update_start,
-            reason="No trainable parameters selected for TTT",
+            reason="No trainable parameters selected for FT",
             epochs=0,
             chunks_per_epoch=0,
         )
@@ -1566,8 +1566,8 @@ def run_ttt_epoch_chunk_update(
     use_amp, scaler, amp_ctx_factory = _make_ttt_amp(config, device)
     if str(config.dtype).lower() != "float32":
         print(
-            f"[ttt-amp] model={model_name} dataset={dataset_name} "
-            f"--ttt-dtype={config.dtype} is ignored; TTT AMP follows --use-amp "
+            f"[ft-amp] model={model_name} dataset={dataset_name} "
+            f"--ttt-dtype={config.dtype} is ignored; FT AMP follows --use-amp "
             f"and uses float16 autocast on CUDA. use_amp={use_amp}",
             flush=True,
         )
@@ -1591,7 +1591,7 @@ def run_ttt_epoch_chunk_update(
                 loss=None,
                 steps=0,
                 update_seconds=time.time() - update_start,
-                reason="Need at least two encoded training samples for chunk TTT",
+                reason="Need at least two encoded training samples for chunk FT",
                 epochs=0,
                 chunks_per_epoch=chunks_per_epoch,
             )
@@ -1605,7 +1605,7 @@ def run_ttt_epoch_chunk_update(
                 best_accuracy = baseline_accuracy
                 best_state = {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()}
                 print(
-                    f"[ttt-val] model={model_name} dataset={dataset_name} "
+                    f"[ft-val] model={model_name} dataset={dataset_name} "
                     f"baseline_{config.eval_metric}={best_metric:.6f}",
                     flush=True,
                 )
@@ -1662,7 +1662,7 @@ def run_ttt_epoch_chunk_update(
 
                 if update_steps % 3 == 0:
                     print(
-                        f"[ttt-loss] model={model_name} dataset={dataset_name} "
+                        f"[ft-loss] model={model_name} dataset={dataset_name} "
                         f"epoch={epoch_idx + 1}/{config.epochs} step={update_steps} "
                         f"loss={batch_loss:.6f} lr={current_lr:.2e}",
                         flush=True,
@@ -1671,14 +1671,14 @@ def run_ttt_epoch_chunk_update(
                     ckpt_path = _save_ttt_model_ckpt(classifier, config, model_name, dataset_name, update_steps)
                     last_saved_step = update_steps
                     print(
-                        f"[ttt-ckpt] saved model={model_name} dataset={dataset_name} "
+                        f"[ft-ckpt] saved model={model_name} dataset={dataset_name} "
                         f"step={update_steps} path={ckpt_path}",
                         flush=True,
                     )
 
             if epoch_updates > 0:
                 print(
-                    f"[ttt-loss] model={model_name} dataset={dataset_name} "
+                    f"[ft-loss] model={model_name} dataset={dataset_name} "
                     f"epoch={epoch_idx + 1}/{config.epochs} "
                     f"mean_loss={epoch_loss_sum / epoch_updates:.6f} "
                     f"updates={epoch_updates} lr={scheduler.get_last_lr()[0]:.2e}",
@@ -1699,7 +1699,7 @@ def run_ttt_epoch_chunk_update(
                     elif _metric_is_valid(val_metric):
                         patience_counter += 1
                     print(
-                        f"[ttt-val] model={model_name} dataset={dataset_name} "
+                        f"[ft-val] model={model_name} dataset={dataset_name} "
                         f"epoch={epoch_idx + 1}/{config.epochs} "
                         f"{config.eval_metric}={val_metric:.6f} best={best_metric:.6f} "
                         f"patience={patience_counter}/{config.patience}",
@@ -1708,7 +1708,7 @@ def run_ttt_epoch_chunk_update(
                     if patience_counter >= config.patience:
                         stopped_early = True
                         print(
-                            f"[ttt-early-stop] model={model_name} dataset={dataset_name} "
+                            f"[ft-early-stop] model={model_name} dataset={dataset_name} "
                             f"epoch={epoch_idx + 1} best_epoch={best_epoch} "
                             f"best_{config.eval_metric}={best_metric:.6f}",
                             flush=True,
@@ -1743,7 +1743,7 @@ def run_ttt_epoch_chunk_update(
         if _should_save_ttt_final_ckpt(config, update_steps) and last_saved_step != update_steps:
             ckpt_path = _save_ttt_model_ckpt(classifier, config, model_name, dataset_name, update_steps)
             print(
-                f"[ttt-ckpt] saved model={model_name} dataset={dataset_name} "
+                f"[ft-ckpt] saved model={model_name} dataset={dataset_name} "
                 f"step={update_steps} path={ckpt_path}",
                 flush=True,
             )
@@ -2019,7 +2019,7 @@ def evaluate_one_dataset(
         t0 = time.time()
         if ttt_config.enabled:
             if should_skip_ttt_for_dataset(dataset_dir, info):
-                ttt_split_reason = "TTT skipped for dataset=volkert to avoid OOM"
+                ttt_split_reason = "FT skipped for dataset=volkert to avoid OOM"
                 classifier.fit(X_train, y_train)
             else:
                 ttt_split_strategy = "full_train_epoch_chunks"
@@ -2046,7 +2046,7 @@ def evaluate_one_dataset(
                     ttt_oom_fallback = True
                     ttt_update_seconds = time.time() - ttt_attempt_start
                     ttt_fallback_reason = (
-                        "TTT OOM; used original model parameters for inference: "
+                        "FT OOM; used original model parameters for inference: "
                         f"{format_exception_for_csv(ttt_exc)}"
                     )
                     ttt_split_reason = append_ttt_reason(ttt_split_reason, ttt_fallback_reason)
@@ -2557,7 +2557,7 @@ def write_summary(
         f"ok_count: {len(ok_df)}",
         f"failed_count: {len(failed_df)}",
         f"skipped_count: {len(skipped_df)}",
-        f"ttt_oom_fallback_count: {len(oom_fallback_df)}",
+        f"ft_oom_fallback_count: {len(oom_fallback_df)}",
         mean_line("avg_accuracy_ok", "accuracy"),
         mean_line("avg_f1_ok", "f1"),
         mean_line("avg_balanced_accuracy_ok", "balanced_accuracy"),
@@ -2580,9 +2580,9 @@ def write_summary(
 
     if len(oom_fallback_df):
         oom_fallback_names = ", ".join(oom_fallback_df["dataset_name"].astype(str).tolist())
-        lines.append(f"ttt_oom_fallback_datasets: {oom_fallback_names}")
+        lines.append(f"ft_oom_fallback_datasets: {oom_fallback_names}")
     else:
-        lines.append("ttt_oom_fallback_datasets: (none)")
+        lines.append("ft_oom_fallback_datasets: (none)")
 
     summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -2654,7 +2654,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Run TabICLv2 classification benchmarks on dataset roots with "
-            "epoch-shuffled chunk TTT and AMD/ROCm multi-GPU workers."
+            "epoch-shuffled chunk FT and AMD/ROCm multi-GPU workers."
         )
     )
     parser.add_argument("--data-root", default=str(DEFAULT_DATA_ROOT))
@@ -2663,10 +2663,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-version", default=DEFAULT_CHECKPOINT_VERSION)
     parser.add_argument(
         "--out-dir",
-        default="result/compare/Tabiclv2_ttt_ensemble32_small_lt2000",
+        default="result/compare/Tabiclv2_ft_ensemble32_small_lt2000",
         help=(
             "Output directory. If omitted, generate one under 1b_result from "
-            "TabICL version, dataset label, model parameters, TTT eval metric, "
+            "TabICL version, dataset label, model parameters, FT eval metric, "
             "estimator counts, and random seed."
         ),
     )
@@ -2687,13 +2687,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--ttt-holdout",
         dest="ttt_enabled",
         action="store_true",
-        help="Compatibility alias: enable full-train epoch-chunk TTT. No B/C holdout is used.",
+        help="Compatibility alias: enable full-train epoch-chunk FT. No B/C holdout is used.",
     )
     parser.add_argument(
         "--no-ttt",
         dest="ttt_enabled",
         action="store_false",
-        help="Disable TTT and run ordinary TabICL inference.",
+        help="Disable FT and run ordinary TabICL inference.",
     )
     parser.set_defaults(ttt_enabled=True)
     parser.add_argument("--ttt-lr", type=float, default=1e-5)
@@ -2706,7 +2706,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help=(
-            "Per-step TTT micro-batch size. When TTT data parallel is active, "
+            "Per-step FT micro-batch size. When FT data parallel is active, "
             "this value is interpreted per GPU and the effective batch becomes "
             "micro_batch_size x number_of_gpus_in_gpu_group."
         ),
@@ -2718,7 +2718,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="ttt_epochs",
         type=int,
         default=30,
-        help="Number of epoch-shuffled chunk TTT passes. --ttt-steps is kept as a compatibility alias.",
+        help="Number of epoch-shuffled chunk FT passes. --ttt-steps is kept as a compatibility alias.",
     )
     parser.add_argument("--ttt-max-chunk-size", type=int, default=10000)
     parser.add_argument("--ttt-min-chunk-size", type=int, default=50)
@@ -2737,20 +2737,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--ttt-save-ckpt",
         type=parse_bool,
         default=False,
-        help="Whether to save intermediate TabICL checkpoints during the TTT update path.",
+        help="Whether to save intermediate TabICL checkpoints during the FT update path.",
     )
     parser.add_argument(
         "--ttt-save-ckpt-every",
         type=int,
         default=30,
-        help="Save a TTT checkpoint every N optimizer steps and always save the final step.",
+        help="Save a FT checkpoint every N optimizer steps and always save the final step.",
     )
     parser.add_argument(
         "--ttt-save-ckpt-start-step",
         type=parse_optional_int,
         default=None,
         help=(
-            "First optimizer step to save a TTT checkpoint. Use None to keep the legacy "
+            "First optimizer step to save a FT checkpoint. Use None to keep the legacy "
             "multiple-of --ttt-save-ckpt-every schedule."
         ),
     )
@@ -2758,13 +2758,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--ttt-data-parallel",
         dest="ttt_data_parallel",
         action="store_true",
-        help="Enable intra-worker multi-GPU data parallelism for the TTT update path.",
+        help="Enable intra-worker multi-GPU data parallelism for the FT update path.",
     )
     parser.add_argument(
         "--no-ttt-data-parallel",
         dest="ttt_data_parallel",
         action="store_false",
-        help="Disable intra-worker multi-GPU data parallelism for the TTT update path.",
+        help="Disable intra-worker multi-GPU data parallelism for the FT update path.",
     )
     parser.set_defaults(ttt_data_parallel=True)
     parser.add_argument("--verbose", action="store_true")
@@ -2916,7 +2916,7 @@ def run_single_model_mode(
     print("model_kwargs:")
     print(json.dumps(model_kwargs, indent=2, ensure_ascii=False))
     if ttt_config.enabled:
-        print("ttt_config:")
+        print("ft_config:")
         print(json.dumps(asdict(ttt_config), indent=2, ensure_ascii=False))
 
     system_failure_mask = (
@@ -2925,7 +2925,7 @@ def run_single_model_mode(
     )
     if integrity_errors or system_failure_mask.any():
         details = "; ".join(integrity_errors) if integrity_errors else "worker failure rows were produced"
-        raise RuntimeError(f"TabICL TTT worker output integrity check failed: {details}")
+        raise RuntimeError(f"TabICL FT worker output integrity check failed: {details}")
 
 
 def run_multi_model_mode(
@@ -3068,7 +3068,7 @@ def run_multi_model_mode(
         print("base_model_kwargs:")
         print(json.dumps(base_model_kwargs, indent=2, ensure_ascii=False))
         if ttt_config.enabled:
-            print("ttt_config:")
+            print("ft_config:")
             print(json.dumps(asdict(ttt_config), indent=2, ensure_ascii=False))
     finally:
         for worker_id in range(len(task_queues)):
