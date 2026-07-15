@@ -21,17 +21,17 @@ from dataclasses import asdict, dataclass
 from enum import Enum
 from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, TypeVar, Union, cast, overload
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast, overload
 from urllib.error import URLError
 
 import joblib
 import torch
 from filelock import FileLock
-from tabpfn_common_utils.telemetry import set_model_config
 from torch import nn
 
 from tabpfn.architectures import ARCHITECTURES
-from tabpfn.architectures.base.bar_distribution import FullSupportBarDistribution
+from tabpfn.architectures.shared.bar_distribution import FullSupportBarDistribution
+from tabpfn.checkpoint import Checkpoint
 from tabpfn.constants import ModelVersion
 from tabpfn.errors import TabPFNHuggingFaceGatedRepoError
 from tabpfn.inference import InferenceEngine
@@ -172,6 +172,7 @@ class ModelSource:  # noqa: D101
             "tabpfn-v3-classifier-v3_default.ckpt",
             "tabpfn-v3-classifier-v3_20260417_binary.ckpt",
             "tabpfn-v3-classifier-v3_20260417_multiclass.ckpt",
+            "tabpfn-v3-classifier-v3_20260506_ood.ckpt",
         ]
         return cls(
             repo_id="Prior-Labs/tabpfn_3",
@@ -185,6 +186,7 @@ class ModelSource:  # noqa: D101
             "tabpfn-v3-regressor-v3_default.ckpt",
             "tabpfn-v3-regressor-v3_20260417_mediumdata.ckpt",
             "tabpfn-v3-regressor-v3_20260506_timeseries.ckpt",
+            "tabpfn-v3-regressor-v3_20260506_ood.ckpt",
         ]
         return cls(
             repo_id="Prior-Labs/tabpfn_3",
@@ -554,7 +556,7 @@ def _download_model(
     return errors
 
 
-P = TypeVar("P", bound=Union[str, list[str]])
+P = TypeVar("P", bound=str | list[str])
 
 
 def prepend_cache_path(model_path: P) -> P:
@@ -647,9 +649,6 @@ def load_model_criterion_config(  # noqa: PLR0912
         )
     )
 
-    # Anonymously track the model config for usage telemetry
-    _log_model_config(resolved_model_paths, which, model_version)
-
     for folder in resolved_model_dirs:
         folder.mkdir(parents=True, exist_ok=True)
 
@@ -732,84 +731,6 @@ def load_model_criterion_config(  # noqa: PLR0912
             )
 
     return loaded_models, first_criterion, architecture_configs, first_inference_config
-
-
-def _log_model_config(
-    model_paths: list[Path],
-    which: Literal["classifier", "regressor"],
-    version: ModelVersion,
-) -> None:
-    """Set the model config (model_path and model_version) for anonymous
-    usage telemetry.
-
-    Args:
-        model_paths: The path(s) to the model.
-        which: The type of model ('classifier' or 'regressor').
-        version: The model version (currently only 'v2' or 'v2.5').
-    """
-    if len(model_paths) != 1:
-        return
-
-    model_type = ModelType(which)
-    model_source = _get_model_source(version, model_type)
-
-    path: Path = model_paths[0]
-    # Check to avoid that we pass in arbitrary paths containing e.g. PII
-    # Ensure we whitelist model names so that no PII can be released.
-    if path.name in model_source.filenames:
-        set_model_config(path.name, version.value)
-    else:
-        set_model_config("OTHER", version.value)
-
-
-def log_model_init_params(
-    estimator: TabPFNClassifier | TabPFNRegressor, params: dict[str, Any]
-) -> None:
-    """Anonymously model initialization parameters for anonymized
-    usage telemetry.
-
-    At the moment, we only log the `fit_mode` parameter.
-
-    Args:
-        estimator: The TabPFN estimator instance.
-        params: The model initialization parameters.
-    """
-    constructor = getattr(estimator.__class__, "__init__", None)
-    if constructor is None:
-        return
-
-    # Create a validated copy of logged params; avoid passing in arbitrary params
-    # as that would allow for PII leakage
-    logged_params = {}
-
-    signature_params = inspect.signature(constructor).parameters
-    if "fit_mode" in params:
-        param = signature_params.get("fit_mode")
-
-        # Early return, may be replaced in the future when we start tracking
-        # more parameters and validate their types.
-        if not param:
-            return
-
-        annotation = param.annotation
-        # Check if the annotation is a string and the fit_mode is in it.
-        # An alternative may be evaluating the annotation, but this is more secure
-        # because we don't want to execute arbitrary code.
-        fit_mode = str(params["fit_mode"])
-        if isinstance(param.annotation, str) and fit_mode in annotation:
-            logged_params["fit_mode"] = fit_mode
-
-    # Log the logged params
-    if logged_params:
-        try:
-            # We conditionally import here to avoid introducing breaking changes as
-            # this interface was introduced in tabpfn_common_utils 0.2.13 and not all
-            # users have upgraded to this version yet.
-            from tabpfn_common_utils.telemetry import set_init_params  # noqa: PLC0415
-
-            set_init_params(logged_params)
-        except ImportError:
-            pass
 
 
 def _resolve_model_version(model_path: ModelPath | None) -> ModelVersion:
@@ -919,12 +840,6 @@ def get_loss_criterion(
     return FullSupportBarDistribution(borders, ignore_nan_targets=True)
 
 
-def _file_identity(path: str) -> tuple[int, int]:
-    """Return a cheap identity tuple (mtime_ns, size) for cache-keying."""
-    st = Path(path).stat()
-    return (st.st_mtime_ns, st.st_size)
-
-
 @functools.lru_cache(maxsize=1)
 def _load_checkpoint_cached(path: str, _identity: tuple[int, int]) -> dict:
     """Load and cache a checkpoint from disk.
@@ -933,19 +848,7 @@ def _load_checkpoint_cached(path: str, _identity: tuple[int, int]) -> dict:
     *path* is modified.  Use ``_load_checkpoint_cached.cache_clear()`` to
     free memory manually.
     """
-    return _load_checkpoint(path)
-
-
-def _load_checkpoint(path: str) -> dict:
-    """Load a checkpoint from disk."""
-    # Catch the `FutureWarning` that torch raises. This should be dealt with!
-    # The warning is raised due to `torch.load`, which advises against ckpt
-    # files that contain non-tensor data.
-    # This `weights_only=None` is the default value. In the future this will
-    # default to `True`, disallowing loading of arbitrary objects.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=FutureWarning)
-        return torch.load(path, map_location="cpu", weights_only=None)
+    return Checkpoint(path).load()
 
 
 def load_model(
@@ -970,12 +873,14 @@ def load_model(
             trainset representation. Forwarded to get_architecture.
     """
     resolved = str(path.resolve())
-    checkpoint = _load_checkpoint_cached(resolved, _file_identity(resolved))
+    checkpoint = _load_checkpoint_cached(resolved, Checkpoint(resolved).identity())
 
-    try:
-        architecture_name = checkpoint["architecture_name"]
-    except KeyError:
-        architecture_name = "base"
+    # V2 models don't have the "architecture_name" key, V2.5 models have the
+    # architecture name set to "base", so we remap. From V2.6 onwards, the architecture
+    # name corresponds to the python file name.
+    architecture_name = checkpoint.get("architecture_name", "tabpfn_v2")
+    if architecture_name == "base":
+        architecture_name = "tabpfn_v2_5"
     architecture = ARCHITECTURES[architecture_name]
     full_state = checkpoint["state_dict"]
     model_config, unused_model_config = architecture.parse_config(checkpoint["config"])
@@ -1028,13 +933,15 @@ def _get_inference_config_from_checkpoint(
     v2.5 and get the correct config.
     """
     # This is how we tell the checkpoints apart:
-    #     v2: "architecture_name" not present, as added after the v2 release
+    #     v2: "architecture_name" not present, as added after the v2 release.
+    #         New models might specify "tabpfn_v2".
     #   v2.5: "architecture_name" present, but "inference_config" not present
     #  >v2.5: "inference_config" present, so don't need to guess a default config
     if inference_config := checkpoint.get("inference_config"):
         return InferenceConfig(**_rename_old_inference_config_keys(inference_config))
 
-    if "architecture_name" not in checkpoint:
+    architecture_name = checkpoint.get("architecture_name", "tabpfn_v2")
+    if architecture_name == "tabpfn_v2":
         model_version = ModelVersion.V2
     else:
         model_version = ModelVersion.V2_5
@@ -1100,6 +1007,7 @@ def save_tabpfn_model(
         models,
         configs,
         save_paths,
+        strict=True,
     ):
         model_state = ens_model.state_dict()
 
@@ -1132,9 +1040,6 @@ def save_fitted_tabpfn_model(estimator: BaseEstimator, path: Path | str) -> None
 
     This stores the initialization parameters and the fitted state, but crucially
     omits the large foundation model weights for efficiency.
-
-    This does not support estimators using `fit_mode="fit_with_cache"`, and will raise
-    NotImplementedError in this case.
     """
     if not hasattr(estimator, "executor_"):
         raise RuntimeError("Estimator must be fitted before saving.")
@@ -1167,8 +1072,12 @@ def save_fitted_tabpfn_model(estimator: BaseEstimator, path: Path | str) -> None
         # move all tensors to "cpu" before saving, so if fitted & saved on cuda-device
         # and loading on cpu-device does not throw
         # "RuntimeError: Attempting to deserialize object on a CUDA device..."
+        # Tensor.to returns a copy, but nn.Module.to moves in place, so modules
+        # must be deep-copied to leave the live estimator on its device.
         fitted_attrs = {
-            k: v.to("cpu") if isinstance(v, (torch.nn.Module, torch.Tensor)) else v
+            k: copy.deepcopy(v).to("cpu")
+            if isinstance(v, torch.nn.Module)
+            else (v.to("cpu") if isinstance(v, torch.Tensor) else v)
             for k, v in fitted_attrs.items()
         }
 
@@ -1180,8 +1089,11 @@ def save_fitted_tabpfn_model(estimator: BaseEstimator, path: Path | str) -> None
         )
 
         # 4. Create the final zip archive
-        shutil.make_archive(str(path).replace(".tabpfn_fit", ""), "zip", tmp)
-        shutil.move(str(path).replace(".tabpfn_fit", "") + ".zip", path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory() as archive_tmpdir:
+            archive_base = Path(archive_tmpdir) / "archive"
+            archive_path = shutil.make_archive(str(archive_base), "zip", tmp)
+            shutil.move(archive_path, path)
 
 
 def _extract_archive(path: Path, tmp: Path) -> None:
@@ -1242,6 +1154,7 @@ def load_fitted_tabpfn_model(
 
 def _resolve_architecture_name(config: ArchitectureConfig) -> str:
     """Resolve the architecture name from the config."""
+    from tabpfn.architectures.tabpfn_v2 import TabPFNV2Config  # noqa: PLC0415
     from tabpfn.architectures.tabpfn_v2_5 import TabPFNV2p5Config  # noqa: PLC0415
     from tabpfn.architectures.tabpfn_v2_6 import TabPFNV2p6Config  # noqa: PLC0415
     from tabpfn.architectures.tabpfn_v3 import TabPFNV3Config  # noqa: PLC0415
@@ -1252,4 +1165,6 @@ def _resolve_architecture_name(config: ArchitectureConfig) -> str:
         return "tabpfn_v2_6"
     if isinstance(config, TabPFNV2p5Config):
         return "tabpfn_v2_5"
-    return "base"
+    if isinstance(config, TabPFNV2Config):
+        return "tabpfn_v2"
+    return "tabpfn_v2"

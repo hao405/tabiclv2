@@ -17,20 +17,29 @@ from typing_extensions import override
 import numpy as np
 import torch
 from sklearn.base import ClassifierMixin
-from sklearn.metrics import log_loss, roc_auc_score
+from sklearn.metrics import accuracy_score, log_loss, roc_auc_score
 from sklearn.utils.validation import check_is_fitted
 
 from tabpfn import TabPFNClassifier
-from tabpfn.constants import ModelVersion
 from tabpfn.finetuning.finetuned_base import EvalResult, FinetunedTabPFNBase
 from tabpfn.finetuning.train_util import clone_model_for_evaluation
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from tabpfn.constants import XType, YType
+    from tabpfn.constants import ModelVersion, XType, YType
     from tabpfn.finetuning.data_util import ClassifierBatch
     from tabpfn.finetuning.logging import FinetuningLogger
+
+
+def _labels_from_probabilities(
+    probabilities: np.ndarray,
+    classes: Any,
+) -> np.ndarray:
+    encoded = np.argmax(probabilities, axis=1)
+    if classes is not None and len(classes) == probabilities.shape[1]:
+        return np.asarray(classes)[encoded]
+    return encoded
 
 
 def _compute_classification_loss(
@@ -69,16 +78,21 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
             is crucial for stable fine-tuning. Defaults to 1e-5.
         weight_decay: The weight decay for the AdamW optimizer. Defaults to 0.01.
         validation_split_ratio: Fraction of the original training data reserved
-            as a validation set for early stopping and monitoring. Defaults to 0.1.
+            as a validation set for early stopping and monitoring. Set to 0 or
+            None to disable validation: all data is then used for fine-tuning,
+            per-epoch evaluation is skipped, and early stopping is disabled.
+            Ignored when explicit validation data is passed to ``fit``.
+            Defaults to 0.1.
         n_finetune_ctx_plus_query_samples: The total number of samples per
             meta-dataset during fine-tuning (context plus query) before applying
-            the `finetune_ctx_query_split_ratio`. Defaults to 10_000.
+            the `finetune_ctx_query_split_ratio`. Defaults to 50_000.
         finetune_ctx_query_split_ratio: The proportion of each fine-tuning
             meta-dataset to use as query samples for calculating the loss. The
             remainder is used as context. Defaults to 0.2.
         n_inference_subsample_samples: The total number of subsampled training
-            samples per estimator during validation and final inference.
-            Defaults to 50_000.
+            samples per estimator during validation and final inference. If
+            None, no subsampling is applied and the full training set is used
+            as context. Defaults to None.
         random_state: Seed for reproducibility of data splitting and model
             initialization. Defaults to 0.
         early_stopping: Whether to use early stopping based on validation
@@ -110,6 +124,8 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
             Defaults to 8.
         use_activation_checkpointing: Whether to use activation checkpointing to
             reduce memory usage. Defaults to True.
+        gradient_accumulation_steps: Number of fine-tuning data batches to
+            accumulate before each optimizer step. Defaults to 1.
         save_checkpoint_interval: Number of epochs between checkpoint saves. This
             only has an effect if `output_dir` is provided during the `fit()` call.
             If None, no intermediate checkpoints are saved. The best model checkpoint
@@ -126,7 +142,7 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
             underlying `TabPFNClassifier`, such as `n_estimators`.
         eval_metric: The primary metric to monitor during fine-tuning.
             For classification, this is ROC AUC by default.
-            The choices are: "roc_auc", "log_loss"
+            The choices are: "roc_auc", "log_loss", "acc"
     """
 
     def __init__(  # noqa: PLR0913
@@ -137,10 +153,10 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         time_limit: int | None = None,
         learning_rate: float = 1e-5,
         weight_decay: float = 0.01,
-        validation_split_ratio: float = 0.1,
-        n_finetune_ctx_plus_query_samples: int = 10_000,
+        validation_split_ratio: float | None = 0.1,
+        n_finetune_ctx_plus_query_samples: int = 50_000,
         finetune_ctx_query_split_ratio: float = 0.2,
-        n_inference_subsample_samples: int = 50_000,
+        n_inference_subsample_samples: int | None = None,
         random_state: int = 0,
         early_stopping: bool = True,
         early_stopping_patience: int = 8,
@@ -152,11 +168,13 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         n_estimators_validation: int = 2,
         n_estimators_final_inference: int = 8,
         use_activation_checkpointing: bool = True,
+        gradient_accumulation_steps: int = 1,
         save_checkpoint_interval: int | None = 10,
         use_fixed_preprocessing_seed: bool = True,
         experiment_logger: FinetuningLogger | None = None,
         extra_classifier_kwargs: dict[str, Any] | None = None,
-        eval_metric: Literal["roc_auc", "log_loss"] | None = None,
+        eval_metric: Literal["roc_auc", "log_loss", "acc"] | None = None,
+        model_version: ModelVersion | None = None,
     ):
         super().__init__(
             device=device,
@@ -179,9 +197,11 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
             n_estimators_validation=n_estimators_validation,
             n_estimators_final_inference=n_estimators_final_inference,
             use_activation_checkpointing=use_activation_checkpointing,
+            gradient_accumulation_steps=gradient_accumulation_steps,
             save_checkpoint_interval=save_checkpoint_interval,
             use_fixed_preprocessing_seed=use_fixed_preprocessing_seed,
             experiment_logger=experiment_logger,
+            model_version=model_version,
         )
         self.extra_classifier_kwargs = extra_classifier_kwargs
         self.eval_metric = eval_metric
@@ -204,13 +224,15 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         """Return the name of the primary metric."""
         if self.eval_metric == "log_loss":
             return "log_loss"
+        if self.eval_metric == "acc":
+            return "accuracy"
         return "ROC AUC"
 
     @override
     def _create_estimator(self, config: dict[str, Any]) -> TabPFNClassifier:
         """Create the TabPFNClassifier with the given config."""
         return TabPFNClassifier.create_default_for_version(
-            version=ModelVersion.V2_5,
+            version=self.finetune_model_version,
             **config,
             fit_mode="batched",
             differentiable_input=False,
@@ -296,7 +318,7 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         X_val: np.ndarray,
         y_val: np.ndarray,
     ) -> EvalResult:
-        """Evaluate the classifier using ROC AUC and log loss."""
+        """Evaluate the classifier using ROC AUC, log loss, and accuracy."""
         eval_classifier = clone_model_for_evaluation(
             self.finetuned_estimator_,
             eval_config,
@@ -306,6 +328,9 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
 
         try:
             probabilities = eval_classifier.predict_proba(X_val)  # type: ignore
+            classes = getattr(eval_classifier, "classes_", None)
+            predictions = _labels_from_probabilities(probabilities, classes)
+            accuracy = accuracy_score(y_val, predictions)
             if probabilities.shape[1] > 2:
                 roc_auc = roc_auc_score(y_val, probabilities, multi_class="ovr")
             else:
@@ -313,18 +338,24 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
             log_loss_score = log_loss(y_val, probabilities)
         except (ValueError, RuntimeError, AttributeError) as e:
             logger.warning(f"An error occurred during evaluation: {e}")
-            roc_auc, log_loss_score = np.nan, np.nan
+            roc_auc, log_loss_score, accuracy = np.nan, np.nan, np.nan
 
         if self.eval_metric == "roc_auc":
             primary_metric = roc_auc
         elif self.eval_metric == "log_loss":
             primary_metric = -log_loss_score
+        elif self.eval_metric == "acc":
+            primary_metric = accuracy
         else:
             raise ValueError(f"Unsupported eval_metric: {self.eval_metric}")
 
         return EvalResult(
             primary=primary_metric,  # pyright: ignore[reportArgumentType]
-            secondary={"log_loss": log_loss_score, "roc_auc": roc_auc},
+            secondary={
+                "log_loss": log_loss_score,
+                "roc_auc": roc_auc,
+                "accuracy": accuracy,
+            },
         )
 
     @override
@@ -344,6 +375,7 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
             "primary_metric": eval_result.primary,
             "log_loss": eval_result.secondary.get("log_loss", np.nan),
             "roc_auc": eval_result.secondary.get("roc_auc", np.nan),
+            "accuracy": eval_result.secondary.get("accuracy", np.nan),
         }
 
     @override

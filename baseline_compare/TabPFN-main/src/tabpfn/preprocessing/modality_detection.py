@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 import pandas as pd
 
 from tabpfn.errors import TabPFNUserError
-from tabpfn.preprocessing.datamodel import Feature, FeatureModality, FeatureSchema
+from tabpfn.preprocessing.datamodel import (
+    Feature,
+    FeatureModality,
+    FeatureSchema,
+    build_input_feature_names,
+)
 
 if TYPE_CHECKING:
     import numpy as np
@@ -55,10 +60,11 @@ def detect_feature_modalities(
     """
     features: list[Feature] = []
     big_enough_n_to_infer_cat = len(X) > min_samples_for_inference
+    unique_feature_names = build_input_feature_names(feature_names, X.shape[1])
     for i, index in enumerate(range(X.shape[1])):
         X_slice: np.ndarray = X[:, index]
         reported_categorical = index in (provided_categorical_indices or ())
-        feature_name = feature_names[i] if feature_names is not None else None
+        feature_name = unique_feature_names[i]
         feat_modality = _detect_feature_modality(
             s=pd.Series(X_slice, name=feature_name),
             reported_categorical=reported_categorical,
@@ -80,9 +86,13 @@ def _detect_feature_modality(
 ) -> FeatureModality:
     n_unique = _get_unique_with_sklearn_compatible_error(s)
 
-    if n_unique <= 1:
+    if n_unique <= 1 and not reported_categorical:
         # Either all values are missing, or all values are the same.
-        # If there's a single value but also missing ones, it's not constant
+        # If there's a single value but also missing ones, it's not constant.
+        # Columns the user explicitly declared categorical are kept categorical
+        # (handled below) even when all-missing, so they route through the ordinal
+        # encoder consistently between fit and predict instead of being treated as
+        # a constant numeric column that crashes on string values seen at predict.
         return FeatureModality.CONSTANT
 
     if _is_numeric_pandas_series(s):

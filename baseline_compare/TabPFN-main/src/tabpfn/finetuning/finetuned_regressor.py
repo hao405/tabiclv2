@@ -21,14 +21,13 @@ from sklearn.metrics import mean_squared_error
 from sklearn.utils.validation import check_is_fitted
 
 from tabpfn import TabPFNRegressor
-from tabpfn.constants import ModelVersion
 from tabpfn.finetuning.finetuned_base import EvalResult, FinetunedTabPFNBase
 from tabpfn.finetuning.train_util import clone_model_for_evaluation
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from tabpfn.constants import XType, YType
+    from tabpfn.constants import ModelVersion, XType, YType
     from tabpfn.finetuning.data_util import RegressorBatch
     from tabpfn.finetuning.logging import FinetuningLogger
     from tabpfn.regressor import RegressionResultType
@@ -235,16 +234,21 @@ class FinetunedTabPFNRegressor(FinetunedTabPFNBase, RegressorMixin):
             is crucial for stable fine-tuning. Defaults to 1e-5.
         weight_decay: The weight decay for the AdamW optimizer. Defaults to 0.01.
         validation_split_ratio: Fraction of the original training data reserved
-            as a validation set for early stopping and monitoring. Defaults to 0.1.
+            as a validation set for early stopping and monitoring. Set to 0 or
+            None to disable validation: all data is then used for fine-tuning,
+            per-epoch evaluation is skipped, and early stopping is disabled.
+            Ignored when explicit validation data is passed to ``fit``.
+            Defaults to 0.1.
         n_finetune_ctx_plus_query_samples: The total number of samples per
             meta-dataset during fine-tuning (context plus query) before applying
-            the `finetune_ctx_query_split_ratio`. Defaults to 10_000.
+            the `finetune_ctx_query_split_ratio`. Defaults to 50_000.
         finetune_ctx_query_split_ratio: The proportion of each fine-tuning
             meta-dataset to use as query samples for calculating the loss. The
             remainder is used as context. Defaults to 0.2.
         n_inference_subsample_samples: The total number of subsampled training
-            samples per estimator during validation and final inference.
-            Defaults to 50_000.
+            samples per estimator during validation and final inference. If
+            None, no subsampling is applied and the full training set is used
+            as context. Defaults to None.
         random_state: Seed for reproducibility of data splitting and model
             initialization. Defaults to 0.
         early_stopping: Whether to use early stopping based on validation
@@ -319,10 +323,10 @@ class FinetunedTabPFNRegressor(FinetunedTabPFNBase, RegressorMixin):
         time_limit: int | None = None,
         learning_rate: float = 1e-5,
         weight_decay: float = 0.01,
-        validation_split_ratio: float = 0.1,
-        n_finetune_ctx_plus_query_samples: int = 10_000,
+        validation_split_ratio: float | None = 0.1,
+        n_finetune_ctx_plus_query_samples: int = 50_000,
         finetune_ctx_query_split_ratio: float = 0.2,
-        n_inference_subsample_samples: int = 50_000,
+        n_inference_subsample_samples: int | None = None,
         random_state: int = 0,
         early_stopping: bool = True,
         early_stopping_patience: int = 8,
@@ -346,6 +350,7 @@ class FinetunedTabPFNRegressor(FinetunedTabPFNBase, RegressorMixin):
         mae_loss_weight: float = 0.0,
         mae_loss_clip: float | None = None,
         eval_metric: Literal["mse"] | None = None,
+        model_version: ModelVersion | None = None,
     ):
         super().__init__(
             device=device,
@@ -371,6 +376,7 @@ class FinetunedTabPFNRegressor(FinetunedTabPFNBase, RegressorMixin):
             save_checkpoint_interval=save_checkpoint_interval,
             use_fixed_preprocessing_seed=use_fixed_preprocessing_seed,
             experiment_logger=experiment_logger,
+            model_version=model_version,
         )
         self.extra_regressor_kwargs = extra_regressor_kwargs
         self.eval_metric = eval_metric
@@ -404,7 +410,7 @@ class FinetunedTabPFNRegressor(FinetunedTabPFNBase, RegressorMixin):
     def _create_estimator(self, config: dict[str, Any]) -> TabPFNRegressor:
         """Create the TabPFNRegressor with the given config."""
         return TabPFNRegressor.create_default_for_version(
-            version=ModelVersion.V2_5,
+            version=self.finetune_model_version,
             **config,
             fit_mode="batched",
             differentiable_input=False,

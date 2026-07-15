@@ -1,0 +1,15 @@
+discovered_datasets: 184
+processed_datasets: 184
+ok_count: 180
+failed_count: 4
+skipped_count: 0
+ttt_oom_fallback_count: 0
+avg_accuracy_ok: 0.850255
+avg_f1_ok: 0.841119
+avg_balanced_accuracy_ok: 0.775902
+avg_roc_auc_ok: 0.897356
+avg_log_loss_ok: 0.337448
+wall_seconds: 7443.127
+failed_datasets: wine-quality-white, accelerometer, internet_firewall, shuttle
+skipped_datasets: (none)
+ttt_oom_fallback_datasets: (none)

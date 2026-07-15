@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import math
 import warnings
@@ -164,7 +165,7 @@ class TabPFNEnsemblePreprocessor:
                 random_state=int(seed),
                 enable_gpu_preprocessing=enable_gpu_preprocessing,
             )
-            for config, seed in zip(self.configs, self.pipeline_seeds)
+            for config, seed in zip(self.configs, self.pipeline_seeds, strict=True)
         ]
 
         n_total_features = feature_schema.num_columns
@@ -675,7 +676,7 @@ def _get_subsample_feature_indices(
     # For one-hot encoding, num_added_features returns 0 as an approximation
     # because the true count depends on data cardinality (see warning below).
     subsample_sizes = []
-    for pipeline, max_feats in zip(pipelines, max_features_per_estimator):
+    for pipeline, max_feats in zip(pipelines, max_features_per_estimator, strict=True):
         subsample_sizes.append(
             _find_max_input_features(
                 pipeline=pipeline,
@@ -741,6 +742,8 @@ def _draw_balanced_from_pool(
 
     When the pool is exhausted it is refilled with ``range(pool_size)`` minus
     any slots already drawn for the current estimator (to avoid duplicates).
+    If every slot has already been drawn (``size > pool_size``), duplicates are
+    unavoidable and the pool is refilled with the full range instead.
 
     Returns:
         (drawn_slots, remaining_pool) so the caller can carry the pool across
@@ -753,6 +756,8 @@ def _draw_balanced_from_pool(
         if len(pool) == 0:
             already_selected = set(slots)
             available = [i for i in range(pool_size) if i not in already_selected]
+            if not available:
+                available = list(range(pool_size))
             rng.shuffle(available)
             pool = available
 
@@ -1011,7 +1016,7 @@ def _compute_feature_importance_order(
     )
 
 
-def generate_classification_ensemble_configs(
+def generate_classification_ensemble_configs(  # noqa: PLR0913
     *,
     num_estimators: int,
     add_fingerprint_feature: bool,
@@ -1023,6 +1028,7 @@ def generate_classification_ensemble_configs(
     random_state: int | np.random.Generator | None,
     num_models: int,
     outlier_removal_std: float | None,
+    passthrough_inf: bool = False,
 ) -> list[ClassifierEnsembleConfig]:
     """Generate ensemble configurations for classification.
 
@@ -1037,6 +1043,7 @@ def generate_classification_ensemble_configs(
         random_state: Random number generator.
         num_models: Number of models to use.
         outlier_removal_std: The standard deviation to remove outliers.
+        passthrough_inf: Whether to pass infinite values through to the model.
 
     Returns:
         List of ensemble configurations.
@@ -1071,6 +1078,7 @@ def generate_classification_ensemble_configs(
             feature_shift_decoder=feature_shift_decoder,
             _model_index=model_index,
             outlier_removal_std=outlier_removal_std,
+            passthrough_inf=passthrough_inf,
         )
         for (
             featshift,
@@ -1082,6 +1090,7 @@ def generate_classification_ensemble_configs(
             configs_,
             class_permutations,
             model_indices,
+            strict=True,
         )
     ]
 
@@ -1097,6 +1106,7 @@ def generate_regression_ensemble_configs(
     random_state: int | np.random.Generator | None,
     num_models: int,
     outlier_removal_std: float | None,
+    passthrough_inf: bool = False,
 ) -> list[RegressorEnsembleConfig]:
     """Generate ensemble configurations for regression.
 
@@ -1110,6 +1120,7 @@ def generate_regression_ensemble_configs(
         random_state: Random number generator.
         num_models: Number of models to use.
         outlier_removal_std: The standard deviation to remove outliers.
+        passthrough_inf: Whether to pass infinite values through to the model.
 
     Returns:
         List of ensemble configurations.
@@ -1135,9 +1146,13 @@ def generate_regression_ensemble_configs(
             add_fingerprint_feature=add_fingerprint_feature,
             polynomial_features=polynomial_features,
             feature_shift_decoder=feature_shift_decoder,
-            target_transform=target_transform,
+            # Each config gets its own copy: the transform is later fitted in
+            # place per ensemble member (see _transform_labels_one), so a
+            # shared instance would end up with the last member's fitted state.
+            target_transform=copy.deepcopy(target_transform),
             outlier_removal_std=outlier_removal_std,
             _model_index=model_index,
+            passthrough_inf=passthrough_inf,
         )
         for featshift, (
             preprocess_config,
@@ -1146,6 +1161,7 @@ def generate_regression_ensemble_configs(
             featshifts,
             configs_,
             model_indices,
+            strict=True,
         )
     ]
 
@@ -1192,11 +1208,21 @@ def _resolve_feature_subsampling_method(
     return FeatureSubsamplingMethod.BALANCED
 
 
+MAX_AUTO_SCALED_N_ESTIMATORS = 32
+"""Upper bound on the n_estimators value produced by feature-coverage scaling.
+
+Very wide datasets would otherwise require an unbounded number of estimators to
+cover every feature. We cap the auto-scaled value here; beyond this point some
+features may never be sampled unless the user raises n_estimators explicitly.
+"""
+
+
 def scale_n_estimators_for_feature_coverage(
     *,
     n_estimators: int,
     n_total_features: int,
     preprocessor_configs: Sequence[PreprocessorConfig],
+    auto_scale_n_estimators: bool = True,
 ) -> int:
     """Scale up n_estimators so every feature is included in at least one estimator.
 
@@ -1205,23 +1231,47 @@ def scale_n_estimators_for_feature_coverage(
     ``n_estimators * max_features_per_estimator < n_total_features`` some features
     are never sampled. Returns the smallest n_estimators that covers all features
     (using the smallest ``max_features_per_estimator`` across the supplied configs,
-    which is the binding budget).
+    which is the binding budget), capped at ``MAX_AUTO_SCALED_N_ESTIMATORS``. When
+    the cap binds, full coverage is not reached and some features may never be
+    sampled unless the user raises ``n_estimators`` explicitly.
+
+    When ``auto_scale_n_estimators`` is False the scaling is skipped and
+    ``n_estimators`` is returned unchanged (this is the ``auto_scale_n_estimators``
+    constructor argument on the estimator); some features may then never be sampled.
     """
-    if not preprocessor_configs:
+    if not auto_scale_n_estimators or not preprocessor_configs:
         return n_estimators
     min_max_features = min(c.max_features_per_estimator for c in preprocessor_configs)
     if min_max_features <= 0:
         return n_estimators
     min_required = math.ceil(n_total_features / min_max_features)
-    if n_estimators >= min_required:
+    target = min(min_required, MAX_AUTO_SCALED_N_ESTIMATORS)
+    if n_estimators >= target:
         return n_estimators
-    warnings.warn(
-        f"Auto-scaling n_estimators from {n_estimators} to {min_required} so "
-        f"every feature is included in at least one ensemble member "
-        f"(n_total_features={n_total_features}, "
-        f"max_features_per_estimator={min_max_features}). "
-        f"Pass n_estimators >= {min_required} to silence this warning.",
-        UserWarning,
-        stacklevel=2,
-    )
-    return min_required
+    if min_required > MAX_AUTO_SCALED_N_ESTIMATORS:
+        warnings.warn(
+            f"Auto-scaling n_estimators from {n_estimators} to {target}, capped at "
+            f"MAX_AUTO_SCALED_N_ESTIMATORS={MAX_AUTO_SCALED_N_ESTIMATORS}. Full "
+            f"feature coverage would require {min_required} estimators "
+            f"(n_total_features={n_total_features}, "
+            f"max_features_per_estimator={min_max_features}); because of the cap "
+            f"some features may never be sampled. Pass n_estimators >= "
+            f"{min_required} to cover all features, or set "
+            f"auto_scale_n_estimators=False to disable scaling.",
+            UserWarning,
+            stacklevel=2,
+        )
+    else:
+        warnings.warn(
+            f"Auto-scaling n_estimators from {n_estimators} to {target} so "
+            f"every feature is included in at least one ensemble member "
+            f"(n_total_features={n_total_features}, "
+            f"max_features_per_estimator={min_max_features}). "
+            f"Pass n_estimators >= {target} to silence this warning. "
+            f"If this scaling is not desired, set auto_scale_n_estimators=False "
+            f"in the estimator constructor to disable it (note: some features may "
+            f"then never be sampled).",
+            UserWarning,
+            stacklevel=2,
+        )
+    return target

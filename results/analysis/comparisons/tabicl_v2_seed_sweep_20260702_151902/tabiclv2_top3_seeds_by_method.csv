@@ -1,0 +1,10 @@
+method,seed,ok_count,avg_accuracy_ok,csv_path,rank_within_method
+benchmark,2026,184,0.855980781727776,results/tabicl_v11_v220260702_151902/tabiclv2/benchmark/seed2026/all_classification_results.csv,1
+benchmark,2028,184,0.8558915001646569,results/tabicl_v11_v220260702_151902/tabiclv2/benchmark/seed2028/all_classification_results.csv,2
+benchmark,2025,184,0.8557410723478222,results/tabicl_v11_v220260702_151902/tabiclv2/benchmark/seed2025/all_classification_results.csv,3
+faware_c,2025,184,0.859290317215548,results/tabicl_v11_v220260702_151902/tabiclv2/faware_c/seed2025/all_classification_results.csv,1
+faware_c,2027,184,0.8591729631536187,results/tabicl_v11_v220260702_151902/tabiclv2/faware_c/seed2027/all_classification_results.csv,2
+faware_c,3,184,0.8590862411234699,results/tabicl_v11_v220260702_151902/tabiclv2/faware_c/seed3/all_classification_results.csv,3
+ft,2027,184,0.8591990925121822,results/tabicl_v11_v220260702_151902/tabiclv2/ft/seed2027/all_classification_results.csv,1
+ft,16,184,0.8590499186847897,results/tabicl_v11_v220260702_151902/tabiclv2/ft/seed16/all_classification_results.csv,2
+ft,2029,184,0.858660352102153,results/tabicl_v11_v220260702_151902/tabiclv2/ft/seed2029/all_classification_results.csv,3

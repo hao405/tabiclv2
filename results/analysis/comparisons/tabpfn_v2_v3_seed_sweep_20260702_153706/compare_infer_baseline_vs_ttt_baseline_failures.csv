@@ -1,0 +1,9 @@
+model,dataset_name,failed_seed_count
+tabpfn_v2,accelerometer,5
+tabpfn_v2,internet_firewall,5
+tabpfn_v2,shuttle,5
+tabpfn_v2,wine-quality-white,4
+tabpfn_v3,accelerometer,6
+tabpfn_v3,internet_firewall,6
+tabpfn_v3,shuttle,6
+tabpfn_v3,wine-quality-white,6

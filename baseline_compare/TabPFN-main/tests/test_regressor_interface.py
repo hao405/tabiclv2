@@ -6,7 +6,8 @@ import io
 import itertools
 import os
 import typing
-from typing import Callable, Literal
+from collections.abc import Callable
+from typing import Any, Literal
 from unittest import mock
 
 import numpy as np
@@ -25,6 +26,7 @@ import tabpfn.regressor as regressor_module
 from tabpfn import TabPFNRegressor
 from tabpfn.base import RegressorModelSpecs, initialize_tabpfn_model
 from tabpfn.constants import ModelVersion
+from tabpfn.inference import InferenceEngineExplicitKVCache
 from tabpfn.model_loading import ModelSource, prepend_cache_path
 from tabpfn.preprocessing import PreprocessorConfig
 from tabpfn.settings import settings
@@ -284,12 +286,16 @@ def test__fit_predict__specify_inference_config__outputs_correct_shape(
 
 
 @pytest.mark.parametrize(
-    "model_version", [ModelVersion.V2, ModelVersion.V2_5, ModelVersion.V3]
+    "model_version",
+    [ModelVersion.V2, ModelVersion.V2_5, ModelVersion.V2_6, ModelVersion.V3],
 )
 # Disable MPS as it doesn't support float64.
 @pytest.mark.parametrize("device", [d for d in get_pytest_devices() if d != "mps"])
 def test__fit_preprocessors_and_with_cache_produce_equal_results(
-    X_y: tuple[np.ndarray, np.ndarray], model_version: ModelVersion, device: str
+    X_y: tuple[np.ndarray, np.ndarray],
+    model_version: ModelVersion,
+    device: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     kwargs = {
         "version": model_version,
@@ -307,12 +313,52 @@ def test__fit_preprocessors_and_with_cache_produce_equal_results(
     tabpfn.fit(X, y)
     preds = tabpfn.predict(X)
 
+    original_init = InferenceEngineExplicitKVCache.__init__
+
+    def _init_without_kv_quantization(
+        self: InferenceEngineExplicitKVCache, *args: Any, **kwargs: Any
+    ) -> None:
+        kwargs.setdefault("maybe_quantize_kv_cache", False)
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        InferenceEngineExplicitKVCache, "__init__", _init_without_kv_quantization
+    )
+
     torch.random.manual_seed(0)
     tabpfn = TabPFNRegressor.create_default_for_version(
         fit_mode="fit_with_cache", **kwargs
     )
     tabpfn.fit(X, y)
     np.testing.assert_array_almost_equal(preds, tabpfn.predict(X), decimal=2)
+
+
+@pytest.mark.parametrize("device", get_pytest_devices())
+def test__fit_preprocessors_and_with_cache_with_quantized_kv_cache__v3(
+    X_y: tuple[np.ndarray, np.ndarray], device: str
+) -> None:
+    kwargs = {
+        "version": ModelVersion.V3,
+        "n_estimators": 2,
+        "inference_precision": torch.float32,
+        "random_state": 0,
+        "device": device,
+    }
+    X, y = X_y
+
+    torch.random.manual_seed(0)
+    tabpfn = TabPFNRegressor.create_default_for_version(
+        fit_mode="fit_preprocessors", **kwargs
+    )
+    tabpfn.fit(X, y)
+    preds = tabpfn.predict(X)
+
+    torch.random.manual_seed(0)
+    tabpfn = TabPFNRegressor.create_default_for_version(
+        fit_mode="fit_with_cache", **kwargs
+    )
+    tabpfn.fit(X, y)
+    np.testing.assert_allclose(preds, tabpfn.predict(X), rtol=0.25)
 
 
 @pytest.mark.parametrize("model_version", list(ModelVersion))
@@ -506,7 +552,7 @@ def test_dict_vs_object_preprocessor_config(X_y: tuple[np.ndarray, np.ndarray]) 
     quant_dict = model_dict.predict(X, output_type="quantiles", quantiles=quantiles)
     quant_obj = model_obj.predict(X, output_type="quantiles", quantiles=quantiles)
 
-    for q_dict, q_obj in zip(quant_dict, quant_obj):
+    for q_dict, q_obj in zip(quant_dict, quant_obj, strict=True):
         np.testing.assert_array_almost_equal(
             q_dict,
             q_obj,
@@ -730,6 +776,10 @@ def test_constant_feature_handling(X_y: tuple[np.ndarray, np.ndarray]) -> None:
         random_state=42,
         inference_config={
             "POLYNOMIAL_FEATURES": "no",
+            # Set to False to avoid different fingerprint features for tiny
+            # numerical variations e.g. from non-deterministic algorithms in
+            # preprocessing steps before adding the fingerprint feature.
+            "FINGERPRINT_FEATURE": False,
         },
     )
     model.fit(X, y)
@@ -753,6 +803,7 @@ def test_constant_feature_handling(X_y: tuple[np.ndarray, np.ndarray]) -> None:
         random_state=42,
         inference_config={
             "POLYNOMIAL_FEATURES": "no",
+            "FINGERPRINT_FEATURE": False,  # see above for why
         },
     )
     model_with_constants.fit(X_with_constants, y)
@@ -975,3 +1026,209 @@ def test__create_default_for_version__passes_through_overrides() -> None:
 
     assert estimator.n_estimators == 16
     assert estimator.softmax_temperature == 0.9
+
+
+# ---------------------------------------------------------------------------
+# differentiable_input
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("device", devices)
+def test__fit_with_differentiable_input__grad_flows_to_upstream_module(
+    device: str,
+) -> None:
+    """End-to-end: a loss computed from forward(use_inference_mode=True) after
+    fit_with_differentiable_input must produce a non-zero, finite gradient on
+    an upstream torch module's weights.
+    """
+    torch.manual_seed(0)
+    D, N_train, N_test = 8, 30, 10
+    linear = nn.Linear(D, D).to(device)
+
+    X_train = linear(torch.randn(N_train, D, device=device))
+    X_test = linear(torch.randn(N_test, D, device=device))
+    y_train = torch.randn(N_train, device=device)
+    y_test = torch.randn(N_test, device=device)
+
+    reg = TabPFNRegressor(
+        n_estimators=1,
+        ignore_pretraining_limits=True,
+        device=device,
+        differentiable_input=True,
+    )
+    reg.fit_with_differentiable_input(X_train, y_train)
+
+    averaged_logits, _outputs, borders = reg.forward(X_test, use_inference_mode=True)
+
+    # averaged_logits is [N_borders, N_samples] after the transpose in
+    # forward(); reduce to a scalar per sample via softmax over bin centers.
+    per_sample_logits = averaged_logits.transpose(0, 1)  # [N_test, N_borders]
+    border_t = torch.as_tensor(
+        borders[0],
+        device=per_sample_logits.device,
+        dtype=per_sample_logits.dtype,
+    )
+    n_logits = per_sample_logits.shape[-1]
+    if border_t.numel() == n_logits + 1:
+        bin_centers = (border_t[:-1] + border_t[1:]) / 2.0
+    else:
+        bin_centers = border_t
+    probs = torch.softmax(per_sample_logits.float(), dim=-1)
+    pred_z = (probs * bin_centers).sum(dim=-1)
+    pred = pred_z * float(reg.y_train_std_) + float(reg.y_train_mean_)
+
+    loss = torch.nn.functional.mse_loss(pred.float(), y_test.float())
+    assert loss.requires_grad
+    loss.backward()
+
+    grad = linear.weight.grad
+    assert grad is not None, "gradient did not reach upstream nn.Linear"
+    assert torch.isfinite(grad).all(), "gradient contained NaN/Inf"
+    assert grad.norm().item() > 0, "gradient norm is zero — graph was detached"
+
+
+def test__fit__differentiable_input_true__raises_helpful_error() -> None:
+    """Calling .fit() (instead of fit_with_differentiable_input) when
+    differentiable_input=True must raise a clear error pointing users to the
+    correct API rather than silently running a non-differentiable path.
+    """
+    reg = TabPFNRegressor(
+        n_estimators=1,
+        ignore_pretraining_limits=True,
+        device="cpu",
+        differentiable_input=True,
+    )
+    X = np.random.default_rng(0).standard_normal((20, 4)).astype(np.float32)
+    y = np.random.default_rng(0).standard_normal(20).astype(np.float32)
+    with pytest.raises(ValueError, match="fit_with_differentiable_input"):
+        reg.fit(X, y)
+
+
+@pytest.mark.parametrize(
+    ("case_id", "extra_kwargs", "X", "y", "match"),
+    [
+        # The differentiable path uses an identity preprocessor and has no
+        # ordinal-encoding step, so categorical columns have no valid handling.
+        (
+            "categorical_features",
+            {"categorical_features_indices": [0]},
+            torch.randn(20, 4),
+            torch.randn(20),
+            "Categorical features",
+        ),
+        # Constant target collapses the bardist borders to a single point.
+        (
+            "constant_target",
+            {},
+            torch.randn(5, 4),
+            torch.full((5,), 3.14),
+            "Constant or near-constant target",
+        ),
+        # torch.std defaults to correction=1 and returns NaN for N=1; our path
+        # uses correction=0 so std collapses to 0 and trips the constant-target
+        # guard instead of a downstream NaN.
+        (
+            "single_sample",
+            {},
+            torch.randn(1, 4),
+            torch.tensor([2.0]),
+            "Constant or near-constant target",
+        ),
+    ],
+)
+def test__fit_with_differentiable_input__bad_input_raises_value_error(
+    case_id: str,
+    extra_kwargs: dict[str, object],
+    X: torch.Tensor,
+    y: torch.Tensor,
+    match: str,
+) -> None:
+    """Bad inputs to the differentiable fit path must raise ValueError with a
+    clear message rather than producing NaNs or crashing downstream.
+    """
+    del case_id  # Only used for parametrize ids.
+    reg = TabPFNRegressor(
+        n_estimators=1,
+        ignore_pretraining_limits=True,
+        device="cpu",
+        differentiable_input=True,
+        **extra_kwargs,  # type: ignore[arg-type]
+    )
+    with pytest.raises(ValueError, match=match):
+        reg.fit_with_differentiable_input(X, y)
+
+
+def test__fit_with_differentiable_input__std_matches_population_definition() -> None:
+    """The differentiable path's y_train_std_ should match np.std (population
+    std, ddof=0), not torch's default sample std (correction=1), so it lines
+    up with the standard fit() path.
+    """
+    reg = TabPFNRegressor(
+        n_estimators=1,
+        ignore_pretraining_limits=True,
+        device="cpu",
+        differentiable_input=True,
+    )
+    X = torch.randn(20, 4)
+    y_np = np.random.default_rng(0).standard_normal(20).astype(np.float32)
+    y = torch.from_numpy(y_np)
+    reg.fit_with_differentiable_input(X, y)
+    expected = float(np.std(y_np))  # ddof=0
+    assert abs(reg.y_train_std_ - expected) < 1e-5, (
+        f"y_train_std_ should equal np.std(y) (population std); "
+        f"got {reg.y_train_std_}, expected {expected}"
+    )
+
+
+def test__fit_with_differentiable_input__feature_schema_cols_independent() -> None:
+    """Each column's Feature must be a distinct instance — list multiplication
+    `[Feature(...)] * n` would alias all columns to one mutable dataclass.
+    """
+    reg = TabPFNRegressor(
+        n_estimators=1,
+        ignore_pretraining_limits=True,
+        device="cpu",
+        differentiable_input=True,
+    )
+    X = torch.randn(10, 4)
+    y = torch.randn(10)
+    reg.fit_with_differentiable_input(X, y)
+    feats = reg.inferred_feature_schema_.features
+    assert len(feats) == 4
+    # Distinct instances, not aliases.
+    ids = {id(f) for f in feats}
+    assert len(ids) == 4, "feature columns share the same Feature instance"
+
+
+def test__fit_with_differentiable_input__second_call_refreshes_target_stats() -> None:
+    """A second call with different y must update y_train_mean_/std_ and the
+    raw_space_bardist_; only the model load and ensemble configs are cached.
+    """
+    torch.manual_seed(0)
+    reg = TabPFNRegressor(
+        n_estimators=1,
+        ignore_pretraining_limits=True,
+        device="cpu",
+        differentiable_input=True,
+    )
+    X1 = torch.randn(20, 4)
+    y1 = torch.randn(20) * 10.0 + 100.0  # mean ~100, std ~10
+    reg.fit_with_differentiable_input(X1, y1)
+    mean1, std1 = reg.y_train_mean_, reg.y_train_std_
+    bardist_borders1 = reg.raw_space_bardist_.borders.clone()
+
+    X2 = torch.randn(20, 4)
+    y2 = torch.randn(20) * 0.5 - 5.0  # mean ~-5, std ~0.5
+    reg.fit_with_differentiable_input(X2, y2)
+    mean2, std2 = reg.y_train_mean_, reg.y_train_std_
+
+    assert abs(mean2 - mean1) > 1.0, (
+        f"y_train_mean_ should reflect new y; got {mean1} -> {mean2}"
+    )
+    assert abs(std2 - std1) > 1.0, (
+        f"y_train_std_ should reflect new y; got {std1} -> {std2}"
+    )
+    # raw_space_bardist_ borders are derived from y stats; they must move.
+    assert not torch.allclose(reg.raw_space_bardist_.borders, bardist_borders1), (
+        "raw_space_bardist_ must be rebuilt to the new target scale"
+    )

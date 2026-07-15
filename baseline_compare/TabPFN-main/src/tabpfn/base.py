@@ -7,15 +7,13 @@ from __future__ import annotations
 import pathlib
 import typing
 from collections.abc import Sequence
-from inspect import signature
-from typing import TYPE_CHECKING, Literal, Union
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import torch
 from sklearn.base import (
     check_is_fitted,
 )
-from tabpfn_common_utils.telemetry.interactive import capture_session, ping
 
 # --- TabPFN imports ---
 from tabpfn.constants import (
@@ -27,7 +25,6 @@ from tabpfn.constants import (
 from tabpfn.errors import TabPFNValidationError
 from tabpfn.inference import (
     InferenceEngine,
-    InferenceEngineCacheKV,
     InferenceEngineCachePreprocessing,
     InferenceEngineExplicitKVCache,
     InferenceEngineOnDemand,
@@ -45,10 +42,10 @@ from tabpfn.utils import (
 from tabpfn.validation import ensure_compatible_predict_input_sklearn
 
 if TYPE_CHECKING:
-    from tabpfn.architectures.base.bar_distribution import FullSupportBarDistribution
-    from tabpfn.architectures.base.memory import MemorySavingMode
     from tabpfn.architectures.interface import Architecture, ArchitectureConfig
+    from tabpfn.architectures.shared.bar_distribution import FullSupportBarDistribution
     from tabpfn.classifier import TabPFNClassifier
+    from tabpfn.constants import MemorySavingMode
     from tabpfn.inference_config import InferenceConfig
     from tabpfn.preprocessing.ensemble import TabPFNEnsemblePreprocessor
     from tabpfn.regressor import TabPFNRegressor
@@ -88,7 +85,7 @@ class RegressorModelSpecs(BaseModelSpecs):
         self.norm_criterion = norm_criterion
 
 
-ModelSpecs = Union[RegressorModelSpecs, ClassifierModelSpecs]
+ModelSpecs = RegressorModelSpecs | ClassifierModelSpecs
 
 
 def initialize_tabpfn_model(
@@ -287,6 +284,7 @@ def create_inference_engine(  # noqa: PLR0913
     memory_saving_mode: MemorySavingMode,
     use_autocast_: bool,
     inference_mode: bool = True,
+    keep_cache_on_device: bool = True,
 ) -> InferenceEngine:
     """Create the appropriate TabPFN inference engine based on `fit_mode`.
 
@@ -308,6 +306,11 @@ def create_inference_engine(  # noqa: PLR0913
         use_autocast_: Whether we use torch.autocast for inference.
         inference_mode: Whether to use torch.inference_mode (set False if
             backprop is needed)
+        keep_cache_on_device: Only relevant for ``fit_mode="fit_with_cache"``.
+            If True (default), each per-estimator KV cache stays on the
+            inference device. If False, caches are offloaded to CPU as they
+            are built and moved back on demand during inference, lowering
+            resident device memory at the cost of per-call transfers.
     """
     if fit_mode == "low_memory":
         return InferenceEngineOnDemand(
@@ -333,24 +336,7 @@ def create_inference_engine(  # noqa: PLR0913
             inference_mode=inference_mode,
         )
     if fit_mode == "fit_with_cache":
-        # Use explicit KV cache engine for models that support it (e.g. v3),
-        # fall back to model-internal KV cache engine for older architectures.
-        _uses_explicit_cache = any(
-            "return_kv_cache" in signature(m.forward).parameters for m in models
-        )
-        if _uses_explicit_cache:
-            return InferenceEngineExplicitKVCache(
-                X_train=X_train,
-                y_train=y_train,
-                ensemble_preprocessor=ensemble_preprocessor,
-                models=models,
-                devices=devices_,
-                dtype_byte_size=byte_size,
-                force_inference_dtype=forced_inference_dtype_,
-                save_peak_mem=memory_saving_mode,
-                autocast=use_autocast_,
-            )
-        return InferenceEngineCacheKV(
+        return InferenceEngineExplicitKVCache(
             X_train=X_train,
             y_train=y_train,
             ensemble_preprocessor=ensemble_preprocessor,
@@ -360,6 +346,7 @@ def create_inference_engine(  # noqa: PLR0913
             force_inference_dtype=forced_inference_dtype_,
             save_peak_mem=memory_saving_mode,
             autocast=use_autocast_,
+            keep_cache_on_device=keep_cache_on_device,
         )
     if fit_mode == "batched":
         raise ValueError(
@@ -368,6 +355,24 @@ def create_inference_engine(  # noqa: PLR0913
         )
 
     raise ValueError(f"Invalid fit_mode: {fit_mode}")
+
+
+def reject_categoricals_for_differentiable_input(
+    categorical_features_indices: Sequence[int] | None,
+) -> None:
+    """Reject categorical features in the differentiable-input fit path.
+
+    The differentiable path uses an identity preprocessor (no
+    ordinal-encoding step), so categorical columns have no valid handling
+    and would corrupt the prompt-tuning signal.
+    """
+    if (
+        categorical_features_indices is not None
+        and len(categorical_features_indices) > 0
+    ):
+        raise ValueError(
+            "Categorical features are not supported for differentiable input."
+        )
 
 
 def initialize_model_variables_helper(
@@ -423,16 +428,6 @@ def estimator_to_device(
         )
 
     return byte_size
-
-
-def initialize_telemetry() -> None:
-    """Initialize telemetry and acknowledge anonymous session.
-
-    If user opted out of telemetry using `TABPFN_DISABLE_TELEMETRY`,
-    no action is taken.
-    """
-    ping()
-    capture_session()
 
 
 def get_embeddings(

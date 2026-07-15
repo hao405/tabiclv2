@@ -24,10 +24,30 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-DEFAULT_DATA_ROOT = Path("data200_by_rows/small_lt2000")
+DEFAULT_DATA_ROOT = Path("data200")
 DEFAULT_MODEL_PATH = "tabicl-classifier-v2-20260212.ckpt"
 DEFAULT_CHECKPOINT_VERSION = "tabicl-classifier-v2-20260212.ckpt"
 DEFAULT_OUT_DIR_ROOT = Path("1b_result")
+DEFAULT_TTT_INACTIVE_DATASET_NAMES = frozenset(
+    {
+        "ASP-POTASSCO-classification",
+        "Indian_pines",
+        "UJI_Pen_Characters",
+        "gas-drift",
+        "helena",
+        "internet_usage",
+        "kr-vs-k",
+        "kropt",
+        "letter",
+        "naticusdroid+android+permissions+dataset",
+        "one-hundred-plants-margin",
+        "one-hundred-plants-shape",
+        "one-hundred-plants-texture",
+        "philippine",
+        "texture",
+        "walking-activity",
+    }
+)
 CLASSIFICATION_TASKS = {"binclass", "multiclass"}
 CATEGORICAL_MISSING_TOKEN = "__tabicl_missing__"
 
@@ -518,6 +538,39 @@ def should_skip_ttt_for_dataset(dataset_dir: Path, info: dict | None) -> bool:
 
 def find_dataset_dirs(data_root: Path) -> List[Path]:
     return [path for path in sorted(data_root.iterdir()) if path.is_dir()]
+
+
+def exclude_ttt_inactive_dataset_dirs(
+    dataset_dirs: List[Path],
+    inactive_names: frozenset[str] = DEFAULT_TTT_INACTIVE_DATASET_NAMES,
+) -> List[Path]:
+    filtered_dirs = [path for path in dataset_dirs if path.name not in inactive_names]
+    excluded_dirs = [path for path in dataset_dirs if path.name in inactive_names]
+    dataset_dir_names = {path.name for path in dataset_dirs}
+    unmatched_inactive_names = sorted(name for name in inactive_names if name not in dataset_dir_names)
+
+    print(
+        "[dataset-filter] "
+        f"ttt_inactive={len(inactive_names)} "
+        f"excluded={len(excluded_dirs)} "
+        f"kept={len(filtered_dirs)}/{len(dataset_dirs)}",
+        flush=True,
+    )
+    if excluded_dirs:
+        print(
+            "[dataset-filter] excluded_ttt_inactive="
+            + ", ".join(path.name for path in excluded_dirs),
+            flush=True,
+        )
+    if unmatched_inactive_names:
+        print(
+            "[dataset-filter] warning: inactive datasets not found under data-root: "
+            + ", ".join(unmatched_inactive_names),
+            file=sys.stderr,
+            flush=True,
+        )
+
+    return filtered_dirs
 
 
 def collect_torch_diagnostics() -> Dict[str, object]:
@@ -2663,7 +2716,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-version", default=DEFAULT_CHECKPOINT_VERSION)
     parser.add_argument(
         "--out-dir",
-        default="result/compare/Tabiclv2_ft_ensemble32_small_lt2000",
+        default="result/compare/Tabiclv2_ft_ensemble32_data200",
         help=(
             "Output directory. If omitted, generate one under 1b_result from "
             "TabICL version, dataset label, model parameters, FT eval metric, "
@@ -2681,6 +2734,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--offload-mode", choices=["auto", "gpu", "cpu", "disk"], default="auto")
     parser.add_argument("--random-state", type=int, default=42)
     parser.add_argument("--max-datasets", type=int, default=None)
+    parser.add_argument(
+        "--exclude-ttt-inactive-datasets",
+        dest="exclude_ttt_inactive_datasets",
+        action="store_true",
+        help="Drop datasets known to skip FT because ttt_applied was false in the reference run.",
+    )
+    parser.add_argument(
+        "--no-exclude-ttt-inactive-datasets",
+        dest="exclude_ttt_inactive_datasets",
+        action="store_false",
+        help="Run all datasets, including names known to skip FT.",
+    )
+    parser.set_defaults(exclude_ttt_inactive_datasets=False)
     parser.add_argument("--max-models", type=int, default=None)
     parser.add_argument("--prefetch-models", type=int, default=4)
     parser.add_argument(
@@ -3101,6 +3167,8 @@ def main() -> None:
         raise NotADirectoryError(f"Data root is not a directory: {data_root}")
 
     dataset_dirs = find_dataset_dirs(data_root)
+    if args.exclude_ttt_inactive_datasets:
+        dataset_dirs = exclude_ttt_inactive_dataset_dirs(dataset_dirs)
     if args.max_datasets is not None:
         dataset_dirs = dataset_dirs[: args.max_datasets]
     if not dataset_dirs:

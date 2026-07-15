@@ -1,0 +1,14 @@
+{
+  "avg_accuracy_ok": 0.8590515789250096,
+  "command": "/home/crc00006699/anaconda3/envs/tabicl/bin/python /home/crc00006699/zh/tabiclv2/1C_Chunk_FT/1C_Chunk_FT_Faware_C.py --data-root /home/crc00006699/zh/tabiclv2/data184 --out-dir /home/crc00006699/zh/tabiclv2/results/Faware_C/tabiclv2_optuna_reserve_ratio_20260703_103059/trials/trial_0001_reserve_0p190148 --workers 1 --gpu-groups 1 --random-state 42 --ttt-c-selection f_mmd --ttt-c-source test --ttt-c-metric standardized_l2 --ttt-eval-metric accuracy --ttt-c-reserve-ratio 0.1901477899",
+  "error": null,
+  "failed_count": 0,
+  "log_path": "/home/crc00006699/zh/tabiclv2/results/Faware_C/tabiclv2_optuna_reserve_ratio_20260703_103059/logs/trial_0001_reserve_0p190148.log",
+  "number": 1,
+  "objective": 0.8590515789250096,
+  "ok_count": 184,
+  "out_dir": "/home/crc00006699/zh/tabiclv2/results/Faware_C/tabiclv2_optuna_reserve_ratio_20260703_103059/trials/trial_0001_reserve_0p190148",
+  "state": "COMPLETE",
+  "ttt_c_reserve_ratio": 0.19014778985134226,
+  "value": 0.8590515789250096
+}

@@ -1,0 +1,19 @@
+strategy: ttt
+model_key: tabpfnv25
+reference_dir: tabpfnv2.5_1c_ttt_epoch30_chunk2000_lr1e-5_all_estimators8
+merge_mode: full_data200
+discovered_datasets: 200
+processed_datasets: 200
+ok_count: 197
+failed_count: 3
+skipped_count: 0
+ttt_oom_fallback_count: 0
+avg_accuracy_ok: 0.845922
+avg_f1_ok: 0.836873
+avg_balanced_accuracy_ok: 0.770125
+avg_roc_auc_ok: 0.903958
+avg_log_loss_ok: 0.369633
+avg_fit_seconds_ok: 62.663366
+avg_predict_seconds_ok: 44.791802
+failed_datasets: accelerometer, internet_firewall, shuttle
+skipped_datasets: (none)

@@ -1,0 +1,15 @@
+discovered_datasets: 184
+processed_datasets: 184
+ok_count: 184
+failed_count: 0
+skipped_count: 0
+ft_oom_fallback_count: 2
+avg_accuracy_ok: 0.858544
+avg_f1_ok: 0.850334
+avg_balanced_accuracy_ok: 0.784783
+avg_roc_auc_ok: 0.905181
+avg_log_loss_ok: 0.317970
+wall_seconds: 5352.967
+failed_datasets: (none)
+skipped_datasets: (none)
+ft_oom_fallback_datasets: connect-4, madeline

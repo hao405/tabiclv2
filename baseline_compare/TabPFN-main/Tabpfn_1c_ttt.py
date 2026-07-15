@@ -93,7 +93,7 @@ import result_naming
 
 CLASSIFICATION_TASKS = {"binclass", "multiclass"}
 CATEGORICAL_MISSING_TOKEN = "__tabicl_missing__"
-DEFAULT_MODEL_VERSION = "v2.5"
+DEFAULT_MODEL_VERSION = "v3"
 TABPFN_CLASS_LIMIT = 10
 V3_BINARY_CLASSIFIER_FILE = "tabpfn-v3-classifier-v3_20260417_binary.ckpt"
 V3_MULTICLASS_CLASSIFIER_FILE = "tabpfn-v3-classifier-v3_20260417_multiclass.ckpt"
@@ -228,7 +228,8 @@ class ResultRow:
 class TTTConfig:
     enabled: bool = True
     epochs: int = 3
-    max_chunk_size: int = 20_000
+    max_chunk_size: int = 2_000
+    grad_accumulation_steps: int = 5
     query_ratio: float = 0.2
     lr: float = 1e-5
     weight_decay: float = 0.01
@@ -266,6 +267,8 @@ def build_ttt_config(args: argparse.Namespace) -> TTTConfig:
         raise ValueError("--ttt-epochs must be >= 0")
     if int(args.ttt_max_chunk_size) < 2:
         raise ValueError("--ttt-max-chunk-size must be >= 2")
+    if int(args.ttt_grad_accumulation_steps) < 1:
+        raise ValueError("--ttt-grad-accumulation-steps must be >= 1")
     if not 0.0 < float(args.ttt_query_ratio) < 1.0:
         raise ValueError("--ttt-query-ratio must be in (0, 1)")
     if not 0.0 < float(args.ttt_validation_fraction) < 1.0:
@@ -276,13 +279,14 @@ def build_ttt_config(args: argparse.Namespace) -> TTTConfig:
         raise ValueError("--ttt-validation-n-estimators must be >= 1")
     if int(args.n_estimators) < 1:
         raise ValueError("--n-estimators must be >= 1")
-    if str(args.ttt_eval_metric) not in {"roc_auc", "log_loss"}:
-        raise ValueError("--ttt-eval-metric must be one of: roc_auc, log_loss")
+    if str(args.ttt_eval_metric) not in {"roc_auc", "log_loss", "acc"}:
+        raise ValueError("--ttt-eval-metric must be one of: roc_auc, log_loss, acc")
     grad_clip = None if float(args.ttt_grad_clip) <= 0 else float(args.ttt_grad_clip)
     return TTTConfig(
         enabled=bool(args.ttt),
         epochs=int(args.ttt_epochs),
         max_chunk_size=int(args.ttt_max_chunk_size),
+        grad_accumulation_steps=int(args.ttt_grad_accumulation_steps),
         query_ratio=float(args.ttt_query_ratio),
         lr=float(args.ttt_lr),
         weight_decay=float(args.ttt_weight_decay),
@@ -778,6 +782,7 @@ class TabPFNAdapter:
             n_estimators_validation=config.n_estimators_validation,
             n_estimators_final_inference=config.n_estimators_final_inference,
             use_activation_checkpointing=config.use_activation_checkpointing,
+            gradient_accumulation_steps=config.grad_accumulation_steps,
             save_checkpoint_interval=config.save_checkpoint_interval,
             extra_classifier_kwargs=classifier_kwargs,
             eval_metric=config.eval_metric,
@@ -845,7 +850,11 @@ class TabPFNAdapter:
             n_holdout_c=0,
             n_test_d=int(len(loaded.y_test)),
             ttt_lr=config.lr,
-            ttt_steps=config.epochs * chunks_per_epoch,
+            ttt_steps=config.epochs
+            * (
+                (chunks_per_epoch + config.grad_accumulation_steps - 1)
+                // config.grad_accumulation_steps
+            ),
             ttt_applied=True,
             ttt_update_seconds=float(ttt_update_seconds),
             ttt_split_strategy="tabpfn_finetune_epoch_chunks",
@@ -856,7 +865,11 @@ class TabPFNAdapter:
             ),
             ttt_epochs=config.epochs,
             ttt_chunks_per_epoch=chunks_per_epoch,
-            ttt_batch_mode="tabpfn_finetuning_api",
+            ttt_batch_mode=(
+                "tabpfn_finetuning_api"
+                if config.grad_accumulation_steps == 1
+                else f"tabpfn_finetuning_api_grad_accum{config.grad_accumulation_steps}"
+            ),
             ttt_val_eval_metric=ttt_validation_summary["ttt_val_eval_metric"],
             ttt_val_baseline_metric=ttt_validation_summary["ttt_val_baseline_metric"],
             ttt_val_best_metric=ttt_validation_summary["ttt_val_best_metric"],
@@ -1226,6 +1239,30 @@ def evaluate_one_dataset(adapter: TabPFNAdapter, dataset_dir: Path) -> ResultRow
     try:
         loaded = load_classification_dataset(dataset_dir)
         task_type = loaded.task_type
+        if loaded.n_classes > TABPFN_CLASS_LIMIT:
+            return ResultRow(
+                dataset_name=loaded.dataset_name,
+                dataset_dir=loaded.dataset_dir.as_posix(),
+                task_type=loaded.task_type,
+                n_train=loaded.n_train_report,
+                n_val=loaded.n_val,
+                n_test=int(len(loaded.y_test)),
+                n_features=int(loaded.X_train.shape[1]),
+                n_classes=loaded.n_classes,
+                accuracy=None,
+                f1=None,
+                balanced_accuracy=None,
+                roc_auc=None,
+                log_loss=None,
+                fit_seconds=0.0,
+                predict_seconds=0.0,
+                status="skip",
+                error=(
+                    f"Skipped because n_classes={loaded.n_classes} exceeds "
+                    f"TabPFN class limit {TABPFN_CLASS_LIMIT}; "
+                    "ManyClassClassifier is not run in this benchmark."
+                ),
+            )
         try:
             result = adapter.fit_predict(loaded)
         except Exception as exc:
@@ -1818,21 +1855,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--data-root",
-        default="../../data178",
+        default="../../data200",
         help="Root directory containing data178-style dataset folders.",
     )
     parser.add_argument(
         "--out-dir",
-        default=None,
+        default="../../results/tabpfn/tabpfnv3_ft",
         help=(
             "Directory for worker CSVs, all_classification_results.csv, and summary.txt. "
             "If omitted, uses baseline_compare/results/<auto_name>."
         ),
     )
-    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=2)
     parser.add_argument(
         "--gpus",
-        default="1",
+        default="0,1",
         help="Comma-separated physical GPU ids, or 'auto' to use detected GPUs.",
     )
     parser.add_argument("--max-datasets", type=int, default=None)
@@ -1883,7 +1920,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--many-class",
         choices=["auto", "on", "off"],
         default="auto",
-        help="Use the official tabpfn-extensions ManyClassClassifier for >10 classes.",
+        help=(
+            "Legacy many-class wrapper switch. Datasets with >10 classes are "
+            "skipped by this benchmark before model fitting."
+        ),
     )
     parser.add_argument(
         "--many-class-alphabet-size",
@@ -1907,14 +1947,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.set_defaults(ttt=True)
     parser.add_argument("--ttt-epochs", type=int, default=30)
-    parser.add_argument("--ttt-max-chunk-size", type=int, default=2000)
+    parser.add_argument("--ttt-max-chunk-size", type=int, default=10000)
+    parser.add_argument(
+        "--ttt-grad-accumulation-steps",
+        type=int,
+        default=1,
+        help=(
+            "Accumulate gradients across this many TTT chunks before one "
+            "optimizer update. With the default chunk size 10000 and value 5, "
+            "the effective update batch is 10000 samples without loading all "
+            "10000 samples at once."
+        ),
+    )
     parser.add_argument("--ttt-query-ratio", type=float, default=0.2)
     parser.add_argument("--ttt-lr", type=float, default=1e-5)
     parser.add_argument("--ttt-weight-decay", type=float, default=0.01)
     parser.add_argument("--ttt-grad-clip", type=float, default=1.0)
     parser.add_argument("--ttt-patience", type=int, default=8)
     parser.add_argument("--ttt-min-delta", type=float, default=1e-4)
-    parser.add_argument("--ttt-eval-metric", choices=["roc_auc", "log_loss"], default="roc_auc")
+    parser.add_argument("--ttt-eval-metric", choices=["roc_auc", "log_loss", "acc"], default="acc")
     parser.add_argument("--ttt-validation-fraction", type=float, default=0.1)
     parser.add_argument("--ttt-n-estimators-finetune", type=int, default=2)
     parser.add_argument("--ttt-validation-n-estimators", type=int, default=2)

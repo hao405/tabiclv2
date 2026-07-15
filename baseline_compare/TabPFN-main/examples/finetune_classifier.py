@@ -17,10 +17,12 @@ import warnings
 import numpy as np
 import sklearn.datasets
 import torch
+import torch.distributed as dist
 from sklearn.metrics import log_loss, roc_auc_score
 from sklearn.model_selection import train_test_split
 
 from tabpfn import TabPFNClassifier
+from tabpfn.finetuning import main_process_first
 from tabpfn.finetuning.finetuned_classifier import (
     FinetunedTabPFNClassifier,
 )
@@ -45,16 +47,18 @@ logging.basicConfig(
 # =============================================================================
 
 # Training hyperparameters
-NUM_EPOCHS = 30
-LEARNING_RATE = 2e-5
+NUM_EPOCHS = 100
+LEARNING_RATE = 1e-5
+N_FINETUNE_CTX_PLUS_QUERY_SAMPLES = 50_000
+EARLY_STOPPING_PATIENCE = 15
 
 # Ensemble configuration
 # number of estimators to use during finetuning
-NUM_ESTIMATORS_FINETUNE = 2
+NUM_ESTIMATORS_FINETUNE = 4
 # number of estimators to use during trian time validation
-NUM_ESTIMATORS_VALIDATION = 2
+NUM_ESTIMATORS_VALIDATION = 4
 # number of estimators to use during final inference
-NUM_ESTIMATORS_FINAL_INFERENCE = 2
+NUM_ESTIMATORS_FINAL_INFERENCE = 4
 
 # Reproducibility
 RANDOM_STATE = 0
@@ -72,7 +76,15 @@ def main() -> None:
 
     # We use the "Higgs" dataset (see https://www.openml.org/search?type=data&sort=runs&id=44129&status=active)
     # but only take a random subset of 100k samples for this example.
-    data = sklearn.datasets.fetch_openml(data_id=44129, as_frame=True, parser="auto")
+    # Under torchrun, the main process downloads the dataset first and the
+    # other ranks then read it from the warm sklearn cache — otherwise every
+    # rank would download it, and not all sklearn fetchers write their cache
+    # atomically.
+    with main_process_first():
+        data = sklearn.datasets.fetch_openml(
+            data_id=44129, as_frame=True, parser="auto"
+        )
+
     _, X_all, _, y_all = train_test_split(
         data.data,
         data.target,
@@ -96,7 +108,6 @@ def main() -> None:
             device=[f"cuda:{i}" for i in range(torch.cuda.device_count())],
             n_estimators=NUM_ESTIMATORS_FINAL_INFERENCE,
             ignore_pretraining_limits=True,
-            inference_config={"SUBSAMPLE_SAMPLES": 50_000},
             random_state=RANDOM_STATE,
         )
         base_clf.fit(X_train, y_train)
@@ -124,6 +135,10 @@ def main() -> None:
         device="cuda",
         epochs=NUM_EPOCHS,
         learning_rate=LEARNING_RATE,
+        lr_warmup_only=True,
+        eval_metric="log_loss",
+        early_stopping_patience=EARLY_STOPPING_PATIENCE,
+        n_finetune_ctx_plus_query_samples=N_FINETUNE_CTX_PLUS_QUERY_SAMPLES,
         n_estimators_finetune=NUM_ESTIMATORS_FINETUNE,
         n_estimators_validation=NUM_ESTIMATORS_VALIDATION,
         n_estimators_final_inference=NUM_ESTIMATORS_FINAL_INFERENCE,
@@ -143,6 +158,9 @@ def main() -> None:
 
         print(f"📊 Finetuned TabPFN Test ROC: {roc_auc:.4f}")
         print(f"📊 Finetuned TabPFN Test Log Loss: {loss:.4f}")
+
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

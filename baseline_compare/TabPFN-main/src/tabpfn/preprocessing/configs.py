@@ -54,7 +54,6 @@ class PreprocessorConfig:
     """
 
     name: Literal[
-        "per_feature",  # a different transformation for each feature
         "power",  # a standard sklearn power transformer
         "safepower",  # a power transformer that prevents some numerical issues
         "power_box",
@@ -65,6 +64,7 @@ class PreprocessorConfig:
         "quantile_norm",
         "quantile_uni_fine",
         "quantile_norm_fine",
+        "quantile_uni_extrapolate",
         "squashing_scaler_default",
         "squashing_scaler_max10",
         "robust",  # a standard sklearn robust scaler
@@ -151,6 +151,9 @@ class EnsembleConfig:
         feature_shift_decoder: How to shift features.
         outlier_removal_std: Number of standard deviations from the mean to consider a
             sample an outlier. If `None`, no outliers are removed.
+        passthrough_inf: Whether to pass infinite values through to the model.
+            When True, the preprocessing pipeline replaces infinities with NaN
+            before preprocessing and restores them afterwards.
     """
 
     preprocess_config: PreprocessorConfig
@@ -161,6 +164,7 @@ class EnsembleConfig:
     outlier_removal_std: float | None
     # Internal index specifying which model to use for this ensemble member.
     _model_index: int
+    passthrough_inf: bool
 
 
 @dataclass

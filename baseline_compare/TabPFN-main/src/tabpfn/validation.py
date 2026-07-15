@@ -11,7 +11,7 @@ from __future__ import annotations
 import typing
 import warnings
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import pandas as pd
 import torch
@@ -20,6 +20,7 @@ from sklearn.utils.multiclass import check_classification_targets
 
 from tabpfn.errors import TabPFNValidationError
 from tabpfn.misc._sklearn_compat import check_array, validate_data
+from tabpfn.preprocessing.clean import coerce_nullable_dtypes_to_numpy
 from tabpfn.settings import settings
 
 if TYPE_CHECKING:
@@ -29,6 +30,8 @@ if TYPE_CHECKING:
 
     from tabpfn import TabPFNClassifier, TabPFNRegressor
     from tabpfn.constants import XType, YType
+
+    T = TypeVar("T")
 
 
 def ensure_compatible_fit_inputs(
@@ -93,6 +96,8 @@ def ensure_compatible_predict_input_sklearn(
 
     Note that this also changes the type of X to np.ndarray.
     """
+    if isinstance(X, pd.DataFrame):
+        X = coerce_nullable_dtypes_to_numpy(X)
     try:
         result = validate_data(
             estimator,
@@ -102,7 +107,9 @@ def ensure_compatible_predict_input_sklearn(
             # Parameters to `check_X_y()`
             accept_sparse=False,
             dtype=None,
-            ensure_all_finite="allow-nan",
+            ensure_all_finite=False
+            if estimator.get_inference_config().PASSTHROUGH_INF
+            else "allow-nan",
             estimator=estimator,
         )
     except (ValueError, TypeError) as e:
@@ -164,6 +171,8 @@ def ensure_compatible_fit_inputs_sklearn(
         A tuple of the validated input data X, target data y, feature names,
         and number of features.
     """
+    if isinstance(X, pd.DataFrame):
+        X = coerce_nullable_dtypes_to_numpy(X)
     try:
         X, y = validate_data(
             estimator,
@@ -172,7 +181,9 @@ def ensure_compatible_fit_inputs_sklearn(
             # Parameters to `check_X_y()`
             accept_sparse=False,
             dtype=None,  # This is handled later in `fit()`
-            ensure_all_finite="allow-nan",
+            ensure_all_finite=False
+            if estimator.get_inference_config().PASSTHROUGH_INF
+            else "allow-nan",
             ensure_min_samples=2,
             ensure_min_features=1,
             y_numeric=ensure_y_numeric,
@@ -195,7 +206,17 @@ def ensure_compatible_fit_inputs_sklearn(
                 ensure_2d=False,
             )
     except (ValueError, TypeError) as e:
-        raise TabPFNValidationError(str(e)) from e
+        e_str = str(e)
+        if "X contains infinity" in e_str:
+            e_str += (
+                "\nHint: TabPFN uses infinite values as missing completely at random "  # noqa: S608
+                "(MCAR) markers. If this matches your use case, try using "
+                f"{estimator.__class__.__name__}"
+                '(inference_config={"PASSTHROUGH_INF": True}).\n'
+                "Otherwise, replace your infinite values with NaN to indicate "
+                "missingness."
+            )
+        raise TabPFNValidationError(e_str) from e
 
     # NOTE: Theoretically we don't need to return the feature names and number,
     # but it makes it clearer in the calling code that these variables now exist

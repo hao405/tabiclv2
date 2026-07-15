@@ -8,7 +8,7 @@ import torch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-MODULE_PATH = REPO_ROOT / "Lora_ttt.py"
+MODULE_PATH = REPO_ROOT / "PEFT_Tabicl" / "1C_Chunk_PEFT.py"
 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -74,8 +74,8 @@ def test_row_icl_lora_only_trains_lora_params_and_freezes_col_embedder():
         classifier,
         lora_ttt.TTTConfig(
             enabled=True,
-            lora=True,
-            lora_targets="row,icl",
+            peft_method="lora",
+            peft_targets="row,icl",
             lora_rank=2,
             lora_alpha=4.0,
         ),
@@ -101,8 +101,8 @@ def test_merged_ttt_state_dict_excludes_lora_keys_and_merges_linear_delta():
         classifier,
         lora_ttt.TTTConfig(
             enabled=True,
-            lora=True,
-            lora_targets="row,icl",
+            peft_method="lora",
+            peft_targets="row,icl",
             lora_rank=1,
             lora_alpha=1.0,
         ),
@@ -111,8 +111,9 @@ def test_merged_ttt_state_dict_excludes_lora_keys_and_merges_linear_delta():
     linear = model.row_interactor.tf_row.blocks[0].linear1
     base_weight = linear.weight.detach().clone()
     with torch.no_grad():
-        getattr(linear, lora_ttt._lora_param_name("A")).fill_(1.0)
-        getattr(linear, lora_ttt._lora_param_name("B")).fill_(2.0)
+        lora = linear.parametrizations.weight[0]
+        lora._ttt_lora_A.fill_(1.0)
+        lora._ttt_lora_B.fill_(2.0)
 
     merged = lora_ttt._merged_ttt_state_dict(model)
 

@@ -536,8 +536,10 @@ class TestTorchVsSklearnAddSVDFeaturesStep:
 
         # --- sklearn path ---
         schema = FeatureSchema(
-            features=[Feature(name=None, modality=FeatureModality.NUMERICAL)]
-            * n_features
+            features=[
+                Feature(name=f"f{i}", modality=FeatureModality.NUMERICAL)
+                for i in range(n_features)
+            ]
         )
         sk_step = SklearnAddSVDFeaturesStep(
             global_transformer_name=svd_name, random_state=42
@@ -589,7 +591,10 @@ class TestAddSVDFeaturesStepIntegration:
 
         # Initial metadata: 20 numerical columns
         schema = FeatureSchema(
-            features=[Feature(name=None, modality=FeatureModality.NUMERICAL)] * 20
+            features=[
+                Feature(name=f"f{i}", modality=FeatureModality.NUMERICAL)
+                for i in range(20)
+            ]
         )
 
         x = torch.randn(60, 2, 20)
@@ -617,8 +622,14 @@ class TestAddSVDFeaturesStepIntegration:
 
         # 12 numerical + 3 categorical
         schema = FeatureSchema(
-            features=[Feature(name=None, modality=FeatureModality.NUMERICAL)] * 12
-            + [Feature(name=None, modality=FeatureModality.CATEGORICAL)] * 3
+            features=[
+                Feature(name=f"num{i}", modality=FeatureModality.NUMERICAL)
+                for i in range(12)
+            ]
+            + [
+                Feature(name=f"cat{i}", modality=FeatureModality.CATEGORICAL)
+                for i in range(3)
+            ]
         )
 
         x = torch.randn(50, 1, 15)
@@ -635,3 +646,34 @@ class TestAddSVDFeaturesStepIntegration:
 
         # Numerical columns should include original 12 + 3 SVD = 15
         assert len(result.feature_schema.indices_for(FeatureModality.NUMERICAL)) == 15
+
+
+def test__add_svd_features__single_feature_is_noop_like_cpu():
+    """With fewer than 2 features the step must add nothing, like the CPU step.
+
+    Regression test: the torch step used to append one SVD column (a rescaled
+    copy of the lone input column) for single-feature data, while the CPU
+    AddSVDFeaturesStep declares itself a no-op (TruncatedSVD requires
+    n_components < n_features). The GPU and CPU pipelines then fed the model
+    different feature matrices, silently changing predictions between
+    ENABLE_GPU_PREPROCESSING on and off.
+    """
+    torch.manual_seed(0)
+    x = torch.randn(50, 1, 1)
+
+    torch_step = TorchAddSVDFeaturesStep("svd_quarter_components")
+    result = torch_step.fit_transform(x, column_indices=[0], num_train_rows=40)
+    assert result.added_columns is None
+    torch.testing.assert_close(result.x, x)
+
+    cpu_step = SklearnAddSVDFeaturesStep(
+        global_transformer_name="svd_quarter_components", random_state=0
+    )
+    schema = FeatureSchema(
+        features=[Feature(name="f0", modality=FeatureModality.NUMERICAL)]
+    )
+    X_np = x[:40, 0, :].numpy()
+    cpu_result = cpu_step.fit_transform(X_np, schema)
+    assert cpu_step.is_no_op
+    assert cpu_result.X.shape == X_np.shape
+    assert cpu_step.num_added_features(40, schema) == 0

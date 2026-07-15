@@ -7,8 +7,8 @@ This reduces the memory required for inference.
 
 from __future__ import annotations
 
-from typing import Callable
-from typing_extensions import Concatenate, ParamSpec
+from collections.abc import Callable
+from typing import Concatenate, ParamSpec
 
 import torch
 
@@ -51,6 +51,15 @@ def chunked_evaluate_maybe_inplace(
 
     msg = "Gradients cannot be tracked save_peak_memory_factor is not None."
     assert not x.requires_grad, msg
+
+    # The in-place write-back below only works if `x.flatten(...)` returns a view of
+    # `x` rather than a copy, which requires the flattened leading dims to be
+    # contiguous. For a non-contiguous `x`, `flatten` silently returns a copy, the
+    # per-chunk in-place writes land in that copy, and `return x` would hand back the
+    # unmodified input (a silent no-op). Guard against this here: `.contiguous()` is a
+    # no-op (returns `x` unchanged) when `x` is already contiguous, so callers that
+    # pass contiguous tensors pay nothing.
+    x = x.contiguous()
 
     x_flat_batch = x.flatten(0, batch_dims - 1)
     split_size = (

@@ -158,3 +158,7 @@ class TestClassifierMetricName:
     def test_log_loss_metric_name(self):
         clf = FinetunedTabPFNClassifier(eval_metric="log_loss")
         assert clf._metric_name == "log_loss"
+
+    def test_acc_metric_name(self):
+        clf = FinetunedTabPFNClassifier(eval_metric="acc")
+        assert clf._metric_name == "accuracy"

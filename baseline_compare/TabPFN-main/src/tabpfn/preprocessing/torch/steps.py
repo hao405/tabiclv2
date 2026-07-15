@@ -36,10 +36,17 @@ from tabpfn.utils import infer_random_state
 class TorchQuantileTransformerStep(TorchPreprocessingStep):
     """Pipeline step wrapper for TorchQuantileTransformer."""
 
-    def __init__(self, n_quantiles: int = 1_000) -> None:
+    def __init__(
+        self,
+        n_quantiles: int = 1_000,
+        extrapolate_ratio: float | None = None,
+    ) -> None:
         """Initialize the quantile transformer step."""
         super().__init__()
-        self._quantile_transformer = TorchQuantileTransformer(n_quantiles=n_quantiles)
+        self._quantile_transformer = TorchQuantileTransformer(
+            n_quantiles=n_quantiles,
+            extrapolate_ratio=extrapolate_ratio,
+        )
 
     @override
     def _fit(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -151,9 +158,13 @@ class TorchSelectiveQuantileTransformerStep(TorchPreprocessingStep):
         self,
         n_quantiles: int,
         target_column_indices: list[int],
+        extrapolate_ratio: float | None = None,
     ) -> None:
         super().__init__()
-        self._qt = TorchQuantileTransformer(n_quantiles=n_quantiles)
+        self._qt = TorchQuantileTransformer(
+            n_quantiles=n_quantiles,
+            extrapolate_ratio=extrapolate_ratio,
+        )
         self._target_column_indices = target_column_indices
 
     @override
@@ -373,6 +384,10 @@ class TorchAddSVDFeaturesStep(TorchPreprocessingStep):
         self._svd: TorchTruncatedSVD | None = None
 
     @override
+    def added_feature_prefix(self) -> str:
+        return "svd"
+
+    @override
     def _fit(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """Fit the scaler and SVD on the selected columns.
 
@@ -384,6 +399,11 @@ class TorchAddSVDFeaturesStep(TorchPreprocessingStep):
         """
         num_train_rows = x.shape[0]
         num_features = x.shape[-1]
+
+        # Mirror the CPU AddSVDFeaturesStep, which is a no-op for fewer than
+        # 2 features (TruncatedSVD needs n_components < n_features).
+        if num_features < 2:
+            return {"is_no_op": torch.tensor(data=True)}
 
         effective_n_components = get_svd_n_components(
             self.global_transformer_name,
@@ -426,6 +446,9 @@ class TorchAddSVDFeaturesStep(TorchPreprocessingStep):
         Returns:
             Tuple of (original_columns, svd_features, NUMERICAL modality).
         """
+        if "is_no_op" in fitted_cache:
+            return x, None, None
+
         num_rows, batch_size, num_features = x.shape
 
         # Extract caches
@@ -469,6 +492,10 @@ class TorchAddFingerprintFeaturesStep(TorchPreprocessingStep):
 
     TODO: Implement this on GPU natively.
     """
+
+    @override
+    def added_feature_prefix(self) -> str:
+        return "fingerprint"
 
     @override
     def fit_transform(

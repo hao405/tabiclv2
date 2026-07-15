@@ -24,9 +24,9 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-DEFAULT_DATA_ROOT = Path("openml_cc18")
-DEFAULT_MODEL_PATH = "tabicl-classifier-v1.1-20250506.ckpt"
-DEFAULT_CHECKPOINT_VERSION = "tabicl-classifier-v1.1-20250506.ckpt"
+DEFAULT_DATA_ROOT = Path("data200_by_rows/small_lt2000")
+DEFAULT_MODEL_PATH = "tabicl-classifier-v2-20260212.ckpt"
+DEFAULT_CHECKPOINT_VERSION = "tabicl-classifier-v2-20260212.ckpt"
 CLASSIFICATION_TASKS = {"binclass", "multiclass"}
 CATEGORICAL_MISSING_TOKEN = "__tabicl_missing__"
 
@@ -1340,7 +1340,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-path", default=None)
     parser.add_argument("--models-dir", default=None)
     parser.add_argument("--checkpoint-version", default=DEFAULT_CHECKPOINT_VERSION)
-    parser.add_argument("--out-dir", default="baseline/iclv1.1_ensemble32_openmlcc18")
+    parser.add_argument("--out-dir", default="result/baseline/iclv2_ensemble32_small_lt2000")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--gpus", default="1")
     parser.add_argument(

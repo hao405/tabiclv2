@@ -5,9 +5,11 @@
 [![Discord](https://img.shields.io/discord/1285598202732482621?color=7289da&label=Discord&logo=discord&logoColor=ffffff)](https://discord.gg/BHnX2Ptf4j)
 [![Documentation](https://img.shields.io/badge/docs-priorlabs.ai-blue)](https://priorlabs.ai/docs)
 [![colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/PriorLabs/TabPFN/blob/main/examples/notebooks/TabPFN_Demo_Local.ipynb)
-[![Python Versions](https://img.shields.io/badge/python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue)](https://pypi.org/project/tabpfn/)
+[![Python Versions](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)](https://pypi.org/project/tabpfn/)
 
-<img src="https://github.com/PriorLabs/tabpfn-extensions/blob/main/tabpfn_summary.webp" width="80%" alt="TabPFN Summary">
+<img src="docs/assets/tabpfn_architecture.svg" width="100%" alt="TabPFN trains on synthetic datasets and predicts on unseen real-world datasets in a single forward pass">
+
+<img src="docs/assets/tabpfn_attention.svg" width="100%" alt="TabPFN-3 architecture: a distribution embedder, then row-wise and cross-row attention, read out as per-row tokens">
 
 ## Quick Start
 
@@ -23,9 +25,16 @@
 pip install tabpfn
 ```
 
-Note: For best performance on Apple Silicon/MPS, consider installing a pytorch version after
-the nightly "2.13.0.dev20260510". This enables flash attention without relying on MLX
-(the latter requires a GPU-CPU-GPU roundtrip).
+TabPFN supports Python 3.10+. `pip install tabpfn` installs a compatible
+PyTorch build automatically. If you want a smaller CPU-only install, need a
+PyTorch build for a specific accelerator or CUDA version, or want platform
+notes for Windows and WSL, choose the matching command from the
+[PyTorch installation selector](https://pytorch.org/get-started/locally/) before
+installing TabPFN.
+
+Note: For best performance on Apple Silicon/MPS, consider installing a PyTorch
+version after the nightly "2.13.0.dev20260510". This enables flash attention
+without relying on MLX (the latter requires a GPU-CPU-GPU roundtrip).
 
 
 ### Basic Usage
@@ -73,7 +82,7 @@ Choose the right TabPFN implementation for your needs:
 
   -  **`interpretability`**: Gain insights with SHAP-based explanations, feature importance, and selection tools.
   -  **`unsupervised`**: Tools for outlier detection and synthetic tabular data generation.
-  -  **`embeddings`**: Extract and use TabPFN’s internal learned embeddings for downstream tasks or analysis.
+  -  **`embeddings`**: Extract and use TabPFN's internal learned embeddings for downstream tasks or analysis.
   -  **`many_class`**: Handle multi-class classification problems that exceed TabPFN's built-in class limit.
 
   To install:
@@ -93,7 +102,8 @@ The TabPFN-2.5, TabPFN-2.6, and TabPFN-3 model weights are released under non-co
 
 The code and TabPFN-2 model weights are licensed under Prior Labs License (Apache 2.0 with additional attribution requirement): [here](LICENSE). To use the v2 model weights, instantiate your model as follows:
 
-```
+```python
+from tabpfn import TabPFNRegressor
 from tabpfn.constants import ModelVersion
 
 tabpfn_v2 = TabPFNRegressor.create_default_for_version(ModelVersion.V2)
@@ -133,12 +143,22 @@ We're building the future of tabular machine learning and would love your involv
 
 ## Citation
 
-You can read our paper explaining TabPFNv2 [here](https://doi.org/10.1038/s41586-024-08328-6), and the model report of TabPFN-2.5 [here](https://arxiv.org/abs/2511.08667).
+You can read our paper explaining TabPFNv2 [here](https://doi.org/10.1038/s41586-024-08328-6), and model reports for [TabPFN-2.5](https://arxiv.org/abs/2511.08667) and [TabPFN-3](https://arxiv.org/abs/2605.13986).
 
 <details>
 <summary><b>BibTeX</b></summary>
 
 ```bibtex
+@misc{grinsztajn2026tabpfn3technicalreport,
+      title={TabPFN-3: Technical Report}, 
+      author={Léo Grinsztajn and Klemens Flöge and Oscar Key and Felix Birkel and Philipp Jund and Brendan Roof and Mihir Manium and Shi Bin Hoo and Magnus Bühler and Anurag Garg and Dominik Safaric and Jake Robertson and Benjamin Jäger and Simone Alessi and Adrian Hayler and Vladyslav Moroshan and Lennart Purucker and Philipp Singer and Alan Arazi and Julien Siems and Jan Hendrik Metzen and Georg Grab and Nick Erickson and Siyuan Guo and Eliott Kalfon and Simon Bing and David Salinas and Clara Cornu and Lilly Charlotte Wehrhahn and Diana Kriuchkova and Kursat Kaya and Lydia Sidhoum and Marie Salmon and Jerry Chen and Madelon Hulsebos and Yann LeCun and Samuel Müller and Bernhard Schölkopf and Sauraj Gambhir and Noah Hollmann and Frank Hutter},
+      year={2026},
+      eprint={2605.13986},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2605.13986}, 
+}
+
 @misc{grinsztajn2025tabpfn,
   title={TabPFN-2.5: Advancing the State of the Art in Tabular Foundation Models},
   author={Léo Grinsztajn and Klemens Flöge and Oscar Key and Felix Birkel and Philipp Jund and Brendan Roof and
@@ -197,9 +217,9 @@ Recommended row and feature limits vary by checkpoint — see the [Models page](
 </details>
 
 <details>
-<summary><b>Q: Why can't I use TabPFN with Python 3.8?</b></summary>
+<summary><b>Q: Why can't I use TabPFN with Python 3.9?</b></summary>
 
-TabPFN requires **Python 3.9+** due to newer language features. Compatible versions: **3.9, 3.10, 3.11, 3.12, 3.13**.
+TabPFN requires **Python 3.10+** due to newer language features. Compatible versions: **3.10, 3.11, 3.12, 3.13, 3.14**.
 
 </details>
 
@@ -235,8 +255,8 @@ This script will download the main classifier and regressor models, as well as a
 **Manual Download**
 
 1. Download the model files manually from HuggingFace:
-   - Classifier: [tabpfn-v3-classifier-20260506.ckpt](https://huggingface.co/Prior-Labs/tabpfn_3/blob/main/tabpfn-v3-classifier-20260506.ckpt)
-   - Regressor: [tabpfn-v3-regressor-20260506.ckpt](https://huggingface.co/Prior-Labs/tabpfn_3/blob/main/tabpfn-v3-regressor-20260506.ckpt)
+   - Classifier: [tabpfn-v3-classifier-v3_default.ckpt](https://huggingface.co/Prior-Labs/tabpfn_3/blob/main/tabpfn-v3-classifier-v3_default.ckpt)
+   - Regressor: [tabpfn-v3-regressor-v3_default.ckpt](https://huggingface.co/Prior-Labs/tabpfn_3/blob/main/tabpfn-v3-regressor-v3_default.ckpt)
 
 2. Place the file in one of these locations:
    - Specify directly: `TabPFNClassifier(model_path="/path/to/model.ckpt")`
@@ -269,6 +289,8 @@ TabPFN uses Pydantic settings for configuration, supporting environment variable
 **Model Configuration:**
 - `TABPFN_MODEL_CACHE_DIR`: Custom directory for caching downloaded TabPFN models (default: platform-specific user cache directory)
 - `TABPFN_ALLOW_CPU_LARGE_DATASET`: Allow running TabPFN on CPU with large datasets (>1000 samples). Set to `true` to override the CPU limitation. Note: This will be very slow!
+- `TABPFN_MPS_MEMORY_FRACTION`: Fraction of recommended max MPS memory to allow on Apple Silicon (default: `0.7`). Used to prevent macOS system crashes; set before importing TabPFN. Values above `1.0` are not recommended.
+- `TABPFN_MAX_BATCHED_TEST_ROWS`: Maximum number of test rows fed through the model in a single forward pass during cached (`fit_mode="fit_with_cache"`) inference (default: `32768`). Larger test sets are split into independent chunks of at most this size and concatenated, bounding peak memory. Test rows are conditionally independent given the KV cache, so chunking is mathematically equivalent — results may still differ slightly due to floating-point non-associativity (see [#800](https://github.com/PriorLabs/TabPFN/issues/800#issuecomment-4903444425)). Performance should be close to optimal at the default of `32768`: the hardware is already saturated at that chunk size and, since the computations are independent, larger chunks bring no speedup. Set to `0` to disable chunking.
 
 **PyTorch Settings:**
 - `PYTORCH_CUDA_ALLOC_CONF`: PyTorch CUDA memory allocation configuration to optimize GPU memory usage (default: `max_split_size_mb:512`). See [PyTorch CUDA documentation](https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf) for more information.
@@ -287,9 +309,9 @@ Or simply set them in your `.env`
 <details>
 <summary><b>Q: How do I save and load a trained TabPFN model?</b></summary>
 
-Use :func:`save_fitted_tabpfn_model` to persist a fitted estimator and reload
-it later with :func:`load_fitted_tabpfn_model` (or the corresponding
-``load_from_fit_state`` class methods).
+Use `save_fitted_tabpfn_model` to persist a fitted estimator and reload
+it later with `load_fitted_tabpfn_model` (or the corresponding
+`load_from_fit_state` class methods).
 
 ```python
 from tabpfn import TabPFNRegressor
@@ -308,7 +330,7 @@ reg_cpu = load_fitted_tabpfn_model("my_reg.tabpfn_fit", device="cpu")
 ```
 
 To store just the foundation model weights (without a fitted estimator) use
-``save_tabpfn_model(reg.model_, "my_tabpfn.ckpt")``. This merely saves a
+``save_tabpfn_model(reg, "my_tabpfn.ckpt")`` (imported from ``tabpfn.model_loading``). This merely saves a
 checkpoint of the pre-trained weights so you can later create and fit a fresh
 estimator. Reload the checkpoint with ``load_model_criterion_config``.
 
@@ -343,23 +365,6 @@ Each TabPFN release publishes a default classification and regression checkpoint
 
 </details>
 
-## Anonymized Telemetry
-
-This project collects fully anonymous usage telemetry disabled by default.
-
-The data is used exclusively to help us provide stability to the relevant products and compute environments and guide future improvements.
-
-- **No personal data is collected**
-- **No code, model inputs, or outputs are ever sent**
-- **Data is strictly anonymous and cannot be linked to individuals**
-
-For details on telemetry, please see our [Telemetry Reference](https://github.com/PriorLabs/TabPFN/blob/main/TELEMETRY.md) and our [Privacy Policy](https://priorlabs.ai/privacy-policy/).
-
-**To opt in**, set the following environment variable:
-
-```bash
-export TABPFN_DISABLE_TELEMETRY=0
-```
 ---
 
 Built with ❤️ by [Prior Labs](https://priorlabs.ai) - Copyright (c) 2026 Prior Labs GmbH

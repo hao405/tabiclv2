@@ -4,11 +4,12 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Literal
 from typing_extensions import override
 
 import numpy as np
 from sklearn.preprocessing import QuantileTransformer
+from sklearn.utils.validation import _num_samples
 
 _DEFAULT_SUBSAMPLE = 100_000
 
@@ -42,13 +43,24 @@ def get_user_n_quantiles_for_preset(transform_name: str, n_samples: int) -> int:
     Raises:
         ValueError: If *transform_name* is not a known quantile preset.
     """
-    if transform_name in ("quantile_uni", "quantile_norm"):
+    if transform_name in (
+        "quantile_uni",
+        "quantile_norm",
+        "quantile_uni_extrapolate",
+    ):
         return max(n_samples // 5, 2)
     if transform_name in ("quantile_uni_coarse", "quantile_norm_coarse"):
         return max(n_samples // 10, 2)
     if transform_name in ("quantile_uni_fine", "quantile_norm_fine"):
         return n_samples
     raise ValueError(f"Unknown quantile preset: {transform_name}")
+
+
+def get_extrapolate_ratio_for_preset(transform_name: str) -> float | None:
+    """Return the default ``extrapolate_ratio`` for a named quantile preset."""
+    if transform_name == "quantile_uni_extrapolate":
+        return 1.0
+    return None
 
 
 class AdaptiveQuantileTransformer(QuantileTransformer):
@@ -62,19 +74,36 @@ class AdaptiveQuantileTransformer(QuantileTransformer):
     greater than the number of available samples in the input data (X).
     This situation can arises because we first initialize the transformer
     based on total samples and then subsample.
+
+    When ``extrapolate_ratio`` is set, inputs outside the training range
+    are linearly extrapolated beyond ``[0, 1]`` at ``transform`` time and
+    clipped at ``-extrapolate_ratio`` / ``1 + extrapolate_ratio``. This
+    preserves OOD information that would otherwise be flattened by the
+    boundary clamp. Intended for ``output_distribution="uniform"``.
     """
 
     def __init__(
         self,
         *,
         n_quantiles: int = 1_000,
+        output_distribution: Literal["uniform", "normal"] = "uniform",
+        ignore_implicit_zeros: bool = False,
         subsample: int = _DEFAULT_SUBSAMPLE,
-        **kwargs: Any,
+        random_state: int | np.random.RandomState | np.random.Generator | None = None,
+        copy: bool = True,
+        extrapolate_ratio: float | None = None,
     ) -> None:
-        # Store the user's desired n_quantiles to use as an upper bound
-        self._user_n_quantiles = n_quantiles
-        # Initialize parent with this, but it will be adapted in fit
-        super().__init__(n_quantiles=n_quantiles, subsample=subsample, **kwargs)
+        # All parent parameters must be explicit (no **kwargs): clone()
+        # rebuilds from get_params(), which only sees named parameters.
+        super().__init__(
+            n_quantiles=n_quantiles,
+            output_distribution=output_distribution,
+            ignore_implicit_zeros=ignore_implicit_zeros,
+            subsample=subsample,
+            random_state=random_state,
+            copy=copy,
+        )
+        self.extrapolate_ratio = extrapolate_ratio
 
     @override
     def fit(
@@ -82,23 +111,75 @@ class AdaptiveQuantileTransformer(QuantileTransformer):
         X: np.ndarray,
         y: np.ndarray | None = None,
     ) -> AdaptiveQuantileTransformer:
-        n_samples = X.shape[0]
+        # sklearn contract: validate at fit time, not in __init__/set_params.
+        if self.extrapolate_ratio is not None:
+            if self.extrapolate_ratio < 0:
+                raise ValueError("extrapolate_ratio must be non-negative.")
+            if self.output_distribution != "uniform":
+                raise ValueError(
+                    "extrapolate_ratio is only supported for "
+                    "output_distribution='uniform'."
+                )
 
-        self.n_quantiles = compute_effective_n_quantiles(
-            self._user_n_quantiles, n_samples, self.subsample
-        )
+        n_samples = _num_samples(X)
+
+        if self.extrapolate_ratio is not None and n_samples > 0:
+            self.x_min_ = np.nanmin(X, axis=0, keepdims=True)
+            self.x_max_ = np.nanmax(X, axis=0, keepdims=True)
 
         # Convert Generator to RandomState if needed for sklearn compatibility
-        if isinstance(self.random_state, np.random.Generator):
-            seed = int(self.random_state.integers(0, 2**32))
-            self.random_state = np.random.RandomState(seed)
-        elif hasattr(self.random_state, "bit_generator"):
+        random_state = self.random_state
+        if isinstance(random_state, np.random.Generator):
+            seed = int(random_state.integers(0, 2**32))
+            random_state = np.random.RandomState(seed)
+        elif hasattr(random_state, "bit_generator"):
             raise ValueError(
-                f"Unsupported random state type: {type(self.random_state)}. "
+                f"Unsupported random state type: {type(random_state)}. "
                 "Please provide an integer seed or np.random.RandomState object."
             )
 
-        return super().fit(X, y)
+        # The parent reads n_quantiles/random_state from self: set the adapted
+        # values only for the duration of the fit, since fit() must not modify
+        # constructor parameters (clone/refit contract).
+        user_n_quantiles = self.n_quantiles
+        user_random_state = self.random_state
+        self.n_quantiles = compute_effective_n_quantiles(
+            user_n_quantiles, n_samples, self.subsample
+        )
+        self.random_state = random_state
+        try:
+            return super().fit(X, y)
+        finally:
+            self.n_quantiles = user_n_quantiles
+            self.random_state = user_random_state
+
+    @override
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        out = super().transform(X)
+
+        if self.extrapolate_ratio is not None and out.shape[0] > 0:
+            X = np.asarray(X)
+            x_range = self.x_max_ - self.x_min_
+            # Skip constant features (matches the GPU path); also avoids a
+            # divide-by-zero in the normalisation below.
+            extrap_mask = x_range > 0
+            min_idcs = (self.x_min_ > X) & extrap_mask
+            max_idcs = (self.x_max_ < X) & extrap_mask
+            if np.any(min_idcs) or np.any(max_idcs):
+                # (X - x_max)/range + 1 simplifies to (X - x_min)/range, so
+                # one normalised array suffices for both branches.
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    norm = (X - self.x_min_) / x_range
+                if np.any(min_idcs):
+                    out[min_idcs] = np.clip(
+                        norm[min_idcs], -self.extrapolate_ratio, 0.0
+                    )
+                if np.any(max_idcs):
+                    out[max_idcs] = np.clip(
+                        norm[max_idcs], 1.0, 1.0 + self.extrapolate_ratio
+                    )
+
+        return out
 
 
 __all__ = [

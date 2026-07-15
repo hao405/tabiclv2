@@ -11,6 +11,7 @@ This module contains tests for:
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
@@ -27,17 +28,21 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 
 from tabpfn import TabPFNClassifier
-from tabpfn.architectures.base.transformer import PerFeatureTransformer
 from tabpfn.architectures.interface import PerformanceOptions
+from tabpfn.architectures.tabpfn_v3 import TabPFNV3
+from tabpfn.constants import ModelVersion
 from tabpfn.finetuning.data_util import (
     ClassifierBatch,
     DatasetCollectionWithPreprocessing,
     get_preprocessed_dataset_chunks,
     meta_dataset_collator,
 )
+from tabpfn.finetuning.finetuned_base import EvalResult
 from tabpfn.finetuning.finetuned_classifier import FinetunedTabPFNClassifier
+from tabpfn.finetuning.finetuned_regressor import FinetunedTabPFNRegressor
 from tabpfn.finetuning.train_util import get_checkpoint_path_and_epoch_from_output_dir
 from tabpfn.preprocessing import ClassifierEnsembleConfig
+from tabpfn.settings import settings
 
 from .utils import (
     get_pytest_devices,
@@ -195,6 +200,71 @@ def create_mock_architecture_forward(
     return mock_forward
 
 
+def make_improving_eval_side_effect() -> Callable[..., EvalResult]:
+    """Side effect for ``_evaluate_model`` returning a strictly improving metric.
+
+    This ensures that a "best" checkpoint is always saved during tests.
+    """
+    call_count = 0
+
+    def _evaluate(*_args: Any, **_kwargs: Any) -> EvalResult:
+        nonlocal call_count
+        roc_auc = 0.5 + 0.05 * call_count
+        call_count += 1
+        return EvalResult(
+            primary=roc_auc,
+            secondary={"roc_auc": roc_auc, "log_loss": 1.5 - 0.1 * call_count},
+        )
+
+    return _evaluate
+
+
+def make_capturing_nonimproving_eval_side_effect(
+    captured: dict[str, Any],
+) -> Callable[..., EvalResult]:
+    """Side effect for ``_evaluate_model`` that never improves.
+
+    Returns the same metric on every call (so no epoch ever counts as an
+    improvement over the default model) and, on the first call (the
+    "Eval default model" step, before any optimizer step), snapshots the
+    un-finetuned model weights into ``captured['default_state']``.
+    """
+
+    def _evaluate(instance: Any, *_args: Any, **_kwargs: Any) -> EvalResult:
+        if "default_state" not in captured:
+            model_sd = instance.finetuned_estimator_.model_.state_dict()
+            captured["default_state"] = {
+                k: v.detach().cpu().clone() for k, v in model_sd.items()
+            }
+        return EvalResult(primary=0.5, secondary={"roc_auc": 0.5, "log_loss": 1.0})
+
+    return _evaluate
+
+
+def make_param_dependent_loss_side_effect() -> Callable[..., torch.Tensor]:
+    """Side effect for ``_forward_with_loss`` that moves every weight.
+
+    Returns a loss tied to the live model parameters so ``loss.backward()``
+    yields a nonzero gradient for every trainable parameter and the optimizer
+    actually updates the weights during training. This makes the
+    "restore the base model" regression test meaningful: if nothing is
+    restored, the weights are guaranteed to have changed.
+    """
+
+    def _loss(instance: Any, _batch: Any) -> torch.Tensor:
+        params = instance.finetuned_estimator_.model_.parameters()
+        return 1e-2 * sum((p**2).sum() for p in params if p.requires_grad)
+
+    return _loss
+
+
+def _state_dicts_equal(a: dict[str, torch.Tensor], b: dict[str, torch.Tensor]) -> bool:
+    """Return True iff two state dicts have identical keys and tensor values."""
+    if a.keys() != b.keys():
+        return False
+    return all(torch.equal(a[k], b[k].cpu()) for k in a)
+
+
 @pytest.fixture(scope="module")
 def synthetic_data() -> tuple[np.ndarray, np.ndarray]:
     """Generate synthetic data for testing."""
@@ -312,7 +382,7 @@ def variable_synthetic_dataset_collection() -> list[tuple[np.ndarray, np.ndarray
     dataset_sizes = [10, 20, 30]
     class_counts = [2, 4, 6]
     n_features = 3
-    for size, n_classes in zip(dataset_sizes, class_counts):
+    for size, n_classes in zip(dataset_sizes, class_counts, strict=True):
         X = rng.normal(size=(size, n_features)).astype(np.float32)
         y = rng.integers(0, n_classes, size=size)
         datasets.append((X, y))
@@ -373,7 +443,7 @@ def test__finetuned_tabpfn_classifier__fit_and_predict(
     mock_forward = create_mock_architecture_forward(n_classes=n_classes)
 
     with mock.patch.object(
-        PerFeatureTransformer,
+        TabPFNV3,
         "forward",
         autospec=True,
         side_effect=mock_forward,
@@ -392,6 +462,202 @@ def test__finetuned_tabpfn_classifier__fit_and_predict(
     predictions = finetuned_clf.predict(X_test)
     assert predictions.shape[0] == X_test.shape[0]
     assert all(pred in np.unique(y_train) for pred in predictions)
+
+
+@pytest.mark.parametrize("validation_split_ratio", [None, 0])
+def test__finetuned_tabpfn_classifier__fit_without_validation(
+    validation_split_ratio: float | None,
+    synthetic_data: tuple[np.ndarray, np.ndarray],
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    """Disabling validation trains on all data and skips evaluation entirely.
+
+    With ``validation_split_ratio=None`` (or ``0``), ``fit`` must run end to
+    end without ever calling ``_evaluate_model``, and ``early_stopping=True``
+    must be silently downgraded (with a log message) rather than acting on a
+    non-existent validation metric: with ``early_stopping_patience=1`` and no
+    validation, all epochs still run.
+
+    Checkpointing must not carry the "best model" concept over from the
+    validation mode: only interval checkpoints are written (never a best
+    checkpoint), and they record the train loss rather than placeholder
+    validation metrics.
+
+    This covers the shared ``FinetunedTabPFNBase._fit`` no-validation branch;
+    ``FinetunedTabPFNRegressor`` inherits the identical code path.
+    """
+    X, y = synthetic_data
+    n_classes = len(np.unique(y))
+    X_train, X_test, y_train, _ = train_test_split(X, y, test_size=0.3, random_state=42)
+    X_train = np.asarray(X_train)
+    X_test = np.asarray(X_test)
+    y_train = np.asarray(y_train)
+
+    epochs = 3
+    finetuned_clf = FinetunedTabPFNClassifier(
+        device="cpu",
+        epochs=epochs,
+        learning_rate=1e-4,
+        validation_split_ratio=validation_split_ratio,
+        n_finetune_ctx_plus_query_samples=50,
+        finetune_ctx_query_split_ratio=0.1,
+        n_inference_subsample_samples=100,
+        random_state=42,
+        early_stopping=True,
+        early_stopping_patience=1,
+        save_checkpoint_interval=1,
+        n_estimators_finetune=1,
+        n_estimators_validation=1,
+        n_estimators_final_inference=1,
+        use_lr_scheduler=False,
+    )
+
+    mock_forward = create_mock_architecture_forward(n_classes=n_classes)
+
+    caplog.set_level(logging.INFO, logger="tabpfn.finetuning.finetuned_base")
+    with (
+        mock.patch.object(
+            TabPFNV3,
+            "forward",
+            autospec=True,
+            side_effect=mock_forward,
+        ),
+        mock.patch.object(
+            finetuned_clf,
+            "_evaluate_model",
+            wraps=finetuned_clf._evaluate_model,
+        ) as evaluate_model_spy,
+    ):
+        finetuned_clf.fit(X_train, y_train, output_dir=tmp_path)
+
+    assert finetuned_clf.is_fitted_
+    evaluate_model_spy.assert_not_called()
+    assert "early stopping is disabled" in caplog.text
+
+    epoch_records = [
+        record for record in caplog.records if "Train Loss" in record.getMessage()
+    ]
+    assert len(epoch_records) == epochs
+
+    # No "best" checkpoint without validation, one interval checkpoint per
+    # epoch, and the stored metrics reflect training (no placeholder values).
+    assert not list(tmp_path.glob("*_best.pth"))
+    interval_checkpoints = sorted(tmp_path.glob("checkpoint_*.pth"))
+    assert len(interval_checkpoints) == epochs
+    checkpoint = torch.load(
+        interval_checkpoints[-1], map_location="cpu", weights_only=False
+    )
+    assert np.isfinite(checkpoint["train_loss"])
+    assert "primary_metric" not in checkpoint
+
+    probabilities = finetuned_clf.predict_proba(X_test)
+    assert probabilities.shape == (X_test.shape[0], n_classes)
+    assert np.allclose(probabilities.sum(axis=1), 1.0, atol=1e-5)
+
+
+def test__finetuned_tabpfn_classifier__no_improvement_restores_base_model(
+    synthetic_data: tuple[np.ndarray, np.ndarray],
+) -> None:
+    """Regression test for GH#1064: never return a model worse than the base.
+
+    When no fine-tuning epoch beats the default model on the validation metric,
+    early stopping must restore the original (un-finetuned) weights instead of
+    leaving the last epoch's (degraded) weights in place. Otherwise the wrapper
+    can return a model strictly worse than the base TabPFN it started from.
+
+    The fine-tuning loss is mocked to a parameter-dependent value so the
+    optimizer genuinely moves the weights, and ``_evaluate_model`` is mocked to
+    a constant metric so no epoch ever counts as an improvement. The control
+    case (``early_stopping=False``, where no restoration happens) confirms the
+    weights really do change, so the early-stopping assertion has teeth.
+
+    This exercises the shared ``FinetunedTabPFNBase._fit`` early-stopping/restore
+    logic. ``FinetunedTabPFNRegressor`` inherits the identical code path, so the
+    behavior is not duplicated for the regressor.
+    """
+    X, y = synthetic_data
+    X_train, _, y_train, _ = train_test_split(X, y, test_size=0.3, random_state=42)
+    X_train = np.asarray(X_train)
+    y_train = np.asarray(y_train)
+
+    def build_clf(*, early_stopping: bool) -> FinetunedTabPFNClassifier:
+        return FinetunedTabPFNClassifier(
+            device="cpu",
+            epochs=3,
+            learning_rate=1e-2,
+            weight_decay=0.0,
+            validation_split_ratio=0.2,
+            n_finetune_ctx_plus_query_samples=50,
+            finetune_ctx_query_split_ratio=0.1,
+            n_inference_subsample_samples=100,
+            random_state=42,
+            early_stopping=early_stopping,
+            early_stopping_patience=10,  # high, so we exhaust all epochs
+            n_estimators_finetune=1,
+            n_estimators_validation=1,
+            n_estimators_final_inference=1,
+            use_lr_scheduler=False,
+        )
+
+    def run_fit(clf: FinetunedTabPFNClassifier, captured: dict[str, Any]) -> None:
+        with (
+            mock.patch.object(
+                FinetunedTabPFNClassifier,
+                "_forward_with_loss",
+                autospec=True,
+                side_effect=make_param_dependent_loss_side_effect(),
+            ),
+            mock.patch.object(
+                FinetunedTabPFNClassifier,
+                "_evaluate_model",
+                autospec=True,
+                side_effect=make_capturing_nonimproving_eval_side_effect(captured),
+            ),
+        ):
+            clf.fit(X_train, y_train)
+
+    # Control: no early stopping -> no restoration -> weights must have changed.
+    control_captured: dict[str, Any] = {}
+    clf_no_es = build_clf(early_stopping=False)
+    run_fit(clf_no_es, control_captured)
+    final_no_es = clf_no_es.finetuned_estimator_.model_.state_dict()
+    assert not _state_dicts_equal(control_captured["default_state"], final_no_es), (
+        "Mocked fine-tuning did not change any weights; the regression test "
+        "cannot detect whether the base model is restored."
+    )
+
+    # Fix under test: early stopping ON and no epoch beats the default model ->
+    # the final weights must be exactly the original (base) weights.
+    captured: dict[str, Any] = {}
+    clf_es = build_clf(early_stopping=True)
+    run_fit(clf_es, captured)
+    final_es = clf_es.finetuned_estimator_.model_.state_dict()
+    assert _state_dicts_equal(captured["default_state"], final_es), (
+        "Fine-tuning that never beat the default model returned modified weights "
+        "instead of restoring the base model (GH#1064)."
+    )
+
+
+@pytest.mark.parametrize(
+    "estimator_cls", [FinetunedTabPFNClassifier, FinetunedTabPFNRegressor]
+)
+def test__finetuned_tabpfn__model_version_tracks_package_default(estimator_cls) -> None:
+    """`model_version` is optional and tracks the package default (GH#1064).
+
+    The fine-tuner must not hardcode an older version: by default it fine-tunes
+    the same version a default ``TabPFNClassifier``/``TabPFNRegressor`` uses, so
+    base-vs-fine-tuned comparisons don't silently mix model generations. This is
+    shared ``FinetunedTabPFNBase`` behavior, so it is checked for both estimators.
+    """
+    # Default (None) resolves to the package default version — no stale hardcode.
+    est = estimator_cls(device="cpu")
+    assert est.model_version is None
+    assert est.finetune_model_version == settings.tabpfn.model_version
+
+    # An explicit version is respected (overrides the package default).
+    est_v25 = estimator_cls(device="cpu", model_version=ModelVersion.V2_5)
+    assert est_v25.finetune_model_version == ModelVersion.V2_5
 
 
 # =============================================================================
@@ -426,7 +692,9 @@ def test__finetuned_tabpfn_classifier__checkpoint_saving_and_loading(
         finetune_ctx_query_split_ratio=0.1,
         n_inference_subsample_samples=100,
         random_state=42,
-        early_stopping=False,
+        # Best checkpoints are only saved under early stopping; the improving
+        # eval side effect below keeps it from actually triggering.
+        early_stopping=True,
         use_lr_scheduler=False,
         n_estimators_finetune=1,
         n_estimators_validation=1,
@@ -436,11 +704,14 @@ def test__finetuned_tabpfn_classifier__checkpoint_saving_and_loading(
 
     mock_forward = create_mock_architecture_forward(n_classes=n_classes)
 
-    with mock.patch.object(
-        PerFeatureTransformer,
-        "forward",
-        autospec=True,
-        side_effect=mock_forward,
+    with (
+        mock.patch.object(TabPFNV3, "forward", autospec=True, side_effect=mock_forward),
+        mock.patch.object(
+            FinetunedTabPFNClassifier,
+            "_evaluate_model",
+            autospec=True,
+            side_effect=make_improving_eval_side_effect(),
+        ),
     ):
         finetuned_clf.fit(X_train, y_train, output_dir=output_folder)
 
@@ -518,20 +789,24 @@ def test__finetuned_tabpfn_classifier__checkpoint_resumption(
 
     mock_forward = create_mock_architecture_forward(n_classes=n_classes)
 
-    with mock.patch.object(
-        PerFeatureTransformer,
-        "forward",
-        autospec=True,
-        side_effect=mock_forward,
+    with (
+        mock.patch.object(TabPFNV3, "forward", autospec=True, side_effect=mock_forward),
+        mock.patch.object(
+            FinetunedTabPFNClassifier,
+            "_evaluate_model",
+            autospec=True,
+            side_effect=make_improving_eval_side_effect(),
+        ),
     ):
         finetuned_clf.fit(X_train, y_train, output_dir=output_folder)
 
     epoch_2_checkpoint = output_folder / "checkpoint_70_2.pth"
     assert epoch_2_checkpoint.exists(), "Checkpoint at epoch 2 should exist"
 
+    # Without early stopping the last epoch is the result: no best checkpoint.
     best_checkpoint_path = output_folder / "checkpoint_70_best.pth"
-    assert best_checkpoint_path.exists(), (
-        "Best checkpoint should exist after first training"
+    assert not best_checkpoint_path.exists(), (
+        "No best checkpoint should be saved when early stopping is disabled"
     )
 
     # Resume training for another 2 epochs (total 4)
@@ -552,11 +827,14 @@ def test__finetuned_tabpfn_classifier__checkpoint_resumption(
         save_checkpoint_interval=2,
     )
 
-    with mock.patch.object(
-        PerFeatureTransformer,
-        "forward",
-        autospec=True,
-        side_effect=mock_forward,
+    with (
+        mock.patch.object(TabPFNV3, "forward", autospec=True, side_effect=mock_forward),
+        mock.patch.object(
+            FinetunedTabPFNClassifier,
+            "_evaluate_model",
+            autospec=True,
+            side_effect=make_improving_eval_side_effect(),
+        ),
     ):
         finetuned_clf_resumed.fit(X_train, y_train, output_dir=output_folder)
 
@@ -565,7 +843,7 @@ def test__finetuned_tabpfn_classifier__checkpoint_resumption(
         "Checkpoint at epoch 4 should exist after resumption"
     )
 
-    assert best_checkpoint_path.exists()
+    assert not best_checkpoint_path.exists()
 
     # Verify predictions work
     y_pred_proba = finetuned_clf_resumed.predict_proba(X_test)
@@ -661,7 +939,7 @@ def test__finetuned_tabpfn_classifier__checkpoint_interval_configuration(
     mock_forward = create_mock_architecture_forward(n_classes=n_classes)
 
     with mock.patch.object(
-        PerFeatureTransformer,
+        TabPFNV3,
         "forward",
         autospec=True,
         side_effect=mock_forward,
@@ -682,9 +960,11 @@ def test__finetuned_tabpfn_classifier__checkpoint_interval_configuration(
             f"Checkpoint at epoch {epoch} should not exist"
         )
 
-    # Verify best checkpoint exists
+    # Without early stopping the last epoch is the result: no best checkpoint.
     best_checkpoint_path = output_folder / "checkpoint_70_best.pth"
-    assert best_checkpoint_path.exists(), "Best checkpoint should exist"
+    assert not best_checkpoint_path.exists(), (
+        "No best checkpoint should be saved when early stopping is disabled"
+    )
 
 
 @pytest.mark.parametrize("device", get_pytest_devices_with_mps_marked_slow())
@@ -715,7 +995,9 @@ def test__finetuned_tabpfn_classifier__best_checkpoint_saving(
         finetune_ctx_query_split_ratio=0.1,
         n_inference_subsample_samples=100,
         random_state=42,
-        early_stopping=False,
+        # Best checkpoints are only saved under early stopping; the improving
+        # eval side effect below keeps it from actually triggering.
+        early_stopping=True,
         use_lr_scheduler=False,
         n_estimators_finetune=1,
         n_estimators_validation=1,
@@ -725,11 +1007,14 @@ def test__finetuned_tabpfn_classifier__best_checkpoint_saving(
 
     mock_forward = create_mock_architecture_forward(n_classes=n_classes)
 
-    with mock.patch.object(
-        PerFeatureTransformer,
-        "forward",
-        autospec=True,
-        side_effect=mock_forward,
+    with (
+        mock.patch.object(TabPFNV3, "forward", autospec=True, side_effect=mock_forward),
+        mock.patch.object(
+            FinetunedTabPFNClassifier,
+            "_evaluate_model",
+            autospec=True,
+            side_effect=make_improving_eval_side_effect(),
+        ),
     ):
         finetuned_clf.fit(X_train, y_train, output_dir=output_folder)
 
@@ -1225,7 +1510,7 @@ def test__finetuned_tabpfn_classifier__use_fixed_preprocessing_seed(
     )
 
     with mock.patch.object(
-        PerFeatureTransformer,
+        TabPFNV3,
         "forward",
         autospec=True,
         side_effect=mock_forward,
@@ -1261,3 +1546,82 @@ def test__finetuned_tabpfn_classifier__use_fixed_preprocessing_seed(
             "Column order is not different for any batch! Fixed preprocessing seed is "
             "not working."
         )
+
+
+@pytest.mark.parametrize("device", devices)
+def test__batched_inference__matches_single_dataset(device: str) -> None:
+    """Batched inference scores several independent datasets in a single fused
+    forward per estimator and matches per-dataset inference exactly.
+
+    The transformer batch dimension is independent, so stacking datasets along it
+    yields independent in-context predictions in one forward. This verifies both
+    the output contract ((n_query, batch_size, n_classes)) and numerical
+    equivalence with running each dataset alone from the same preprocessed inputs.
+    """
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA device requested but not available.")
+
+    def mkds(seed: int, n: int = 60, f: int = 5) -> tuple[np.ndarray, np.ndarray]:
+        r = np.random.RandomState(seed)
+        X = r.randn(n, f).astype(np.float32)
+        y = (X[:, 0] + 0.3 * r.randn(n) > 0).astype(int)
+        return X, y
+
+    data = [mkds(s) for s in range(3)]
+
+    def make_clf() -> TabPFNClassifier:
+        return TabPFNClassifier(
+            n_estimators=2,
+            device=device,
+            random_state=42,
+            fit_mode="batched",
+            inference_precision=torch.float32,
+            differentiable_input=False,
+        )
+
+    clf = make_clf()
+    collection = get_preprocessed_dataset_chunks(
+        clf,
+        [d[0] for d in data],
+        [d[1] for d in data],
+        train_test_split,
+        100,
+        model_type="classifier",
+        equal_split_size=True,
+        data_shuffle_seed=42,
+        preprocessing_random_state=42,
+    )
+    batch = next(
+        iter(DataLoader(collection, batch_size=3, collate_fn=meta_dataset_collator))
+    )
+    perf = PerformanceOptions()
+
+    clf.fit_from_preprocessed(
+        batch.X_context,
+        batch.y_context,
+        batch.cat_indices,
+        batch.configs,
+        performance_options=perf,
+    )
+    fused = clf.forward(batch.X_query, use_inference_mode=True).detach()
+
+    # Output keeps the dataset batch dim: (n_query, n_datasets, n_classes).
+    assert fused.ndim == 3
+    assert fused.shape[1] == 3
+    assert torch.allclose(fused.sum(-1), torch.ones_like(fused.sum(-1)), atol=1e-4)
+
+    # Each dataset, run alone from the same preprocessed inputs, matches the slice.
+    for i in range(3):
+        single_clf = make_clf()
+        single_clf.fit_from_preprocessed(
+            [t[i : i + 1] for t in batch.X_context],
+            [t[i : i + 1] for t in batch.y_context],
+            [batch.cat_indices[i]],
+            [[cfg[i]] for cfg in batch.configs],
+            performance_options=perf,
+        )
+        single = single_clf.forward(
+            [t[i : i + 1] for t in batch.X_query], use_inference_mode=True
+        ).detach()
+        assert single.shape[1] == 1
+        assert torch.allclose(fused[:, i, :], single[:, 0, :], atol=1e-4)

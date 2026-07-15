@@ -4,9 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tabpfn"
-version = "8.0.2"
+version = "8.1.0"
 dependencies = [
   "torch>=2.5",
+  "safetensors>=0.4.0",
   "numpy>=1.21.6",
   "scikit-learn>=1.2.0",
   "typing_extensions>=4.12.0",
@@ -16,18 +17,13 @@ dependencies = [
   "huggingface-hub>=0.23.0",
   "pydantic>=2.8.0",
   "pydantic-settings>=2.10.1",
-  # eval-type-backport is required on Python 3.9 to enable support for "X | Y" notation
-  # for union types in Pydantic.
-  # Once Python 3.10 is the minimum version, this can be removed.
-  "eval-type-backport>=0.2.2",
   "joblib>=1.2.0",
   "tqdm>=4.66.0",
-  "tabpfn-common-utils[telemetry-interactive]>=0.2.13",
   "filelock>=3.11.0",
   "lightgbm>=3.0",
   "mlx>=0.29.3; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 authors = [{ name = "Prior Labs", email = "opensource@priorlabs.ai" }]
 
 readme = "README.md"
@@ -42,16 +38,17 @@ classifiers = [
   'Operating System :: Unix',
   'Operating System :: MacOS',
   'Programming Language :: Python :: 3',
-  'Programming Language :: Python :: 3.9',
   'Programming Language :: Python :: 3.10',
   'Programming Language :: Python :: 3.11',
   'Programming Language :: Python :: 3.12',
   'Programming Language :: Python :: 3.13',
+  'Programming Language :: Python :: 3.14',
 ]
 license = { file = "LICENSE" }
 
 [project.optional-dependencies]
 wandb = ["wandb>=0.25.1"]
+viz = ["matplotlib>=3.5"]
 
 [project.urls]
 documentation = "https://priorlabs.ai/docs"
@@ -62,8 +59,9 @@ dev = [
   {include-group = "ci"},
   # Lint/format
   "pre-commit>=4.3.0",
-  "ruff==0.15.12", # This version must be the same as in .pre-commit-config.yaml
-  "mypy==1.19.1", # This version must be the same as in .pre-commit-config.yaml
+  # This version must be the same as in [tool.ruff] below and in .pre-commit-config.yaml
+  "ruff==0.15.12",
+  "mypy==2.1.0", # This version must be the same as in .pre-commit-config.yaml
   # Test
   "pytest-xdist>=3.8.0",
   # Changelog
@@ -85,7 +83,7 @@ dev = [
 # The minimum subset of the dev dependencies required to run the tests on the CI.
 # The idea is to be as close to the deployment environment as possible.
 ci = [
-  "licensecheck>=2025.1.0",
+  "licensecheck>=2025.1.0,!=2026.0.2,!=2026.0.3",  # 2026.0.2 and 2026.0.3 are borked and crash the CI
   "onnx>=1.19.0",  # We run onnx export in the tests, but not in the production package.
   "pytest-mock>=3.14.1",
   "pytest>=8.4.2",
@@ -93,7 +91,7 @@ ci = [
 
 [tool.uv]
 exclude-newer = "7 days"
-exclude-newer-package = {torch = false} 
+exclude-newer-package = {torch = false}
 
 [tool.setuptools.package-data]
 "tabpfn.architectures.shared" = ["tabpfn_col_embedding.pt"]
@@ -113,7 +111,9 @@ markers = [
 
 # https://github.com/charliermarsh/ruff
 [tool.ruff]
-target-version = "py39"
+# Must be the same version as in [dependency-groups] above and .pre-commit-config.yaml
+required-version = "==0.15.12"
+target-version = "py310"
 line-length = 88
 output-format = "full"
 src = ["src", "tests", "examples"]
@@ -272,30 +272,6 @@ author = "Prior Labs GmbH"
 "__init__.py" = ["I002"]
 "examples/*" = ["INP001", "I002", "E741", "D101", "D103", "T20", "D415", "ERA001", "E402", "E501", "BLE001"]
 "docs/*" = ["INP001"]
-"src/tabpfn/architectures/base/*.py" = [
-  # Documentation
-  "D100",
-  "D101",
-  "D102",
-  "D103",
-  "D107",
-]
-# TODO(eddiebergman): There's a lot of typing and ruff problems detected here
-"src/tabpfn/architectures/base/multi_head_attention.py" = [
-]
-"src/tabpfn/architectures/base/encoders.py" = [
-  "PT018",
-  "ARG002",
-  "E501",
-  "ERA001",
-  "F821",
-  "FBT001",
-  "FBT002",
-  "A001",
-]
-"src/tabpfn/architectures/base/preprocessing.py" = [
-  "ANN"
-]
 "src/tabpfn/model_loading.py" = [
   "C901"
 ]
@@ -321,7 +297,7 @@ ignore-decorators = ["typing.override", "typing_extensions.override", "typing.ov
 max-args = 10 # Changed from default of 5
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.10"
 packages = ["src/tabpfn", "tests"]
 
 show_error_codes = true
@@ -349,13 +325,6 @@ disallow_untyped_decorators = false # Test decorators are not properly typed
 disallow_incomplete_defs = false    # Sometimes we just want to ignore verbose types
 disable_error_code = ["var-annotated"]
 
-# TODO(eddiebergman): Too much to deal with right now
-[[tool.mypy.overrides]]
-module = [
-  "tabpfn.architectures.base.multi_head_attention",
-  "tabpfn.architectures.encoders"
-]
-ignore_errors = true
 
 [[tool.mypy.overrides]]
 module = [
@@ -377,7 +346,7 @@ ignore_missing_imports = true
 [tool.pyright]
 include = ["src", "tests"]
 
-pythonVersion = "3.9"
+pythonVersion = "3.10"
 typeCheckingMode = "strict"
 
 strictListInference = true

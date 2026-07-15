@@ -847,6 +847,30 @@ def evaluate_one_dataset(adapter: TabPFNAdapter, dataset_dir: Path) -> ResultRow
     try:
         loaded = load_classification_dataset(dataset_dir)
         task_type = loaded.task_type
+        if loaded.n_classes > TABPFN_CLASS_LIMIT:
+            return ResultRow(
+                dataset_name=loaded.dataset_name,
+                dataset_dir=loaded.dataset_dir.as_posix(),
+                task_type=loaded.task_type,
+                n_train=loaded.n_train_report,
+                n_val=loaded.n_val,
+                n_test=int(len(loaded.y_test)),
+                n_features=int(loaded.X_train.shape[1]),
+                n_classes=loaded.n_classes,
+                accuracy=None,
+                f1=None,
+                balanced_accuracy=None,
+                roc_auc=None,
+                log_loss=None,
+                fit_seconds=0.0,
+                predict_seconds=0.0,
+                status="skip",
+                error=(
+                    f"Skipped because n_classes={loaded.n_classes} exceeds "
+                    f"TabPFN class limit {TABPFN_CLASS_LIMIT}; "
+                    "ManyClassClassifier is not run in this benchmark."
+                ),
+            )
         try:
             result = adapter.fit_predict(loaded)
         except Exception as exc:
@@ -1420,7 +1444,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--data-root",
-        default="../../data178",
+        default="../../data184",
         help="Root directory containing data178-style dataset folders.",
     )
     parser.add_argument(
@@ -1485,7 +1509,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--many-class",
         choices=["auto", "on", "off"],
         default="auto",
-        help="Use the official tabpfn-extensions ManyClassClassifier for >10 classes.",
+        help=(
+            "Legacy many-class wrapper switch. Datasets with >10 classes are "
+            "skipped by this benchmark before model fitting."
+        ),
     )
     parser.add_argument(
         "--many-class-alphabet-size",

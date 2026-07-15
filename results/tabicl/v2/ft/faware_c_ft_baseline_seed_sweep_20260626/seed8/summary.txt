@@ -1,0 +1,15 @@
+discovered_datasets: 200
+processed_datasets: 200
+ok_count: 200
+failed_count: 0
+skipped_count: 0
+ft_oom_fallback_count: 4
+avg_accuracy_ok: 0.855235
+avg_f1_ok: 0.847245
+avg_balanced_accuracy_ok: 0.784690
+avg_roc_auc_ok: 0.911354
+avg_log_loss_ok: 0.338846
+wall_seconds: 5453.577
+failed_datasets: (none)
+skipped_datasets: (none)
+ft_oom_fallback_datasets: Indian_pines, philippine, gas-drift, naticusdroid+android+permissions+dataset

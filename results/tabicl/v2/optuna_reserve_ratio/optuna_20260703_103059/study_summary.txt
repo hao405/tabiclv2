@@ -1,0 +1,8 @@
+study_name: faware_c_reserve_ratio
+total_trials: 5
+completed_trials: 5
+failed_trials: 0
+best_trial_number: 1
+best_value: 0.8590515789250096
+best_ttt_c_reserve_ratio: 0.19014778985134226
+best_out_dir: /home/crc00006699/zh/tabiclv2/results/Faware_C/tabiclv2_optuna_reserve_ratio_20260703_103059/trials/trial_0001_reserve_0p190148

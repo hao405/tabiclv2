@@ -43,9 +43,13 @@ _ResultWithSchema = tuple[npt.NDArray[np.floating], FeatureSchema]
 
 def _make_schema(n_features: int, n_cat: int) -> FeatureSchema:
     """Build a feature schema with ``n_cat`` CATEGORICAL columns first."""
-    features = [Feature(name=None, modality=FeatureModality.CATEGORICAL)] * n_cat + [
-        Feature(name=None, modality=FeatureModality.NUMERICAL)
-    ] * (n_features - n_cat)
+    features = [
+        Feature(name=f"f{i}", modality=FeatureModality.CATEGORICAL)
+        for i in range(n_cat)
+    ] + [
+        Feature(name=f"f{i}", modality=FeatureModality.NUMERICAL)
+        for i in range(n_cat, n_features)
+    ]
     return FeatureSchema(features=features)
 
 
@@ -56,6 +60,7 @@ def _make_config(
     feature_shift_decoder: Literal["shuffle", "rotate"] | None = "shuffle",
     feature_shift_count: int = 3,
     outlier_removal_std: float | None = 12.0,
+    passthrough_inf: bool = False,
 ) -> ClassifierEnsembleConfig:
     return ClassifierEnsembleConfig(
         preprocess_config=pconfig,
@@ -66,6 +71,7 @@ def _make_config(
         feature_shift_decoder=feature_shift_decoder,
         outlier_removal_std=outlier_removal_std,
         _model_index=0,
+        passthrough_inf=passthrough_inf,
     )
 
 
@@ -196,6 +202,32 @@ def _assert_preprocessing_match(
         )
 
 
+def _assert_paths_match(
+    X: npt.NDArray[np.float64],
+    schema: FeatureSchema,
+    config: ClassifierEnsembleConfig,
+    *,
+    torch_dtype: torch.dtype = torch.float32,
+) -> None:
+    """Run both pipelines and assert they agree.
+
+    The fingerprint is recomputed on the GPU path whenever it is enabled, so it
+    is the one column allowed to differ when present.
+    """
+    seed = 42
+    X_cpu, schema_cpu = _run_cpu_only(X, schema, config, seed, torch_dtype=torch_dtype)
+    X_gpu, schema_gpu = _run_cpu_plus_gpu(
+        X, schema, config, seed, torch_dtype=torch_dtype
+    )
+    _assert_preprocessing_match(
+        X_cpu,
+        schema_cpu,
+        X_gpu,
+        schema_gpu,
+        has_fingerprint_on_gpu=config.add_fingerprint_feature,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -233,6 +265,7 @@ class TestGpuQuantileEligibility:
         assert is_gpu_quantile_eligible("quantile_uni")
         assert is_gpu_quantile_eligible("quantile_uni_coarse")
         assert is_gpu_quantile_eligible("quantile_uni_fine")
+        assert is_gpu_quantile_eligible("quantile_uni_extrapolate")
 
     def test_not_eligible(self) -> None:
         assert not is_gpu_quantile_eligible("squashing_scaler_default")
@@ -254,6 +287,9 @@ class TestGpuQuantileEligibility:
 # other platforms we use configs without SVD to keep the consistency tests
 # deterministic.
 _IS_MACOS = sys.platform == "darwin"
+_SVD_MACOS = pytest.mark.skipif(
+    not _IS_MACOS, reason="torch SVD is non-deterministic across LAPACK backends"
+)
 
 
 class TestPipelineConsistency:
@@ -283,6 +319,12 @@ class TestPipelineConsistency:
         categorical_name="onehot",
         max_features_per_estimator=680,
     )
+    # Extrapolating quantile (uses the optional extrapolate_ratio path).
+    V26_QUANTILE_EXTRAPOLATE = PreprocessorConfig(
+        "quantile_uni_extrapolate",
+        categorical_name="numeric",
+        max_features_per_estimator=680,
+    )
     # v2.5 classifier configs (non-quantile)
     V25_SQUASHING_SVD = PreprocessorConfig(
         name="squashing_scaler_default",
@@ -304,6 +346,22 @@ class TestPipelineConsistency:
         max_features_per_estimator=500,
     )
 
+    # Append-original variants exercised by test_config_variations_match.
+    V26_QUANTILE_SVD_APPEND = PreprocessorConfig(
+        "quantile_uni",
+        append_original=True,
+        categorical_name="ordinal_very_common_categories_shuffled",
+        global_transformer_name="svd_quarter_components",
+        max_features_per_estimator=500,
+    )
+    V26_QUANTILE_APPEND_NO_SVD = PreprocessorConfig(
+        "quantile_uni",
+        append_original=True,
+        categorical_name="ordinal_very_common_categories_shuffled",
+        global_transformer_name=None,
+        max_features_per_estimator=500,
+    )
+
     @pytest.mark.parametrize(
         "torch_dtype",
         [torch.float16, torch.float32, torch.float64],
@@ -315,239 +373,155 @@ class TestPipelineConsistency:
             V26_QUANTILE_NUMERIC,
             V26_QUANTILE_NUMERIC_APPEND_ORIGINAL,
             V26_QUANTILE_ONEHOT,
-            pytest.param(
-                V26_QUANTILE_SVD,
-                marks=pytest.mark.skipif(
-                    not _IS_MACOS,
-                    reason="torch SVD is non-deterministic across LAPACK backends",
-                ),
-            ),
+            V26_QUANTILE_EXTRAPOLATE,
+            pytest.param(V26_QUANTILE_SVD, marks=_SVD_MACOS),
+            pytest.param(V25_SQUASHING_SVD, marks=_SVD_MACOS),
+            V25_SQUASHING_NO_SVD,
+            V25_NONE,
         ],
         ids=[
             "v26_quantile_numeric",
             "v26_quantile_numeric_append_original",
             "v26_quantile_onehot",
+            "v26_quantile_extrapolate",
             "v26_quantile_svd",
+            "v25_squashing_svd",
+            "v25_squashing_no_svd",
+            "v25_none",
         ],
     )
-    def test_quantile_configs_match(
+    def test_configs_match(
         self,
         sample_data: _DataWithSchema,
         pconfig: PreprocessorConfig,
         torch_dtype: torch.dtype,
     ) -> None:
+        """Full CPU-only and CPU+GPU pipelines agree for every shipped config."""
         X, schema = sample_data
-        config = _make_config(pconfig)
-        seed = 42
-
-        X_cpu, schema_cpu = _run_cpu_only(
-            X, schema, config, seed, torch_dtype=torch_dtype
-        )
-        X_gpu, schema_gpu = _run_cpu_plus_gpu(
-            X, schema, config, seed, torch_dtype=torch_dtype
-        )
-
-        # Fingerprint hashes differ when quantile is on GPU because the torch
-        # and sklearn quantile transforms produce slightly different boundary
-        # values, which changes the SHA-256 hash input.
-        quantile_on_gpu = is_gpu_quantile_eligible(pconfig.name)
-        _assert_preprocessing_match(
-            X_cpu,
-            schema_cpu,
-            X_gpu,
-            schema_gpu,
-            has_fingerprint_on_gpu=quantile_on_gpu and config.add_fingerprint_feature,
-        )
+        _assert_paths_match(X, schema, _make_config(pconfig), torch_dtype=torch_dtype)
 
     @pytest.mark.parametrize(
-        "torch_dtype",
-        [torch.float16, torch.float32, torch.float64],
-        ids=["f16", "f32", "f64"],
+        "config",
+        [
+            _make_config(V26_QUANTILE_NUMERIC, fingerprint=False),
+            pytest.param(
+                _make_config(V26_QUANTILE_SVD, fingerprint=False), marks=_SVD_MACOS
+            ),
+            _make_config(
+                V26_QUANTILE_NUMERIC,
+                feature_shift_decoder="rotate",
+                feature_shift_count=5,
+            ),
+            _make_config(V26_QUANTILE_NUMERIC, outlier_removal_std=None),
+            pytest.param(_make_config(V26_QUANTILE_SVD_APPEND), marks=_SVD_MACOS),
+            _make_config(V26_QUANTILE_APPEND_NO_SVD),
+        ],
+        ids=[
+            "no_fingerprint",
+            "no_fingerprint_with_svd",
+            "rotate_shuffle",
+            "no_outlier_removal",
+            "append_original_with_svd",
+            "append_original_no_svd",
+        ],
     )
+    def test_config_variations_match(
+        self, sample_data: _DataWithSchema, config: ClassifierEnsembleConfig
+    ) -> None:
+        """Non-default options (fingerprint/shuffle/outlier/append) stay consistent."""
+        X, schema = sample_data
+        _assert_paths_match(X, schema, config)
+
+    @_SVD_MACOS
+    def test_feature_subsampling_matches(
+        self, large_feature_data: _DataWithSchema
+    ) -> None:
+        """Consistency holds once feature subsampling kicks in (600 features)."""
+        X, schema = large_feature_data
+        _assert_paths_match(X, schema, _make_config(self.V26_QUANTILE_SVD))
+
+
+class TestSmallFeatureCounts:
+    """CPU/GPU parity at tiny feature counts, where edge cases hide.
+
+    Pins the SVD step: a no-op for <2 features on CPU, but the torch step used
+    to append a spurious column for single-feature data.
+    """
+
+    @pytest.mark.parametrize("n_features", [1, 2, 3], ids=lambda n: f"{n}feat")
     @pytest.mark.parametrize(
         "pconfig",
         [
-            pytest.param(
-                V25_SQUASHING_SVD,
-                marks=pytest.mark.skipif(
-                    not _IS_MACOS,
-                    reason="torch SVD is non-deterministic across LAPACK backends",
-                ),
-            ),
-            V25_SQUASHING_NO_SVD,
-            V25_NONE,
+            TestPipelineConsistency.V26_QUANTILE_NUMERIC,
+            TestPipelineConsistency.V26_QUANTILE_SVD,
         ],
-        ids=["v25_squashing_svd", "v25_squashing_no_svd", "v25_none"],
+        ids=["quantile_numeric", "quantile_svd"],
     )
-    def test_non_quantile_configs_svd_shuffle_on_gpu(
-        self,
-        sample_data: _DataWithSchema,
-        pconfig: PreprocessorConfig,
-        torch_dtype: torch.dtype,
+    def test_small_feature_count_matches(
+        self, n_features: int, pconfig: PreprocessorConfig
     ) -> None:
-        """For non-quantile transforms, SVD and shuffle still move to GPU."""
-        X, schema = sample_data
-        config = _make_config(pconfig)
-        seed = 42
+        # Only a real SVD (>=2 features) is platform-dependent; the <2-feature
+        # no-op being regression-tested here runs everywhere.
+        if (
+            pconfig is TestPipelineConsistency.V26_QUANTILE_SVD
+            and n_features >= 2
+            and not _IS_MACOS
+        ):
+            pytest.skip("torch SVD is non-deterministic across LAPACK backends")
 
-        X_cpu, schema_cpu = _run_cpu_only(
-            X, schema, config, seed, torch_dtype=torch_dtype
+        rng = np.random.default_rng(42)
+        X = rng.standard_normal((200, n_features)).astype(np.float64)
+        schema = _make_schema(n_features, n_cat=0)
+        config = _make_config(pconfig, feature_shift_count=min(3, n_features))
+        _assert_paths_match(X, schema, config)
+
+
+class TestTestBatchSizeInvariance:
+    """GPU test-time transforms must not depend on the test batch size.
+
+    Mirrors the KV-cache predict path (fit once with a retained cache, then
+    transform X_test alone): TorchSoftClipOutliers used to skip clipping for
+    single-row inputs, so single-sample predict diverged from batched predict.
+    """
+
+    @pytest.mark.parametrize("n_test_rows", [1, 2], ids=lambda n: f"{n}testrows")
+    def test_single_row_test_transform_matches_batch(self, n_test_rows: int) -> None:
+        # `none` config + a gross outlier row so the soft (log-based) clip
+        # visibly engages; an upstream quantile transform would mask it.
+        config = _make_config(TestPipelineConsistency.V25_NONE)
+        static_seed, _ = infer_random_state(42)
+
+        rng = np.random.default_rng(42)
+        X_train = rng.standard_normal((200, 5)).astype(np.float64)
+        X_test = rng.standard_normal((8, 5)).astype(np.float64)
+        X_test[0, :] = 1e3
+
+        cpu_pipe = create_preprocessing_pipeline(
+            config, random_state=static_seed, enable_gpu_preprocessing=True
         )
-        X_gpu, schema_gpu = _run_cpu_plus_gpu(
-            X, schema, config, seed, torch_dtype=torch_dtype
+        cpu_train = cpu_pipe.fit_transform(X_train.copy(), _make_schema(5, 0))
+        cpu_test = cpu_pipe.transform(X_test.copy())
+
+        gpu_pipe = create_gpu_preprocessing_pipeline(
+            config,
+            keep_fitted_cache=True,
+            enable_gpu_preprocessing=True,
+            feature_schema=cpu_train.feature_schema,
+            n_train_samples=cpu_train.X.shape[0],
+            random_state=static_seed,
         )
+        assert gpu_pipe is not None
 
-        _assert_preprocessing_match(
-            X_cpu,
-            schema_cpu,
-            X_gpu,
-            schema_gpu,
-            has_fingerprint_on_gpu=config.add_fingerprint_feature,
-        )
+        # Fit the cache on train, then transform the test rows alone, reusing it.
+        train_t = torch.from_numpy(cpu_train.X.astype(np.float32)).unsqueeze(1)
+        gpu_pipe(train_t, cpu_train.feature_schema, num_train_rows=cpu_train.X.shape[0])
 
-    def test_no_fingerprint(self, sample_data: _DataWithSchema) -> None:
-        """Without fingerprint, all columns should match exactly."""
-        X, schema = sample_data
-        pconfig = self.V26_QUANTILE_NUMERIC
-        config = _make_config(pconfig, fingerprint=False)
-        seed = 42
-
-        X_cpu, schema_cpu = _run_cpu_only(X, schema, config, seed)
-        X_gpu, schema_gpu = _run_cpu_plus_gpu(X, schema, config, seed)
-        _assert_preprocessing_match(
-            X_cpu,
-            schema_cpu,
-            X_gpu,
-            schema_gpu,
-            has_fingerprint_on_gpu=False,
-        )
-
-    @pytest.mark.skipif(
-        not _IS_MACOS, reason="torch SVD non-deterministic across LAPACK backends"
-    )
-    def test_no_fingerprint_with_svd(self, sample_data: _DataWithSchema) -> None:
-        """Without fingerprint, SVD columns should still match on macOS."""
-        X, schema = sample_data
-        pconfig = self.V26_QUANTILE_SVD
-        config = _make_config(pconfig, fingerprint=False)
-        seed = 42
-
-        X_cpu, schema_cpu = _run_cpu_only(X, schema, config, seed)
-        X_gpu, schema_gpu = _run_cpu_plus_gpu(X, schema, config, seed)
-        _assert_preprocessing_match(
-            X_cpu,
-            schema_cpu,
-            X_gpu,
-            schema_gpu,
-            has_fingerprint_on_gpu=False,
-        )
-
-    def test_rotate_shuffle(self, sample_data: _DataWithSchema) -> None:
-        X, schema = sample_data
-        config = _make_config(
-            self.V26_QUANTILE_NUMERIC,
-            feature_shift_decoder="rotate",
-            feature_shift_count=5,
-        )
-        seed = 42
-
-        X_cpu, schema_cpu = _run_cpu_only(X, schema, config, seed)
-        X_gpu, schema_gpu = _run_cpu_plus_gpu(X, schema, config, seed)
-        _assert_preprocessing_match(
-            X_cpu,
-            schema_cpu,
-            X_gpu,
-            schema_gpu,
-            has_fingerprint_on_gpu=config.add_fingerprint_feature,
-        )
-
-    def test_no_outlier_removal(self, sample_data: _DataWithSchema) -> None:
-        X, schema = sample_data
-        config = _make_config(self.V26_QUANTILE_NUMERIC, outlier_removal_std=None)
-        seed = 42
-
-        X_cpu, schema_cpu = _run_cpu_only(X, schema, config, seed)
-        X_gpu, schema_gpu = _run_cpu_plus_gpu(X, schema, config, seed)
-        _assert_preprocessing_match(
-            X_cpu,
-            schema_cpu,
-            X_gpu,
-            schema_gpu,
-            has_fingerprint_on_gpu=config.add_fingerprint_feature,
-        )
-
-    @pytest.mark.skipif(
-        not _IS_MACOS, reason="torch SVD non-deterministic across LAPACK backends"
-    )
-    def test_append_to_original_true_with_svd(
-        self, sample_data: _DataWithSchema
-    ) -> None:
-        """Test append_to_original=True with GPU quantile + SVD (macOS only)."""
-        X, schema = sample_data
-        pconfig = PreprocessorConfig(
-            "quantile_uni",
-            append_original=True,
-            categorical_name="ordinal_very_common_categories_shuffled",
-            global_transformer_name="svd_quarter_components",
-            max_features_per_estimator=500,
-        )
-        config = _make_config(pconfig)
-        seed = 42
-
-        X_cpu, schema_cpu = _run_cpu_only(X, schema, config, seed)
-        X_gpu, schema_gpu = _run_cpu_plus_gpu(X, schema, config, seed)
-
-        _assert_preprocessing_match(
-            X_cpu,
-            schema_cpu,
-            X_gpu,
-            schema_gpu,
-            has_fingerprint_on_gpu=config.add_fingerprint_feature,
-        )
-
-    def test_append_to_original_true_no_svd(self, sample_data: _DataWithSchema) -> None:
-        """Test append_to_original=True with GPU quantile, no SVD."""
-        X, schema = sample_data
-        pconfig = PreprocessorConfig(
-            "quantile_uni",
-            append_original=True,
-            categorical_name="ordinal_very_common_categories_shuffled",
-            global_transformer_name=None,
-            max_features_per_estimator=500,
-        )
-        config = _make_config(pconfig)
-        seed = 42
-
-        X_cpu, schema_cpu = _run_cpu_only(X, schema, config, seed)
-        X_gpu, schema_gpu = _run_cpu_plus_gpu(X, schema, config, seed)
-
-        _assert_preprocessing_match(
-            X_cpu,
-            schema_cpu,
-            X_gpu,
-            schema_gpu,
-            has_fingerprint_on_gpu=config.add_fingerprint_feature,
-        )
-
-    @pytest.mark.skipif(
-        not _IS_MACOS, reason="torch SVD non-deterministic across LAPACK backends"
-    )
-    def test_feature_subsampling(self, large_feature_data: _DataWithSchema) -> None:
-        """Verify consistency if feature subsampling kicks in (macOS only, uses SVD)."""
-        X, schema = large_feature_data
-        pconfig = self.V26_QUANTILE_SVD
-        config = _make_config(pconfig)
-        seed = 42
-
-        X_cpu, schema_cpu = _run_cpu_only(X, schema, config, seed)
-        X_gpu, schema_gpu = _run_cpu_plus_gpu(X, schema, config, seed)
-        _assert_preprocessing_match(
-            X_cpu,
-            schema_cpu,
-            X_gpu,
-            schema_gpu,
-            has_fingerprint_on_gpu=config.add_fingerprint_feature,
-        )
+        test_t = torch.from_numpy(cpu_test.X.astype(np.float32)).unsqueeze(1)
+        batched = gpu_pipe(test_t, cpu_train.feature_schema, use_fitted_cache=True).x
+        single = gpu_pipe(
+            test_t[:n_test_rows], cpu_train.feature_schema, use_fitted_cache=True
+        ).x
+        torch.testing.assert_close(single[:n_test_rows], batched[:n_test_rows])
 
 
 class TestTestDataConsistency:
@@ -630,3 +604,68 @@ class TestTestDataConsistency:
             gpu_out.feature_schema,
             has_fingerprint_on_gpu=True,
         )
+
+
+class TestGpuPipelineInfPassthrough:
+    """+/-inf passthrough through the *factory-built* GPU (torch) pipeline.
+
+    The standalone torch-pipeline tests use hand-built step lists; these drive
+    the real ``create_gpu_preprocessing_pipeline`` output (selective quantile /
+    SVD / shuffle / soft-clip wired from the CPU ``scheduled_gpu_transform``
+    marks) so the CPU->GPU handoff is exercised end to end. Tensors stay on CPU,
+    so this runs in CI; a CUDA twin lives in the estimator tests.
+
+    Infinities are recorded and NaN'd inside each pipeline and written back at
+    the end, so the robust, layout-independent invariant is that the set of rows
+    carrying a +/-inf is exactly the input's (columns get added/reordered/renamed
+    in between).
+    """
+
+    @pytest.mark.parametrize(
+        "preset", ["quantile_uni_coarse", "squashing_scaler_default"]
+    )
+    @pytest.mark.parametrize("global_transformer_name", [None, "svd"])
+    def test_infinities_survive_cpu_plus_gpu_pipeline(
+        self,
+        preset: str,
+        global_transformer_name: str | None,
+    ) -> None:
+        rng = np.random.default_rng(0)
+        X = rng.standard_normal((40, 5)).astype(np.float64)
+        X[3, 1] = np.inf
+        X[7, 2] = -np.inf
+        schema = _make_schema(n_features=5, n_cat=0)
+
+        config = _make_config(
+            PreprocessorConfig(
+                preset,
+                categorical_name="numeric",
+                global_transformer_name=global_transformer_name,
+            ),
+            passthrough_inf=True,
+        )
+
+        X_out, _ = _run_cpu_plus_gpu(X, schema, config, seed=0)
+
+        pos_rows = set(np.where(np.isposinf(X_out).any(axis=1))[0].tolist())
+        neg_rows = set(np.where(np.isneginf(X_out).any(axis=1))[0].tolist())
+        assert pos_rows == {3}
+        assert neg_rows == {7}
+
+    def test_finite_input_stays_finite_through_cpu_plus_gpu_pipeline(self) -> None:
+        """The unconditional inf round-trip fabricates nothing on finite input."""
+        rng = np.random.default_rng(0)
+        X = rng.standard_normal((40, 5)).astype(np.float64)
+        schema = _make_schema(n_features=5, n_cat=0)
+        config = _make_config(
+            PreprocessorConfig(
+                "quantile_uni_coarse",
+                categorical_name="numeric",
+                global_transformer_name="svd",
+            ),
+            passthrough_inf=True,
+        )
+
+        X_out, _ = _run_cpu_plus_gpu(X, schema, config, seed=0)
+
+        assert not np.isinf(X_out).any()
