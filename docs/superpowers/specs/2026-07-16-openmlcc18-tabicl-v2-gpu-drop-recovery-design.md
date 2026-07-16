@@ -49,6 +49,9 @@ Recovery preserves seed 42, TabICL v2 with 32 estimators, one worker, TTT 30
 epochs, learning rate `1e-5`, and patience 8. FT uses selector `random`; F-aware
 FT uses `f_mmd`. Both adaptation methods persist `tabicl_encoded_l2`, and all
 successful adaptation rows must report `ttt_applied=True` without OOM fallback.
+After a confirmed OOM at the original inference batch size 8 on an otherwise
+empty 24 GiB GPU, the approved recovery retry uses batch size 4 while retaining
+32 estimators and every other experiment parameter.
 
 The recovery manifest records the original run ID, source and recovery data
 roots, expected, retained, retried, and replaced dataset names, commands, GPU
