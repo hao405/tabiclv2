@@ -160,6 +160,34 @@ def test_merge_keeps_explicit_persistent_failure(tmp_path: Path):
     assert merged[1]["status"] == "fail"
 
 
+def test_merge_accepts_declared_oom_fallback_but_keeps_it_auditable(tmp_path: Path):
+    module = load_module()
+    result = tmp_path / "tabicl-v2" / "ft" / "seed42" / "all_classification_results.csv"
+    fallback = row("a", method="ft")
+    fallback.update(
+        {
+            "ttt_applied": False,
+            "ttt_oom_fallback": True,
+            "ttt_fallback_reason": "TTT OOM; used original model parameters",
+        }
+    )
+    write_csv(result, [fallback])
+    plan = module.build_cell_plan(
+        matrix_root=tmp_path,
+        method="ft",
+        seed=42,
+        expected_names=["a", "b"],
+    )
+    _, merged = module.merge_rows(
+        plan=plan,
+        recovery_rows=[row("b", method="ft")],
+        expected_names=["a", "b"],
+        recovery_source=tmp_path / "recovery.csv",
+    )
+    assert merged[0]["status"] == "ok"
+    assert module.is_truthy(merged[0]["ttt_oom_fallback"])
+
+
 def test_complete_cell_has_empty_recovery_set(tmp_path: Path):
     module = load_module()
     result = tmp_path / "tabicl-v2" / "infer" / "seed42" / "all_classification_results.csv"
@@ -352,6 +380,40 @@ def test_reusable_task_artifact_and_allocator_environment(tmp_path: Path):
     assert module.recovery_environment()["PYTORCH_CUDA_ALLOC_CONF"] == (
         "expandable_segments:True"
     )
+
+
+def test_latest_task_artifact_prefers_raw_declared_fallback(tmp_path: Path):
+    module = load_module()
+    attempt = (
+        tmp_path
+        / module.MODEL
+        / "ft"
+        / "seed42"
+        / "dataset-a"
+        / "attempt_1"
+    )
+    fallback = row("dataset-a", method="ft")
+    fallback.update(
+        {
+            "ttt_applied": False,
+            "ttt_oom_fallback": True,
+            "ttt_fallback_reason": "TTT OOM; used original model parameters",
+        }
+    )
+    write_csv(attempt / "all_classification_results.csv", [fallback])
+    failed = row("dataset-a", status="fail", method="ft")
+    failed["error"] = "old strict validator rejected fallback"
+    write_csv(attempt / "validated_task_result.csv", [failed])
+    artifact = module.find_latest_task_artifact(
+        recovery_root=tmp_path,
+        method="ft",
+        seed=42,
+        dataset_name="dataset-a",
+    )
+    assert artifact is not None
+    assert artifact.result_csv.name == "all_classification_results.csv"
+    assert artifact.row["status"] == "ok"
+    assert module.is_truthy(artifact.row["ttt_oom_fallback"])
 
 
 def test_expected_initial_inventory_is_14_15_14():

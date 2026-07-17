@@ -157,7 +157,13 @@ def is_truthy(value: object) -> bool:
     return str(value).strip().lower() in TRUTHY
 
 
-def validate_success_row(*, method: str, row: dict[str, str], source: Path) -> None:
+def validate_success_row(
+    *,
+    method: str,
+    row: dict[str, str],
+    source: Path,
+    allow_declared_fallback: bool = False,
+) -> None:
     name = row.get("dataset_name", "").strip()
     if row.get("status", "").strip() != "ok":
         raise ValueError(f"row is not successful for {method}/{name}: {source}")
@@ -171,17 +177,31 @@ def validate_success_row(*, method: str, row: dict[str, str], source: Path) -> N
     if method == "infer":
         return
     expected_selection = EXPECTED_SELECTION[method]
-    if not is_truthy(row.get("ttt_applied")):
-        raise ValueError(f"ttt_applied is not true for {method}/{name}")
-    if is_truthy(row.get("ttt_oom_fallback")):
-        raise ValueError(f"OOM fallback is not allowed for {method}/{name}")
-    for column in ("ttt_fallback_reason", "ttt_c_fallback_reason"):
-        if row.get(column, "").strip():
-            raise ValueError(f"fallback is not allowed for {method}/{name}: {column}")
     if row.get("ttt_c_selection", "").strip() != expected_selection:
         raise ValueError(f"unexpected selector for {method}/{name}")
     if row.get("ttt_c_metric", "").strip() != EXPECTED_METRIC:
         raise ValueError(f"unexpected native metric for {method}/{name}")
+    applied = is_truthy(row.get("ttt_applied"))
+    oom_fallback = is_truthy(row.get("ttt_oom_fallback"))
+    fallback_reasons = [
+        row.get(column, "").strip()
+        for column in ("ttt_fallback_reason", "ttt_c_fallback_reason")
+        if row.get(column, "").strip()
+    ]
+    if applied and not oom_fallback and not fallback_reasons:
+        return
+    if (
+        allow_declared_fallback
+        and not applied
+        and oom_fallback
+        and fallback_reasons
+    ):
+        return
+    if not applied:
+        raise ValueError(f"ttt_applied is not true for {method}/{name}")
+    if oom_fallback:
+        raise ValueError(f"OOM fallback is not allowed for {method}/{name}")
+    raise ValueError(f"fallback is not allowed for {method}/{name}")
 
 
 def validate_complete_tabicl_rows(
@@ -206,7 +226,12 @@ def validate_complete_tabicl_rows(
         raise ValueError(f"non-ok rows in {source}: {bad[:5]}")
     for name, row in by_name.items():
         if row.get("status", "").strip() == "ok":
-            validate_success_row(method=method, row=row, source=source)
+            validate_success_row(
+                method=method,
+                row=row,
+                source=source,
+                allow_declared_fallback=True,
+            )
 
 
 def merge_rows(
@@ -408,7 +433,12 @@ def build_recovery_command(
 
 
 def read_task_artifact(
-    *, result_csv: Path, method: str, dataset_name: str, require_ok: bool
+    *,
+    result_csv: Path,
+    method: str,
+    dataset_name: str,
+    require_ok: bool,
+    allow_declared_fallback: bool = False,
 ) -> dict[str, str]:
     _, rows = read_csv(result_csv)
     sentinels = [
@@ -427,7 +457,12 @@ def read_task_artifact(
     row = by_name[dataset_name]
     status = row.get("status", "").strip()
     if status == "ok":
-        validate_success_row(method=method, row=row, source=result_csv)
+        validate_success_row(
+            method=method,
+            row=row,
+            source=result_csv,
+            allow_declared_fallback=allow_declared_fallback,
+        )
     elif require_ok:
         raise ValueError(f"single-task artifact is not successful: {result_csv}")
     elif status != "fail":
@@ -469,6 +504,43 @@ def find_reusable_success(
             row=row,
             reused=True,
         )
+    return None
+
+
+def find_latest_task_artifact(
+    *, recovery_root: Path, method: str, seed: int, dataset_name: str
+) -> TaskArtifact | None:
+    task_root = recovery_root / MODEL / method / f"seed{seed}" / dataset_name
+    attempts = sorted(
+        task_root.glob("attempt_*"),
+        key=lambda path: int(path.name.removeprefix("attempt_"))
+        if path.name.removeprefix("attempt_").isdigit()
+        else -1,
+        reverse=True,
+    )
+    for attempt_dir in attempts:
+        for filename in ("all_classification_results.csv", "validated_task_result.csv"):
+            result_csv = attempt_dir / filename
+            if not result_csv.is_file():
+                continue
+            try:
+                row = read_task_artifact(
+                    result_csv=result_csv,
+                    method=method,
+                    dataset_name=dataset_name,
+                    require_ok=False,
+                    allow_declared_fallback=True,
+                )
+            except (OSError, ValueError):
+                continue
+            return TaskArtifact(
+                method=method,
+                dataset_name=dataset_name,
+                attempt_dir=attempt_dir,
+                result_csv=result_csv,
+                row=row,
+                reused=True,
+            )
     return None
 
 
@@ -855,6 +927,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--methods", nargs="+", choices=METHODS, default=list(METHODS))
     parser.add_argument("--gpu-min-free-ratio", type=float, default=0.90)
+    parser.add_argument(
+        "--merge-only",
+        action="store_true",
+        help="Merge the latest isolated task artifacts without launching model processes.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -894,10 +971,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         except BlockingIOError as exc:
             raise RuntimeError("another targeted recovery process is already running") from exc
         repaired_transactions = repair_pending_transactions(recovery_root)
-        gpu_audit = audit_gpu(
-            devices=args.devices,
-            minimum_free_ratio=args.gpu_min_free_ratio,
-        )
+        if not args.merge_only:
+            gpu_audit = audit_gpu(
+                devices=args.devices,
+                minimum_free_ratio=args.gpu_min_free_ratio,
+            )
 
     plans = [
         build_cell_plan(
@@ -929,14 +1007,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         plans=plans,
         data_root=args.data_root,
     )
+    execution_schedule = [] if args.merge_only else schedule
     for plan in plans:
         print(
             f"recovery_plan: method={plan.method} retained={len(plan.retained_rows)} "
             f"retry={len(plan.recovery_names)} names={','.join(plan.recovery_names) or '(none)'}"
         )
     print(f"preflight_dataset: {preflight_dataset or '(none)'}")
-    print(f"isolated_process_count: {len(schedule)}")
-    for method, dataset_name in schedule:
+    print(f"isolated_process_count: {len(execution_schedule)}")
+    print(f"merge_only: {args.merge_only}")
+    for method, dataset_name in execution_schedule:
         attempt_dir = next_task_attempt_dir(
             recovery_root, method, args.seed, dataset_name
         )
@@ -978,18 +1058,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         "current_inventory": inventory,
         "preflight_dataset": preflight_dataset,
-        "isolated_process_count": len(schedule),
+        "preflight_status": previous_manifest.get("preflight_status") if args.merge_only else None,
+        "isolated_process_count": (
+            previous_manifest.get("isolated_process_count", len(schedule))
+            if args.merge_only
+            else len(execution_schedule)
+        ),
+        "merge_only_process_count": len(execution_schedule),
+        "merge_only": args.merge_only,
         "started_at": now(),
         "cells": [],
-        "tasks": [],
+        "tasks": list(previous_manifest.get("tasks", [])) if args.merge_only else [],
         "attempt_history": prior_history,
     }
     write_recovery_manifest(manifest_path, payload)
     artifacts: dict[tuple[str, str], TaskArtifact] = {}
+    if args.merge_only:
+        for plan in plans:
+            for dataset_name in plan.recovery_names:
+                artifact = find_latest_task_artifact(
+                    recovery_root=recovery_root,
+                    method=plan.method,
+                    seed=args.seed,
+                    dataset_name=dataset_name,
+                )
+                if artifact is None:
+                    raise FileNotFoundError(
+                        f"no reusable task artifact for {plan.method}/{dataset_name}"
+                    )
+                artifacts[(plan.method, dataset_name)] = artifact
     preflight_count = sum(
-        dataset_name == preflight_dataset for _, dataset_name in schedule
+        dataset_name == preflight_dataset for _, dataset_name in execution_schedule
     )
-    for index, (method, dataset_name) in enumerate(schedule):
+    for index, (method, dataset_name) in enumerate(execution_schedule):
         plan = plan_by_method[method]
         reusable = find_reusable_success(
             recovery_root=recovery_root,
