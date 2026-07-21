@@ -25,9 +25,9 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-DEFAULT_DATA_ROOT = Path("data200")
-DEFAULT_MODEL_PATH = "tabicl-classifier-v1.1-20250506.ckpt"
-DEFAULT_CHECKPOINT_VERSION = "tabicl-classifier-v1.1-20250506.ckpt"
+DEFAULT_DATA_ROOT = Path("data184")
+DEFAULT_MODEL_PATH = "tabicl-classifier-v2-20260212.ckpt"
+DEFAULT_CHECKPOINT_VERSION = "tabicl-classifier-v2-20260212.ckpt"
 DEFAULT_OUT_DIR_ROOT = Path("1b_result")
 CLASSIFICATION_TASKS = {"binclass", "multiclass"}
 CATEGORICAL_MISSING_TOKEN = "__tabicl_missing__"
@@ -133,6 +133,11 @@ class TTTConfig:
     c_class_balance: bool = True
     c_reserve_ratio: float = 0.4
     crumb_bandwidth: str = "median"
+    crumb_rff_dim: int = 64
+    crumb_greedy_batch_size: int = 500
+    crumb_mmd_check_interval: int = 500
+    crumb_early_stop_epsilon: float = 1e-4
+    crumb_early_stop_patience: int = 5
 
 
 @dataclass
@@ -203,6 +208,13 @@ class CSelectionContext:
     reserved_context_score_sum: float = 0.0
     reserved_context_score_sumsq: float = 0.0
     reserved_context_score_count: int = 0
+    query_candidate_indices: Any = None
+    context_only_indices: Any = None
+    crumb_candidate_count: int = 0
+    crumb_max_candidate_count: int = 0
+    crumb_final_mmd2: Optional[float] = None
+    crumb_early_stopped: bool = False
+    crumb_early_stop_checks: int = 0
 
 
 @dataclass
@@ -932,6 +944,16 @@ def build_ttt_config(args: argparse.Namespace) -> TTTConfig:
             raise ValueError("--ttt-crumb-bandwidth must be 'median' or a positive float") from exc
         if crumb_bandwidth <= 0.0 or not math.isfinite(crumb_bandwidth):
             raise ValueError("--ttt-crumb-bandwidth must be 'median' or a positive finite float")
+    if int(args.ttt_crumb_rff_dim) < 1:
+        raise ValueError("--ttt-crumb-rff-dim must be >= 1")
+    if int(args.ttt_crumb_greedy_batch_size) < 1:
+        raise ValueError("--ttt-crumb-greedy-batch-size must be >= 1")
+    if int(args.ttt_crumb_mmd_check_interval) < 1:
+        raise ValueError("--ttt-crumb-mmd-check-interval must be >= 1")
+    if float(args.ttt_crumb_early_stop_epsilon) < 0.0:
+        raise ValueError("--ttt-crumb-early-stop-epsilon must be >= 0")
+    if int(args.ttt_crumb_early_stop_patience) < 1:
+        raise ValueError("--ttt-crumb-early-stop-patience must be >= 1")
 
     return TTTConfig(
         enabled=bool(args.ttt_enabled),
@@ -975,6 +997,11 @@ def build_ttt_config(args: argparse.Namespace) -> TTTConfig:
         c_class_balance=bool(args.ttt_c_class_balance),
         c_reserve_ratio=float(args.ttt_c_reserve_ratio),
         crumb_bandwidth=str(args.ttt_crumb_bandwidth),
+        crumb_rff_dim=int(args.ttt_crumb_rff_dim),
+        crumb_greedy_batch_size=int(args.ttt_crumb_greedy_batch_size),
+        crumb_mmd_check_interval=int(args.ttt_crumb_mmd_check_interval),
+        crumb_early_stop_epsilon=float(args.ttt_crumb_early_stop_epsilon),
+        crumb_early_stop_patience=int(args.ttt_crumb_early_stop_patience),
     )
 
 
@@ -1253,116 +1280,282 @@ def _resolve_crumb_rbf_sigma(X_candidates, X_reference, bandwidth: str, seed: in
     return sigma if math.isfinite(sigma) and sigma > 0.0 else 1.0
 
 
-def _rbf_mean_affinity(X_candidates, X_reference, sigma: float) -> Any:
-    X_candidates = np.asarray(X_candidates, dtype=np.float64)
-    X_reference = np.asarray(X_reference, dtype=np.float64)
-    if X_candidates.ndim == 1:
-        X_candidates = X_candidates.reshape(-1, 1)
-    if X_reference.ndim == 1:
-        X_reference = X_reference.reshape(-1, 1)
-    if len(X_candidates) == 0 or len(X_reference) == 0:
-        return np.zeros(len(X_candidates), dtype=np.float64)
-    denom = max(2.0 * float(sigma) * float(sigma), np.finfo(np.float64).tiny)
-    affinities = np.zeros(len(X_candidates), dtype=np.float64)
-    row_start = 0
-    for distances in _pairwise_squared_distances_chunked(X_candidates, X_reference):
-        row_end = row_start + distances.shape[0]
-        affinities[row_start:row_end] = np.mean(np.exp(-distances / denom), axis=1)
-        row_start = row_end
-    return np.nan_to_num(affinities, nan=0.0, posinf=0.0, neginf=0.0)
+def _crumb_rff_features(X_rows, omega, phase, *, chunk_size: int = 8192) -> Any:
+    X_arr = np.asarray(X_rows, dtype=np.float64)
+    if X_arr.ndim == 1:
+        X_arr = X_arr.reshape(-1, 1)
+    rff_dim = int(omega.shape[1])
+    scale = math.sqrt(2.0 / float(rff_dim))
+    features = np.empty((len(X_arr), rff_dim), dtype=np.float32)
+    for start in range(0, len(X_arr), int(chunk_size)):
+        stop = min(len(X_arr), start + int(chunk_size))
+        projected = X_arr[start:stop] @ omega + phase
+        features[start:stop] = (scale * np.cos(projected)).astype(np.float32, copy=False)
+    return features
 
 
-def _select_crumb_mmd_query_indices(
-    y_chunk,
-    X_chunk_for_selection,
+def _crumb_mmd2(reference_mean, selected_sum, selected_count: int) -> float:
+    if int(selected_count) <= 0:
+        return float("inf")
+    selected_mean = np.asarray(selected_sum, dtype=np.float64) / float(selected_count)
+    delta = np.asarray(reference_mean, dtype=np.float64) - selected_mean
+    return float(np.dot(delta, delta))
+
+
+def build_crumb_mmd_query_candidate_pool(
+    X_train_for_selection,
+    selection_context: CSelectionContext | None,
     *,
+    config: TTTConfig,
+) -> None:
+    """Build one dataset-level, label-free CRUMB query-candidate pool."""
+    ensure_runtime_deps()
+    if selection_context is None or selection_context.reference is None:
+        return
+
+    X_arr = np.asarray(X_train_for_selection, dtype=np.float64)
+    reference = np.asarray(selection_context.reference, dtype=np.float64)
+    if X_arr.ndim == 1:
+        X_arr = X_arr.reshape(-1, 1)
+    if reference.ndim == 1:
+        reference = reference.reshape(-1, 1)
+    n_train = int(len(X_arr))
+    if n_train < 2 or len(reference) == 0:
+        return
+
+    max_candidates = n_train - 1
+    rff_dim = int(config.crumb_rff_dim)
+    greedy_batch_size = int(config.crumb_greedy_batch_size)
+    check_interval = int(config.crumb_mmd_check_interval)
+    epsilon = float(config.crumb_early_stop_epsilon)
+    patience = int(config.crumb_early_stop_patience)
+    warmup = max(100, int(math.ceil(max_candidates / 10.0)))
+
+    sigma = _resolve_crumb_rbf_sigma(
+        X_arr,
+        reference,
+        config.crumb_bandwidth,
+        config.random_state,
+    )
+    rng = np.random.default_rng(config.random_state)
+    omega = rng.normal(
+        loc=0.0,
+        scale=1.0 / float(sigma),
+        size=(X_arr.shape[1], rff_dim),
+    )
+    phase = rng.uniform(0.0, 2.0 * math.pi, size=(rff_dim,))
+    train_rff = _crumb_rff_features(X_arr, omega, phase)
+    reference_rff = _crumb_rff_features(reference, omega, phase)
+    reference_mean = np.mean(reference_rff, axis=0, dtype=np.float64)
+    cross_term = -2.0 * (train_rff @ reference_mean)
+
+    selected_mask = np.zeros(n_train, dtype=bool)
+    selected: list[int] = []
+    selected_sum = np.zeros(rff_dim, dtype=np.float64)
+    checkpoint_mmd2: dict[int, float] = {}
+    low_improvement_streak = 0
+    eligible_checks = 0
+    early_stopped = False
+
+    while len(selected) < max_candidates:
+        selected_count = len(selected)
+        if selected_count:
+            redundancy = (2.0 / float(selected_count + 1)) * (train_rff @ selected_sum)
+            scores = cross_term + redundancy
+        else:
+            scores = np.array(cross_term, copy=True)
+        scores[selected_mask] = np.inf
+
+        batch_take = min(greedy_batch_size, max_candidates - selected_count)
+        finite_count = int(np.count_nonzero(np.isfinite(scores)))
+        if finite_count <= 0:
+            break
+        batch_take = min(batch_take, finite_count)
+        batch_idx = np.argpartition(scores, batch_take - 1)[:batch_take]
+        batch_idx = batch_idx[np.argsort(scores[batch_idx], kind="stable")]
+
+        for raw_idx in batch_idx.tolist():
+            idx = int(raw_idx)
+            if selected_mask[idx]:
+                continue
+            selected_mask[idx] = True
+            selected.append(idx)
+            selected_sum += np.asarray(train_rff[idx], dtype=np.float64)
+            current_count = len(selected)
+
+            if current_count % check_interval != 0:
+                continue
+            current_mmd2 = _crumb_mmd2(reference_mean, selected_sum, current_count)
+            checkpoint_mmd2[current_count] = current_mmd2
+            previous_count = current_count - check_interval
+            if current_count < warmup or previous_count not in checkpoint_mmd2:
+                continue
+
+            previous_mmd2 = checkpoint_mmd2[previous_count]
+            relative_improvement = (previous_mmd2 - current_mmd2) / max(
+                previous_mmd2,
+                np.finfo(np.float64).tiny,
+            )
+            eligible_checks += 1
+            if relative_improvement < epsilon:
+                low_improvement_streak += 1
+            else:
+                low_improvement_streak = 0
+            if low_improvement_streak >= patience:
+                early_stopped = True
+                break
+
+        if early_stopped:
+            break
+
+    candidate_indices = np.asarray(selected, dtype=int)
+    context_only_indices = np.flatnonzero(~selected_mask).astype(int, copy=False)
+    final_mmd2 = _crumb_mmd2(reference_mean, selected_sum, len(selected))
+    selection_context.query_candidate_indices = candidate_indices
+    selection_context.context_only_indices = context_only_indices
+    selection_context.crumb_candidate_count = int(len(candidate_indices))
+    selection_context.crumb_max_candidate_count = int(max_candidates)
+    selection_context.crumb_final_mmd2 = float(final_mmd2)
+    selection_context.crumb_early_stopped = bool(early_stopped)
+    selection_context.crumb_early_stop_checks = int(eligible_checks)
+
+
+def _stratified_candidate_sample(
+    y_chunk,
+    candidate_local,
+    *,
+    query_size: int,
+    seed: int,
+    class_balance: bool,
+) -> Any:
+    y_arr = np.asarray(y_chunk).astype(int)
+    candidate_local = np.asarray(candidate_local, dtype=int)
+    rng = np.random.default_rng(seed)
+    requested = max(1, min(int(query_size), len(y_arr) - 1))
+    if len(candidate_local) == 0:
+        return np.array([], dtype=int)
+
+    shuffled = candidate_local[rng.permutation(len(candidate_local))]
+    if not class_balance:
+        safe = _class_balanced_order(shuffled.tolist(), y_arr, requested)
+        return np.asarray(safe[:requested], dtype=int)
+
+    labels, chunk_counts = np.unique(y_arr, return_counts=True)
+    chunk_count_by_label = {
+        int(label): int(count)
+        for label, count in zip(labels.tolist(), chunk_counts.tolist())
+    }
+    groups: dict[int, Any] = {}
+    caps: dict[int, int] = {}
+    for label in np.unique(y_arr[candidate_local]).tolist():
+        group = candidate_local[y_arr[candidate_local] == int(label)]
+        group = group[rng.permutation(len(group))]
+        groups[int(label)] = group
+        caps[int(label)] = min(
+            int(len(group)),
+            max(0, chunk_count_by_label[int(label)] - 1),
+        )
+
+    feasible = min(requested, sum(caps.values()))
+    if feasible <= 0:
+        return np.array([], dtype=int)
+
+    total_candidates = float(len(candidate_local))
+    ideal = {
+        label: feasible * len(group) / total_candidates
+        for label, group in groups.items()
+    }
+    allocation = {
+        label: min(caps[label], int(math.floor(ideal[label])))
+        for label in groups
+    }
+    remaining = feasible - sum(allocation.values())
+    tie_break = {label: float(rng.random()) for label in groups}
+    while remaining > 0:
+        available = [
+            label
+            for label in groups
+            if allocation[label] < caps[label]
+        ]
+        if not available:
+            break
+        label = max(
+            available,
+            key=lambda item: (
+                ideal[item] - allocation[item],
+                tie_break[item],
+            ),
+        )
+        allocation[label] += 1
+        remaining -= 1
+
+    selected = np.concatenate(
+        [groups[label][: allocation[label]] for label in sorted(groups) if allocation[label] > 0]
+    )
+    return selected[rng.permutation(len(selected))].astype(int, copy=False)
+
+
+def _select_crumb_candidate_query_indices(
+    y_chunk,
+    *,
+    global_indices,
     query_size: int,
     seed: int,
     config: TTTConfig,
     selection_context: CSelectionContext | None,
 ) -> CSelectionResult | None:
-    if selection_context is None or selection_context.reference is None or len(selection_context.reference) == 0:
+    if selection_context is None or selection_context.query_candidate_indices is None:
         return None
 
-    X_arr = np.asarray(X_chunk_for_selection, dtype=np.float64)
-    if X_arr.ndim == 1:
-        X_arr = X_arr.reshape(-1, 1)
-    reference = np.asarray(selection_context.reference, dtype=np.float64)
-    if reference.ndim == 1:
-        reference = reference.reshape(-1, 1)
-
-    n = int(len(y_chunk))
-    if n < 2:
-        return None
-    query_size = max(1, min(int(query_size), n - 1))
-    y_arr = np.asarray(y_chunk).astype(int)
-    sigma = _resolve_crumb_rbf_sigma(X_arr, reference, config.crumb_bandwidth, seed)
-    cross_affinity = _rbf_mean_affinity(X_arr, reference, sigma)
-
-    remaining = list(range(n))
-    selected: list[int] = []
-    selected_scores: list[float] = []
-    selected_per_label: dict[int, int] = {}
-    per_label_cap: dict[int, int] = {}
-    if config.c_class_balance:
-        labels, counts = np.unique(y_arr, return_counts=True)
-        per_label_cap = {int(label): max(0, int(count) - 1) for label, count in zip(labels, counts)}
-        selected_per_label = {label: 0 for label in per_label_cap}
-
-    denom = max(2.0 * float(sigma) * float(sigma), np.finfo(np.float64).tiny)
-    for _ in range(query_size):
-        best_pos = None
-        best_score = None
-        next_n = len(selected) + 1
-        selected_arr = X_arr[np.asarray(selected, dtype=int)] if selected else None
-        for pos, idx in enumerate(remaining):
-            label = int(y_arr[idx])
-            if config.c_class_balance and selected_per_label.get(label, 0) >= per_label_cap.get(label, 0):
-                continue
-            redundancy = 0.0
-            if selected_arr is not None and len(selected_arr) > 0:
-                distances = next(_pairwise_squared_distances_chunked(X_arr[idx : idx + 1], selected_arr, chunk_size=1))
-                redundancy = float(np.sum(np.exp(-distances[0] / denom)))
-            score = float(-2.0 * cross_affinity[idx] + (2.0 / float(next_n)) * redundancy)
-            if best_score is None or score < best_score:
-                best_score = score
-                best_pos = pos
-
-        if best_pos is None:
-            break
-        idx = int(remaining.pop(best_pos))
-        selected.append(idx)
-        selected_scores.append(float(best_score))
-        if config.c_class_balance:
-            label = int(y_arr[idx])
-            selected_per_label[label] = selected_per_label.get(label, 0) + 1
-
-    if len(selected) < query_size:
+    global_indices_arr = np.asarray(global_indices, dtype=int)
+    candidate_global = set(
+        np.asarray(selection_context.query_candidate_indices, dtype=int).tolist()
+    )
+    candidate_local = np.asarray(
+        [
+            local_idx
+            for local_idx, global_idx in enumerate(global_indices_arr)
+            if int(global_idx) in candidate_global
+        ],
+        dtype=int,
+    )
+    requested = max(1, min(int(query_size), len(global_indices_arr) - 1))
+    qry_idx = _stratified_candidate_sample(
+        y_chunk,
+        candidate_local,
+        query_size=requested,
+        seed=seed,
+        class_balance=bool(config.c_class_balance),
+    )
+    if len(qry_idx) == 0:
         return CSelectionResult(
             ctx_idx=np.array([], dtype=int),
             qry_idx=np.array([], dtype=int),
-            split_strategy="crumb_mmd:fallback",
-            distance_sum=float(np.sum(selected_scores)) if selected_scores else 0.0,
-            distance_sumsq=float(np.sum(np.asarray(selected_scores, dtype=np.float64) ** 2)) if selected_scores else 0.0,
-            distance_count=int(len(selected_scores)),
-            fallback_reason=f"crumb_mmd produced only {len(selected)}/{query_size} query rows",
+            split_strategy="crumb_mmd_global_candidates:fallback",
+            fallback_reason="current chunk has no label-safe CRUMB query candidates",
             label_coverage_ok=False,
         )
 
-    qry_idx = np.asarray(selected[:query_size], dtype=int)
     qry_set = set(qry_idx.tolist())
-    ctx_idx = np.asarray([idx for idx in range(n) if idx not in qry_set], dtype=int)
+    ctx_idx = np.asarray(
+        [idx for idx in range(len(global_indices_arr)) if idx not in qry_set],
+        dtype=int,
+    )
     coverage_ok = _has_query_label_coverage(y_chunk, ctx_idx, qry_idx)
-    selected_scores_arr = np.asarray(selected_scores[:query_size], dtype=np.float64)
-    bandwidth_label = config.crumb_bandwidth if str(config.crumb_bandwidth) == "median" else f"{sigma:g}"
+    fallback_reason = None
+    if len(qry_idx) < requested:
+        fallback_reason = (
+            f"CRUMB candidate pool safely truncated query rows "
+            f"from {requested} to {len(qry_idx)}"
+        )
     return CSelectionResult(
         ctx_idx=ctx_idx,
         qry_idx=qry_idx,
-        split_strategy=f"crumb_mmd:{config.c_source}:{config.c_metric}:rbf:{bandwidth_label}",
-        distance_sum=float(np.sum(selected_scores_arr)),
-        distance_sumsq=float(np.sum(selected_scores_arr * selected_scores_arr)),
-        distance_count=int(len(selected_scores_arr)),
-        fallback_reason=None if coverage_ok else "crumb_mmd query labels absent from context",
+        split_strategy=(
+            f"crumb_mmd_global_candidates:{config.c_source}:{config.c_metric}:"
+            f"rff{config.crumb_rff_dim}:stratified"
+        ),
+        fallback_reason=fallback_reason,
         label_coverage_ok=coverage_ok,
     )
 
@@ -1585,18 +1778,22 @@ def _select_ctx_query_for_chunk(
             label_coverage_ok=False,
         )
     elif config.c_selection == "crumb_mmd":
-        selected = _select_crumb_mmd_query_indices(
+        selected = _select_crumb_candidate_query_indices(
             y_chunk,
-            X_chunk_for_selection,
+            global_indices=global_indices,
             query_size=query_size,
             seed=seed,
             config=config,
             selection_context=selection_context,
         )
-        if selected is not None and selected.label_coverage_ok:
+        if selected is not None:
             return selected
-        fallback_reason = (
-            selected.fallback_reason if selected is not None and selected.fallback_reason else "missing CRUMB-aware selection context"
+        return CSelectionResult(
+            ctx_idx=np.array([], dtype=int),
+            qry_idx=np.array([], dtype=int),
+            split_strategy="crumb_mmd_global_candidates:fallback",
+            fallback_reason="missing global CRUMB query-candidate pool",
+            label_coverage_ok=False,
         )
     elif config.c_selection in {"f_nearest", "f_density_mixed"}:
         selected = _select_faware_query_indices(
@@ -2363,6 +2560,36 @@ def run_ttt_epoch_chunk_update(
             selection_context,
             reserve_ratio=config.c_reserve_ratio,
         )
+    elif config.c_selection == "crumb_mmd":
+        build_crumb_mmd_query_candidate_pool(
+            transform_chunk_for_c_selection(X_encoded, selection_context),
+            selection_context,
+            config=config,
+        )
+        if selection_context is None or selection_context.query_candidate_indices is None:
+            return TTTUpdateResult(
+                applied=False,
+                loss=None,
+                steps=0,
+                update_seconds=time.time() - update_start,
+                wise_ft=bool(config.wise_ft),
+                wise_alpha=wise_alpha_for_dataset,
+                reason="Unable to build the global CRUMB query-candidate pool",
+                epochs=0,
+                chunks_per_epoch=0,
+            )
+        print(
+            f"[crumb-pool] model={model_name} dataset={dataset_name} "
+            f"candidates={selection_context.crumb_candidate_count}/"
+            f"{selection_context.crumb_max_candidate_count} "
+            f"context_only={len(selection_context.context_only_indices)} "
+            f"rff_dim={config.crumb_rff_dim} "
+            f"greedy_batch={config.crumb_greedy_batch_size} "
+            f"final_mmd2={selection_context.crumb_final_mmd2:.8g} "
+            f"early_stopped={selection_context.crumb_early_stopped} "
+            f"eligible_checks={selection_context.crumb_early_stop_checks}",
+            flush=True,
+        )
     chunks_per_epoch = count_ttt_chunks(
         int(len(y_encoded)),
         max_chunk_size=config.max_chunk_size,
@@ -2920,8 +3147,13 @@ def evaluate_one_dataset(
                         ttt_split_reason += f" | f_mmd_reserved_context={reserve_pct:g}% source=test"
                     elif ttt_config.c_selection == "crumb_mmd":
                         ttt_split_reason += (
-                            f" | crumb_mmd_kernel=rbf bandwidth={ttt_config.crumb_bandwidth}"
-                            " source=test"
+                            f" | crumb_mmd_kernel=rff bandwidth={ttt_config.crumb_bandwidth}"
+                            f" rff_dim={ttt_config.crumb_rff_dim}"
+                            f" greedy_batch={ttt_config.crumb_greedy_batch_size}"
+                            f" mmd_check={ttt_config.crumb_mmd_check_interval}"
+                            f" mmd_epsilon={ttt_config.crumb_early_stop_epsilon:g}"
+                            f" mmd_patience={ttt_config.crumb_early_stop_patience}"
+                            " source=test global_candidate_pool=true"
                         )
                 if ttt_config.wise_ft:
                     if apply_wise_for_dataset:
@@ -3597,7 +3829,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-version", default=DEFAULT_CHECKPOINT_VERSION)
     parser.add_argument(
         "--out-dir",
-        default="results/CRUMB_C/Tabiclv1.1_CRUMB_aware_C_standardized_l2_data200",
+        default="results/tabicl/v2_CRUMB_184_200_100",
         help=(
             "Output directory. If omitted, generate one under 1b_result from "
             "TabICL version, dataset label, model parameters, TTT eval metric, "
@@ -3606,7 +3838,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--gpus", default=None)
-    parser.add_argument("--gpu-groups", default="0;1")
+    parser.add_argument("--gpu-groups", default="1;2")
     parser.add_argument("--n-estimators", type=int, default=32)
     parser.add_argument("--batch-size", type=parse_optional_int, default=8)
     parser.add_argument("--kv-cache", type=parse_kv_cache, default=False)
@@ -3694,7 +3926,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "the original 1C_Chunk_TTT.py split behavior; f_nearest/f_density_mixed choose C "
             "by matching an unlabeled validation/test reference distribution; f_mmd reserves "
             "the farthest --ttt-c-reserve-ratio train rows from the test distribution as context-only rows; "
-            "crumb_mmd uses CRUMB-style RBF-kernel MMD herding to choose query rows."
+            "crumb_mmd builds one global CRUMB-style RFF greedy-MMD query-candidate pool, "
+            "then stratified-samples per-epoch query rows only from that pool."
         ),
     )
     parser.add_argument(
@@ -3721,6 +3954,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--ttt-crumb-bandwidth",
         default="median",
         help="Gaussian RBF bandwidth for --ttt-c-selection=crumb_mmd. Use 'median' or a positive float.",
+    )
+    parser.add_argument(
+        "--ttt-crumb-rff-dim",
+        type=int,
+        default=64,
+        help="Random Fourier Feature dimension for the global CRUMB greedy-MMD candidate pool.",
+    )
+    parser.add_argument(
+        "--ttt-crumb-greedy-batch-size",
+        type=int,
+        default=200,
+        help="Number of lowest-scoring candidates committed before refreshing the CRUMB redundancy term.",
+    )
+    parser.add_argument(
+        "--ttt-crumb-mmd-check-interval",
+        type=int,
+        default=100,
+        help="Evaluate the global candidate-pool squared MMD after this many newly selected rows.",
+    )
+    parser.add_argument(
+        "--ttt-crumb-early-stop-epsilon",
+        type=float,
+        default=1e-4,
+        help="Minimum relative squared-MMD improvement required at a CRUMB early-stop check.",
+    )
+    parser.add_argument(
+        "--ttt-crumb-early-stop-patience",
+        type=int,
+        default=5,
+        help="Consecutive low-improvement CRUMB checks required before candidate selection stops.",
     )
     parser.add_argument(
         "--ttt-c-reserve-ratio",

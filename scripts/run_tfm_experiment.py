@@ -4,12 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -17,7 +21,10 @@ from typing import Sequence
 
 
 MODEL_CHOICES = ("tabicl-v1.1", "tabicl-v2", "tabpfn-v2", "tabpfn-v3")
+DEFAULT_MATRIX_MODELS = ("tabicl-v2", "tabpfn-v3")
 METHOD_CHOICES = ("infer", "ft", "faware_ft")
+DEFAULT_DATA_ROOT = "openml_cc18"
+DEFAULT_OPENML_MAX_CLASSES = 10
 TABICL_MODELS = {"tabicl-v1.1", "tabicl-v2"}
 TABPFN_MODELS = {"tabpfn-v2", "tabpfn-v3"}
 
@@ -55,7 +62,10 @@ class LaunchSpec:
     metric: str | None
     checkpoint: str | None
     runner: str
+    source_data_root: str
     data_root: str
+    dataset_max_classes: int | None
+    dataset_view_manifest: str | None
     out_dir: str
     run_id: str
     workers: int
@@ -66,6 +76,17 @@ class LaunchSpec:
     passthrough_args: list[str]
 
 
+@dataclass(frozen=True)
+class DatasetContext:
+    source_root: Path
+    effective_root: Path
+    max_classes: int | None
+    view_manifest: Path | None
+    source_count: int
+    included_count: int
+    excluded_count: int
+
+
 def repo_root_from_script() -> Path:
     return Path(__file__).resolve().parents[1]
 
@@ -74,7 +95,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Launch one TabICL/TabPFN model x method experiment. "
-            "The ft method uses random context/query selection; faware_ft uses f_mmd."
+            "The ft method uses random context/query selection; faware_ft uses "
+            "f_test_centroid_reserve."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -83,7 +105,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--matrix",
         action="store_true",
-        help="Run the fixed 4-model x 3-method matrix sequentially on one data root.",
+        help="Run the default 2-model x 3-method matrix sequentially on one data root.",
     )
     parser.add_argument(
         "--matrix-resume",
@@ -109,7 +131,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional method subset for --matrix; defaults to the fixed full method axis.",
     )
-    parser.add_argument("--data-root", default="data184")
+    parser.add_argument("--data-root", default=DEFAULT_DATA_ROOT)
+    parser.add_argument(
+        "--dataset-max-classes",
+        type=int,
+        default=None,
+        help=(
+            "Materialize a symlink dataset view containing tasks with at most this "
+            "many training classes. The default OpenML-CC18 root implicitly uses 10; "
+            "set 0 to disable filtering."
+        ),
+    )
+    parser.add_argument(
+        "--dataset-names",
+        nargs="+",
+        default=None,
+        help="Optional exact dataset-name subset, materialized as the same read-only view.",
+    )
     parser.add_argument("--out-dir", default=None)
     parser.add_argument("--output-root", default="results/managed_experiments")
     parser.add_argument(
@@ -193,6 +231,249 @@ def resolve_path(value: str | Path, repo_root: Path) -> Path:
     return path.resolve()
 
 
+def _finite_numeric(array: object) -> bool:
+    import numpy as np
+
+    value = np.asarray(array)
+    return not np.issubdtype(value.dtype, np.number) or bool(np.isfinite(value).all())
+
+
+def inspect_dataset_directory(dataset_dir: Path) -> dict[str, object]:
+    import numpy as np
+
+    required = [
+        "info.json",
+        *[
+            f"{prefix}_{split}.npy"
+            for split in ("train", "val", "test")
+            for prefix in ("N", "C", "y")
+        ],
+    ]
+    missing = [name for name in required if not (dataset_dir / name).is_file()]
+    if missing:
+        raise ValueError(f"{dataset_dir.name} missing benchmark files: {missing}")
+    try:
+        info = json.loads((dataset_dir / "info.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid info.json in {dataset_dir}") from exc
+    if not isinstance(info, dict):
+        raise ValueError(f"info.json must contain an object: {dataset_dir}")
+
+    labels: dict[str, object] = {}
+    numeric_features: int | None = None
+    categorical_features: int | None = None
+    split_rows: dict[str, int] = {}
+    for split in ("train", "val", "test"):
+        numeric = np.load(dataset_dir / f"N_{split}.npy", mmap_mode="r")
+        categorical = np.load(dataset_dir / f"C_{split}.npy", mmap_mode="r")
+        y = np.load(dataset_dir / f"y_{split}.npy", mmap_mode="r")
+        if numeric.ndim != 2 or categorical.ndim != 2 or y.ndim != 1:
+            raise ValueError(f"invalid array rank in {dataset_dir.name}/{split}")
+        if len(numeric) != len(y) or len(categorical) != len(y):
+            raise ValueError(f"row-count mismatch in {dataset_dir.name}/{split}")
+        if numeric_features is None:
+            numeric_features = int(numeric.shape[1])
+            categorical_features = int(categorical.shape[1])
+        elif (
+            numeric.shape[1] != numeric_features
+            or categorical.shape[1] != categorical_features
+        ):
+            raise ValueError(f"feature-count mismatch across splits in {dataset_dir.name}")
+        if not _finite_numeric(y):
+            raise ValueError(f"non-finite labels in {dataset_dir.name}/{split}")
+        labels[split] = np.unique(np.asarray(y))
+        split_rows[split] = int(len(y))
+
+    train_labels = np.asarray(labels["train"])
+    if len(train_labels) < 2:
+        raise ValueError(f"training split has fewer than two classes: {dataset_dir.name}")
+    for split in ("val", "test"):
+        if not set(np.asarray(labels[split]).tolist()).issubset(set(train_labels.tolist())):
+            raise ValueError(f"{split} contains labels absent from train: {dataset_dir.name}")
+    return {
+        "dataset_name": dataset_dir.name,
+        "n_classes": int(len(train_labels)),
+        "n_train": split_rows["train"],
+        "n_val": split_rows["val"],
+        "n_test": split_rows["test"],
+        "n_numeric_features": int(numeric_features or 0),
+        "n_categorical_features": int(categorical_features or 0),
+    }
+
+
+def _dataset_view_path(
+    source_root: Path,
+    *,
+    max_classes: int | None,
+    dataset_names: Sequence[str] | None,
+    repo_root: Path,
+) -> Path:
+    name = source_root.name
+    if max_classes is not None:
+        name += f"_max{max_classes}"
+    if dataset_names:
+        digest = hashlib.sha256("\n".join(dataset_names).encode("utf-8")).hexdigest()[:10]
+        name += f"_subset_{digest}"
+    return repo_root / "results" / "dataset_views" / name
+
+
+def _view_matches(
+    view_root: Path,
+    *,
+    manifest_payload: dict[str, object],
+    included_names: Sequence[str],
+    source_root: Path,
+) -> bool:
+    manifest_path = view_root / "dataset_view_manifest.json"
+    try:
+        existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    for key, value in manifest_payload.items():
+        if existing.get(key) != value:
+            return False
+    children = sorted(path.name for path in view_root.iterdir() if path.is_dir())
+    if children != sorted(included_names):
+        return False
+    return all(
+        (view_root / name).is_symlink()
+        and (view_root / name).resolve() == (source_root / name).resolve()
+        for name in included_names
+    )
+
+
+def _materialize_dataset_view(
+    view_root: Path,
+    *,
+    source_root: Path,
+    included_names: Sequence[str],
+    manifest_payload: dict[str, object],
+) -> None:
+    view_root.parent.mkdir(parents=True, exist_ok=True)
+    if view_root.exists() and _view_matches(
+        view_root,
+        manifest_payload=manifest_payload,
+        included_names=included_names,
+        source_root=source_root,
+    ):
+        return
+
+    token = uuid.uuid4().hex
+    temp_root = view_root.parent / f".{view_root.name}.tmp-{token}"
+    backup_root = view_root.parent / f".{view_root.name}.old-{token}"
+    temp_root.mkdir(parents=False)
+    try:
+        for name in included_names:
+            source = (source_root / name).resolve()
+            relative = os.path.relpath(source, start=temp_root)
+            (temp_root / name).symlink_to(relative, target_is_directory=True)
+        payload = dict(manifest_payload)
+        payload["created_at"] = datetime.now().astimezone().isoformat()
+        (temp_root / "dataset_view_manifest.json").write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        if view_root.exists():
+            view_root.rename(backup_root)
+        temp_root.rename(view_root)
+        if backup_root.exists():
+            shutil.rmtree(backup_root)
+    except Exception:
+        if temp_root.exists():
+            shutil.rmtree(temp_root)
+        if backup_root.exists() and not view_root.exists():
+            backup_root.rename(view_root)
+        raise
+
+
+def prepare_dataset_context(
+    args: argparse.Namespace,
+    *,
+    repo_root: Path,
+    materialize: bool,
+) -> DatasetContext:
+    source_root = resolve_path(args.data_root, repo_root)
+    if not source_root.is_dir():
+        raise FileNotFoundError(f"Dataset root does not exist: {source_root}")
+    max_classes = args.dataset_max_classes
+    default_openml_root = resolve_path(DEFAULT_DATA_ROOT, repo_root)
+    if max_classes is None and source_root == default_openml_root:
+        max_classes = DEFAULT_OPENML_MAX_CLASSES
+    if max_classes == 0:
+        max_classes = None
+    requested_names = list(dict.fromkeys(args.dataset_names or []))
+
+    if max_classes is None and not requested_names:
+        source_count = sum(path.is_dir() for path in source_root.iterdir())
+        return DatasetContext(
+            source_root=source_root,
+            effective_root=source_root,
+            max_classes=None,
+            view_manifest=None,
+            source_count=source_count,
+            included_count=source_count,
+            excluded_count=0,
+        )
+
+    dataset_dirs = sorted(path for path in source_root.iterdir() if path.is_dir())
+    metadata = [inspect_dataset_directory(path) for path in dataset_dirs]
+    by_name = {str(row["dataset_name"]): row for row in metadata}
+    missing_requested = sorted(set(requested_names) - set(by_name))
+    if missing_requested:
+        raise ValueError(f"Unknown --dataset-names: {missing_requested}")
+    requested_set = set(requested_names)
+    included: list[dict[str, object]] = []
+    excluded: list[dict[str, object]] = []
+    for row in metadata:
+        name = str(row["dataset_name"])
+        reasons: list[str] = []
+        if requested_names and name not in requested_set:
+            reasons.append("not_requested")
+        if max_classes is not None and int(row["n_classes"]) > max_classes:
+            reasons.append(f"n_classes>{max_classes}")
+        if reasons:
+            excluded.append({**row, "reasons": reasons})
+        else:
+            included.append(row)
+    if not included:
+        raise ValueError("Dataset filtering selected zero tasks")
+
+    view_root = _dataset_view_path(
+        source_root,
+        max_classes=max_classes,
+        dataset_names=requested_names,
+        repo_root=repo_root,
+    )
+    manifest_path = view_root / "dataset_view_manifest.json"
+    payload: dict[str, object] = {
+        "source_root": str(source_root),
+        "effective_root": str(view_root),
+        "max_classes": max_classes,
+        "requested_dataset_names": requested_names,
+        "source_count": len(metadata),
+        "included_count": len(included),
+        "excluded_count": len(excluded),
+        "included": included,
+        "excluded": excluded,
+    }
+    if materialize:
+        _materialize_dataset_view(
+            view_root,
+            source_root=source_root,
+            included_names=[str(row["dataset_name"]) for row in included],
+            manifest_payload=payload,
+        )
+    return DatasetContext(
+        source_root=source_root,
+        effective_root=view_root,
+        max_classes=max_classes,
+        view_manifest=manifest_path,
+        source_count=len(metadata),
+        included_count=len(included),
+        excluded_count=len(excluded),
+    )
+
+
 def default_run_id() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -209,6 +490,13 @@ def validate_args(args: argparse.Namespace, device_ids: list[str]) -> None:
         raise ValueError("--n-estimators must be >= 1")
     if args.max_datasets is not None and args.max_datasets < 1:
         raise ValueError("--max-datasets must be >= 1")
+    if args.dataset_max_classes is not None and args.dataset_max_classes < 0:
+        raise ValueError("--dataset-max-classes must be >= 0")
+    if args.dataset_names is not None:
+        if any(not name.strip() for name in args.dataset_names):
+            raise ValueError("--dataset-names must not contain empty names")
+        if len(args.dataset_names) != len(set(args.dataset_names)):
+            raise ValueError("--dataset-names must not contain duplicates")
     if args.ttt_epochs < 1:
         raise ValueError("--ttt-epochs must be >= 1")
     if args.ttt_lr <= 0:
@@ -362,12 +650,19 @@ def build_launch_spec(
     validate_args(args, device_ids)
 
     run_id = args.run_id or default_run_id()
-    data_root = resolve_path(args.data_root, repo_root)
+    dataset_context = getattr(args, "_dataset_context", None)
+    if dataset_context is None:
+        dataset_context = prepare_dataset_context(
+            args,
+            repo_root=repo_root,
+            materialize=False,
+        )
+    data_root = dataset_context.effective_root
     out_dir = resolve_out_dir(args, repo_root, run_id)
     is_tabicl = args.model in TABICL_MODELS
     n_estimators = args.n_estimators or (32 if is_tabicl else 8)
     selection = None if args.method == "infer" else (
-        "random" if args.method == "ft" else "f_mmd"
+        "random" if args.method == "ft" else "f_test_centroid_reserve"
     )
     source: str | None = None
     metric: str | None = None
@@ -462,7 +757,14 @@ def build_launch_spec(
         metric=metric,
         checkpoint=None if checkpoint is None else str(checkpoint),
         runner=str(runner),
+        source_data_root=str(dataset_context.source_root),
         data_root=str(data_root),
+        dataset_max_classes=dataset_context.max_classes,
+        dataset_view_manifest=(
+            None
+            if dataset_context.view_manifest is None
+            else str(dataset_context.view_manifest)
+        ),
         out_dir=str(out_dir),
         run_id=run_id,
         workers=args.workers,
@@ -475,7 +777,13 @@ def build_launch_spec(
 
 
 def validate_required_files(spec: LaunchSpec, repo_root: Path) -> None:
-    required = [Path(spec.runner), Path(spec.data_root)]
+    effective_data_root = Path(spec.data_root)
+    required_data_root = (
+        effective_data_root
+        if effective_data_root.exists()
+        else Path(spec.source_data_root)
+    )
+    required = [Path(spec.runner), required_data_root]
     if spec.checkpoint is not None:
         required.append(Path(spec.checkpoint))
     if spec.model == "tabpfn-v3" and spec.checkpoint is None:
@@ -564,7 +872,7 @@ def build_matrix_specs(
     passthrough_args: Sequence[str] = (),
 ) -> list[LaunchSpec]:
     run_id = args.run_id or default_run_id()
-    models = list(dict.fromkeys(args.matrix_models or MODEL_CHOICES))
+    models = list(dict.fromkeys(args.matrix_models or DEFAULT_MATRIX_MODELS))
     methods = list(dict.fromkeys(args.matrix_methods or METHOD_CHOICES))
     specs: list[LaunchSpec] = []
     for model in models:
@@ -639,7 +947,11 @@ def run_matrix(
             matrix_manifest_path,
             {
                 "run_id": specs[0].run_id,
+                "source_data_root": specs[0].source_data_root,
                 "data_root": specs[0].data_root,
+                "effective_data_root": specs[0].data_root,
+                "dataset_max_classes": specs[0].dataset_max_classes,
+                "dataset_view_manifest": specs[0].dataset_view_manifest,
                 "status": status,
                 "started_at": started_at,
                 "updated_at": datetime.now().astimezone().isoformat(),
@@ -691,6 +1003,11 @@ def run(argv: Sequence[str] | None = None) -> int:
 
     try:
         validate_launch_mode(args)
+        args._dataset_context = prepare_dataset_context(
+            args,
+            repo_root=repo_root,
+            materialize=not args.dry_run,
+        )
         if args.matrix:
             return run_matrix(
                 args,

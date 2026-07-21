@@ -1,0 +1,24 @@
+{
+  "models": [
+    "tabicl-v2",
+    "tabpfn-v3"
+  ],
+  "methods": [
+    "infer",
+    "ft",
+    "faware_ft"
+  ],
+  "data_root": "Graph-SCM 3-stage 512 seed42",
+  "source_matrix": "../matrix/tabiclv2_graph_scm_2x3_full_20260716_090925",
+  "replacement": {
+    "cell": "tabpfn-v3/faware_ft/seed42",
+    "source": "../optuna/tabpfnv3_graph_scm_rr_optuna4_20260716_195632/trials/trial_0003_reserve_0p290864",
+    "trial": 3,
+    "ttt_c_reserve_ratio": 0.29086417952528093,
+    "objective_accuracy": 0.8149421368300435,
+    "status_ok": 512,
+    "ttt_applied": 512,
+    "oom_fallback": 0
+  },
+  "pairing": "dataset_name shared status=ok"
+}

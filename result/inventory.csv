@@ -1,0 +1,73 @@
+model,dataset,method,overall_status,artifact_complete,source_host,source_path,selected_run,selection_policy,selected_seeds,selected_seed_count,selected_on_eval,expected_datasets,result_rows,unique_datasets,status_ok,adaptation_expected,adaptation_applied,fallback_count,failed_count,selection_note,snapshot_timestamp
+TabICLv2,data184,Infer,complete,True,local,/Users/zhuhao/experiment/second_learning/tabiclv2_test/results/tabicl/v2/infer_baseline/seed_sweep_20260702_151902/seed2026/all_classification_results.csv,seed2026,,,0,False,184,184,184,184,0,0,0,0,,2026-07-20T02:27:57+00:00
+TabICLv2,data184,FT,complete,True,local,/Users/zhuhao/experiment/second_learning/tabiclv2_test/results/tabicl/v2/ft/seed_sweep_20260702_151902/seed2028/all_classification_results.csv;/Users/zhuhao/experiment/second_learning/tabiclv2_test/results/tabicl/v2/ft/seed_sweep_20260702_151902/seed3/all_classification_results.csv;/Users/zhuhao/experiment/second_learning/tabiclv2_test/results/tabicl/v2/ft/seed_sweep_20260702_151902/seed2025/all_classification_results.csv,seed2028+seed3+seed2025,middle3_avg_accuracy_ok,"2028,3,2025",3,True,184,184,184,184,184,184,0,0,selected_on_eval;middle3_avg_accuracy_ok,2026-07-20T02:27:57+00:00
+TabICLv2,data184,F-aware FT,complete,True,local,/Users/zhuhao/experiment/second_learning/tabiclv2_test/results/tabicl/v2/faware_c/seed_sweep_20260702_151902/seed2025/all_classification_results.csv;/Users/zhuhao/experiment/second_learning/tabiclv2_test/results/tabicl/v2/faware_c/seed_sweep_20260702_151902/seed2027/all_classification_results.csv;/Users/zhuhao/experiment/second_learning/tabiclv2_test/results/tabicl/v2/faware_c/seed_sweep_20260702_151902/seed3/all_classification_results.csv,seed2025+seed2027+seed3,top3_avg_accuracy_ok,"2025,2027,3",3,True,184,184,184,184,184,184,0,0,selected_on_eval;top3_avg_accuracy_ok,2026-07-20T02:27:57+00:00
+TabICLv2,data184,LoRA,complete,True,local,/Users/zhuhao/experiment/second_learning/tabiclv2_test/results/PEFT_results/talent184/tabiclv2/lora/full_peft_data184_20260715/all_classification_results.csv,full_peft_data184_20260715,,,0,False,184,184,184,184,184,184,0,0,,2026-07-20T02:27:57+00:00
+TabICLv2,data184,ln_head_embedding,complete,True,local,/Users/zhuhao/experiment/second_learning/tabiclv2_test/results/PEFT_results/talent184/tabiclv2/ln_head_embedding/full_peft_data184_20260715/all_classification_results.csv,full_peft_data184_20260715,,,0,False,184,184,184,184,184,184,0,0,,2026-07-20T02:27:57+00:00
+TabICLv2,data184,Last-block,complete,True,local,/Users/zhuhao/experiment/second_learning/tabiclv2_test/results/PEFT_results/talent184/tabiclv2/last_layers/full_peft_data184_20260715/all_classification_results.csv,full_peft_data184_20260715,,,0,False,184,184,184,184,184,184,0,0,,2026-07-20T02:27:57+00:00
+TabICLv2,data184,LoCalPFN,complete_with_failures,True,jiqun,/home/crc00006699/zh/tabiclv2/results/PEFT_compare/localpfn_fast_explore_k256_q128_e5_s5_data184_seed42_20260719/tabiclv2/localpfn/all_classification_results.csv,localpfn,,,0,False,184,184,184,95,184,95,0,89,,2026-07-20T02:27:57+00:00
+TabICLv2,data184,MICP,missing,False,,,,,,0,False,184,0,0,0,184,0,0,0,,2026-07-20T02:27:57+00:00
+TabICLv2,OpenML-CC18,Infer,complete_with_failures,True,jiqun,/home/crc00006699/zh/tabiclv2/results/managed_experiments/openmlcc18_2x3_full_20260715_223032/tabicl-v2/infer/seed42/all_classification_results.csv,seed42,,,0,False,67,67,67,66,0,0,0,1,,2026-07-20T02:27:57+00:00
+TabICLv2,OpenML-CC18,FT,complete_with_failures,True,jiqun,/home/crc00006699/zh/tabiclv2/results/managed_experiments/openmlcc18_2x3_full_20260715_223032/tabicl-v2/ft/seed42/all_classification_results.csv,seed42,,,0,False,67,67,67,64,67,59,5,3,,2026-07-20T02:27:57+00:00
+TabICLv2,OpenML-CC18,F-aware FT,complete_with_failures,True,jiqun,/home/crc00006699/zh/tabiclv2/results/managed_experiments/openmlcc18_2x3_full_20260715_223032/tabicl-v2/faware_ft/seed42/all_classification_results.csv,seed42,,,0,False,67,67,67,64,67,59,5,3,,2026-07-20T02:27:57+00:00
+TabICLv2,OpenML-CC18,LoRA,complete_with_failures,True,jiqun,/home/crc00006699/zh/tabiclv2/results/PEFT/tabiclv2/lora/openmlcc18_peft_2x3_full_20260717_113939/all_classification_results.csv,openmlcc18_peft_2x3_full_20260717_113939,,,0,False,67,67,67,65,67,59,6,2,,2026-07-20T02:27:57+00:00
+TabICLv2,OpenML-CC18,ln_head_embedding,complete_with_failures,True,jiqun,/home/crc00006699/zh/tabiclv2/results/PEFT/tabiclv2/ln_head_embedding/openmlcc18_peft_2x3_full_20260717_113939/all_classification_results.csv,openmlcc18_peft_2x3_full_20260717_113939,,,0,False,67,67,67,65,67,60,5,2,,2026-07-20T02:27:57+00:00
+TabICLv2,OpenML-CC18,Last-block,complete_with_failures,True,jiqun,/home/crc00006699/zh/tabiclv2/results/PEFT/tabiclv2/last_layers/openmlcc18_peft_2x3_full_20260717_113939/all_classification_results.csv,openmlcc18_peft_2x3_full_20260717_113939,,,0,False,67,67,67,65,67,64,1,2,,2026-07-20T02:27:57+00:00
+TabICLv2,OpenML-CC18,LoCalPFN,missing,False,,,,,,0,False,67,0,0,0,67,0,0,0,,2026-07-20T02:27:57+00:00
+TabICLv2,OpenML-CC18,MICP,missing,False,,,,,,0,False,67,0,0,0,67,0,0,0,,2026-07-20T02:27:57+00:00
+TabICLv2,Graph-SCM,Infer,complete,True,local,/Users/zhuhao/experiment/second_learning/tabiclv2_test/results/合成数据实验/matrix/tabiclv2_graph_scm_2x3_full_20260716_090925/tabicl-v2/infer/seed42/all_classification_results.csv,seed42,,,0,False,512,512,512,512,0,0,0,0,,2026-07-20T02:27:57+00:00
+TabICLv2,Graph-SCM,FT,complete_with_failures,True,local,/Users/zhuhao/experiment/second_learning/tabiclv2_test/results/合成数据实验/matrix/tabiclv2_graph_scm_2x3_full_20260716_090925/tabicl-v2/ft/seed42/all_classification_results.csv,seed42,,,0,False,512,512,512,512,512,506,6,0,,2026-07-20T02:27:57+00:00
+TabICLv2,Graph-SCM,F-aware FT,complete_with_failures,True,local,/Users/zhuhao/experiment/second_learning/tabiclv2_test/results/合成数据实验/matrix/tabiclv2_graph_scm_2x3_full_20260716_090925/tabicl-v2/faware_ft/seed42/all_classification_results.csv,seed42,,,0,False,512,512,512,512,512,508,4,0,,2026-07-20T02:27:57+00:00
+TabICLv2,Graph-SCM,LoRA,missing,False,,,,,,0,False,512,0,0,0,512,0,0,0,,2026-07-20T02:27:57+00:00
+TabICLv2,Graph-SCM,ln_head_embedding,missing,False,,,,,,0,False,512,0,0,0,512,0,0,0,,2026-07-20T02:27:57+00:00
+TabICLv2,Graph-SCM,Last-block,missing,False,,,,,,0,False,512,0,0,0,512,0,0,0,,2026-07-20T02:27:57+00:00
+TabICLv2,Graph-SCM,LoCalPFN,missing,False,,,,,,0,False,512,0,0,0,512,0,0,0,,2026-07-20T02:27:57+00:00
+TabICLv2,Graph-SCM,MICP,missing,False,,,,,,0,False,512,0,0,0,512,0,0,0,,2026-07-20T02:27:57+00:00
+TabPFNv3,data184,Infer,complete,True,local,/Users/zhuhao/experiment/second_learning/tabiclv2_test/results/tabpfn/v3/infer_baseline/seed_sweep_20260702_153706/seed10/all_classification_results.csv,seed10,,,0,False,184,184,184,184,0,0,0,0,,2026-07-20T02:27:57+00:00
+TabPFNv3,data184,FT,complete_with_failures,True,local,/Users/zhuhao/experiment/second_learning/tabiclv2_test/results/tabpfn/v3/tabpfnv3_best_para/all_classification_results.csv,tabpfnv3_best_para,,,0,True,184,184,184,183,184,183,1,1,selected_on_eval,2026-07-20T02:27:57+00:00
+TabPFNv3,data184,F-aware FT,complete_with_failures,True,jiqun,/home/crc00006699/zh/tabiclv2/results/tabpfn/tabpfn_v3_Data184/f_mmd/tabpfn_v3/seed42/all_classification_results.csv,seed42,,,0,False,184,184,184,183,184,183,0,1,,2026-07-20T02:27:57+00:00
+TabPFNv3,data184,LoRA,complete_with_failures,True,local,/Users/zhuhao/experiment/second_learning/tabiclv2_test/results/PEFT_results/talent184/tabpfnv3/lora/tabpfnv3_peft_data184_direct_20260716_122453/all_classification_results.csv,tabpfnv3_peft_data184_direct_20260716_122453,,,0,False,184,184,184,178,184,177,1,6,,2026-07-20T02:27:57+00:00
+TabPFNv3,data184,ln_head_embedding,complete_with_failures,True,local,/Users/zhuhao/experiment/second_learning/tabiclv2_test/results/PEFT_results/talent184/tabpfnv3/ln_head_embedding/tabpfnv3_peft_data184_direct_20260716_122453/all_classification_results.csv,tabpfnv3_peft_data184_direct_20260716_122453,,,0,False,184,184,184,182,184,181,1,2,,2026-07-20T02:27:57+00:00
+TabPFNv3,data184,Last-block,complete_with_failures,True,local,/Users/zhuhao/experiment/second_learning/tabiclv2_test/results/PEFT_results/talent184/tabpfnv3/last_layers/tabpfnv3_peft_data184_direct_20260716_122453/all_classification_results.csv,tabpfnv3_peft_data184_direct_20260716_122453,,,0,False,184,184,184,183,184,183,0,1,,2026-07-20T02:27:57+00:00
+TabPFNv3,data184,LoCalPFN,partial,False,jiqun,/home/crc00006699/zh/tabiclv2/results/PEFT_compare/localpfn_fast_explore_k256_q128_e5_s5_data184_seed42_20260719/tabpfnv3/localpfn/all_classification_results.csv,localpfn,,,0,False,184,3,3,2,184,2,0,1,missing=181,2026-07-20T02:27:57+00:00
+TabPFNv3,data184,MICP,missing,False,,,,,,0,False,184,0,0,0,184,0,0,0,,2026-07-20T02:27:57+00:00
+TabPFNv3,OpenML-CC18,Infer,complete,True,jiqun,/home/crc00006699/zh/tabiclv2/results/managed_experiments/openmlcc18_2x3_full_20260715_223032/tabpfn-v3/infer/seed42/all_classification_results.csv,seed42,,,0,False,67,67,67,67,0,0,0,0,,2026-07-20T02:27:57+00:00
+TabPFNv3,OpenML-CC18,FT,complete_with_failures,True,jiqun,/home/crc00006699/zh/tabiclv2/results/managed_experiments/openmlcc18_2x3_full_20260715_223032/tabpfn-v3/ft/seed42/all_classification_results.csv,seed42,,,0,False,67,67,67,65,67,61,4,2,,2026-07-20T02:27:57+00:00
+TabPFNv3,OpenML-CC18,F-aware FT,complete_with_failures,True,jiqun,/home/crc00006699/zh/tabiclv2/results/managed_experiments/openmlcc18_2x3_full_20260715_223032/tabpfn-v3/faware_ft/seed42/all_classification_results.csv,seed42,,,0,False,67,67,67,65,67,61,4,2,,2026-07-20T02:27:57+00:00
+TabPFNv3,OpenML-CC18,LoRA,complete_with_failures,True,jiqun,/home/crc00006699/zh/tabiclv2/results/PEFT/tabpfnv3/lora/openmlcc18_peft_2x3_full_20260717_113939/all_classification_results.csv,openmlcc18_peft_2x3_full_20260717_113939,,,0,False,67,67,67,62,67,56,6,5,,2026-07-20T02:27:57+00:00
+TabPFNv3,OpenML-CC18,ln_head_embedding,complete_with_failures,True,jiqun,/home/crc00006699/zh/tabiclv2/results/PEFT/tabpfnv3/ln_head_embedding/openmlcc18_peft_2x3_full_20260717_113939/all_classification_results.csv,openmlcc18_peft_2x3_full_20260717_113939,,,0,False,67,67,67,65,67,58,7,2,,2026-07-20T02:27:57+00:00
+TabPFNv3,OpenML-CC18,Last-block,complete_with_failures,True,jiqun,/home/crc00006699/zh/tabiclv2/results/PEFT/tabpfnv3/last_layers/openmlcc18_peft_2x3_full_20260717_113939/all_classification_results.csv,openmlcc18_peft_2x3_full_20260717_113939,,,0,False,67,67,67,63,67,62,1,4,,2026-07-20T02:27:57+00:00
+TabPFNv3,OpenML-CC18,LoCalPFN,missing,False,,,,,,0,False,67,0,0,0,67,0,0,0,,2026-07-20T02:27:57+00:00
+TabPFNv3,OpenML-CC18,MICP,missing,False,,,,,,0,False,67,0,0,0,67,0,0,0,,2026-07-20T02:27:57+00:00
+TabPFNv3,Graph-SCM,Infer,complete,True,local,/Users/zhuhao/experiment/second_learning/tabiclv2_test/results/合成数据实验/matrix/tabiclv2_graph_scm_2x3_full_20260716_090925/tabpfn-v3/infer/seed42/all_classification_results.csv,seed42,,,0,False,512,512,512,512,0,0,0,0,,2026-07-20T02:27:57+00:00
+TabPFNv3,Graph-SCM,FT,complete,True,local,/Users/zhuhao/experiment/second_learning/tabiclv2_test/results/合成数据实验/matrix/tabiclv2_graph_scm_2x3_full_20260716_090925/tabpfn-v3/ft/seed42/all_classification_results.csv,seed42,,,0,False,512,512,512,512,512,512,0,0,,2026-07-20T02:27:57+00:00
+TabPFNv3,Graph-SCM,F-aware FT,complete,True,local,/Users/zhuhao/experiment/second_learning/tabiclv2_test/results/合成数据实验/best_matrix/tabpfn-v3/faware_ft/seed42/all_classification_results.csv,seed42,,,0,True,512,512,512,512,512,512,0,0,selected_on_eval,2026-07-20T02:27:57+00:00
+TabPFNv3,Graph-SCM,LoRA,missing,False,,,,,,0,False,512,0,0,0,512,0,0,0,,2026-07-20T02:27:57+00:00
+TabPFNv3,Graph-SCM,ln_head_embedding,missing,False,,,,,,0,False,512,0,0,0,512,0,0,0,,2026-07-20T02:27:57+00:00
+TabPFNv3,Graph-SCM,Last-block,missing,False,,,,,,0,False,512,0,0,0,512,0,0,0,,2026-07-20T02:27:57+00:00
+TabPFNv3,Graph-SCM,LoCalPFN,missing,False,,,,,,0,False,512,0,0,0,512,0,0,0,,2026-07-20T02:27:57+00:00
+TabPFNv3,Graph-SCM,MICP,missing,False,,,,,,0,False,512,0,0,0,512,0,0,0,,2026-07-20T02:27:57+00:00
+LimiX-2M,data184,Infer,complete_with_failures,True,jiqun,/home/crc00006699/zh/tabiclv2/results/limix/data184/limix2m/seed42/infer/all_classification_results.csv,infer,,,0,False,184,184,184,178,0,0,0,6,,2026-07-20T02:27:57+00:00
+LimiX-2M,data184,FT,partial,False,jiqun,/home/crc00006699/zh/tabiclv2/results/limix/data184/limix2m/seed42/ft/all_classification_results.csv,ft,,,0,False,184,87,87,83,184,83,0,4,missing=97,2026-07-20T02:27:57+00:00
+LimiX-2M,data184,F-aware FT,missing,False,,,,,,0,False,184,0,0,0,184,0,0,0,,2026-07-20T02:27:57+00:00
+LimiX-2M,data184,LoRA,missing,False,,,,,,0,False,184,0,0,0,184,0,0,0,,2026-07-20T02:27:57+00:00
+LimiX-2M,data184,ln_head_embedding,missing,False,,,,,,0,False,184,0,0,0,184,0,0,0,,2026-07-20T02:27:57+00:00
+LimiX-2M,data184,Last-block,missing,False,,,,,,0,False,184,0,0,0,184,0,0,0,,2026-07-20T02:27:57+00:00
+LimiX-2M,data184,LoCalPFN,missing,False,,,,,,0,False,184,0,0,0,184,0,0,0,,2026-07-20T02:27:57+00:00
+LimiX-2M,data184,MICP,missing,False,,,,,,0,False,184,0,0,0,184,0,0,0,,2026-07-20T02:27:57+00:00
+LimiX-2M,OpenML-CC18,Infer,missing,False,,,,,,0,False,67,0,0,0,0,0,0,0,,2026-07-20T02:27:57+00:00
+LimiX-2M,OpenML-CC18,FT,missing,False,,,,,,0,False,67,0,0,0,67,0,0,0,,2026-07-20T02:27:57+00:00
+LimiX-2M,OpenML-CC18,F-aware FT,missing,False,,,,,,0,False,67,0,0,0,67,0,0,0,,2026-07-20T02:27:57+00:00
+LimiX-2M,OpenML-CC18,LoRA,missing,False,,,,,,0,False,67,0,0,0,67,0,0,0,,2026-07-20T02:27:57+00:00
+LimiX-2M,OpenML-CC18,ln_head_embedding,missing,False,,,,,,0,False,67,0,0,0,67,0,0,0,,2026-07-20T02:27:57+00:00
+LimiX-2M,OpenML-CC18,Last-block,missing,False,,,,,,0,False,67,0,0,0,67,0,0,0,,2026-07-20T02:27:57+00:00
+LimiX-2M,OpenML-CC18,LoCalPFN,missing,False,,,,,,0,False,67,0,0,0,67,0,0,0,,2026-07-20T02:27:57+00:00
+LimiX-2M,OpenML-CC18,MICP,missing,False,,,,,,0,False,67,0,0,0,67,0,0,0,,2026-07-20T02:27:57+00:00
+LimiX-2M,Graph-SCM,Infer,missing,False,,,,,,0,False,512,0,0,0,0,0,0,0,,2026-07-20T02:27:57+00:00
+LimiX-2M,Graph-SCM,FT,missing,False,,,,,,0,False,512,0,0,0,512,0,0,0,,2026-07-20T02:27:57+00:00
+LimiX-2M,Graph-SCM,F-aware FT,missing,False,,,,,,0,False,512,0,0,0,512,0,0,0,,2026-07-20T02:27:57+00:00
+LimiX-2M,Graph-SCM,LoRA,missing,False,,,,,,0,False,512,0,0,0,512,0,0,0,,2026-07-20T02:27:57+00:00
+LimiX-2M,Graph-SCM,ln_head_embedding,missing,False,,,,,,0,False,512,0,0,0,512,0,0,0,,2026-07-20T02:27:57+00:00
+LimiX-2M,Graph-SCM,Last-block,missing,False,,,,,,0,False,512,0,0,0,512,0,0,0,,2026-07-20T02:27:57+00:00
+LimiX-2M,Graph-SCM,LoCalPFN,missing,False,,,,,,0,False,512,0,0,0,512,0,0,0,,2026-07-20T02:27:57+00:00
+LimiX-2M,Graph-SCM,MICP,missing,False,,,,,,0,False,512,0,0,0,512,0,0,0,,2026-07-20T02:27:57+00:00

@@ -5,12 +5,12 @@ import json
 
 from sklearn.metrics import f1_score, precision_score, mean_squared_error, r2_score, accuracy_score
 
-from inference.predictor import LimiXPredictor
-from retrieval_extension.retrieval_search_space.init_search_space import generate_search_space
+from baseline_compare.LimiX.inference.predictor import LimiXPredictor
+from baseline_compare.LimiX.retrieval_extension.retrieval_search_space.init_search_space import generate_search_space
 import numpy as np
 import torch
 
-from utils.inference_utils import auc_metric
+from baseline_compare.LimiX.utils.inference_utils import auc_metric
 
 
 class RetrievalSearchHyperparameters:

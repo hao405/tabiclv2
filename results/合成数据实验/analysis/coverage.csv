@@ -1,0 +1,8 @@
+model,method,source_csv,rows,ok_rows,failed_rows,ttt_applied_rows,ttt_oom_fallback_rows,ttt_c_selection,ttt_c_metric
+tabicl-v2,infer,results/合成数据实验/matrix/tabiclv2_graph_scm_2x3_full_20260716_090925/tabicl-v2/infer/seed42/all_classification_results.csv,512,512,0,0,0,,
+tabicl-v2,ft,results/合成数据实验/matrix/tabiclv2_graph_scm_2x3_full_20260716_090925/tabicl-v2/ft/seed42/all_classification_results.csv,512,512,0,506,6,random,standardized_l2
+tabicl-v2,faware_ft,results/合成数据实验/matrix/tabiclv2_graph_scm_2x3_full_20260716_090925/tabicl-v2/faware_ft/seed42/all_classification_results.csv,512,512,0,508,4,f_mmd,standardized_l2
+tabpfn-v3,infer,results/合成数据实验/matrix/tabiclv2_graph_scm_2x3_full_20260716_090925/tabpfn-v3/infer/seed42/all_classification_results.csv,512,512,0,0,0,,
+tabpfn-v3,ft,results/合成数据实验/matrix/tabiclv2_graph_scm_2x3_full_20260716_090925/tabpfn-v3/ft/seed42/all_classification_results.csv,512,512,0,512,0,random,
+tabpfn-v3,faware_ft,results/合成数据实验/optuna/tabpfnv3_graph_scm_rr_optuna4_20260716_195632/trials/trial_0003_reserve_0p290864/all_classification_results.csv,512,512,0,512,0,f_mmd,standardized_l2
+tabpfn-v3,faware_ft_default,results/合成数据实验/matrix/tabiclv2_graph_scm_2x3_full_20260716_090925/tabpfn-v3/faware_ft/seed42/all_classification_results.csv,512,512,0,512,0,f_mmd,standardized_l2

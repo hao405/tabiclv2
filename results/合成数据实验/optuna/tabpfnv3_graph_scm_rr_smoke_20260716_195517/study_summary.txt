@@ -1,0 +1,9 @@
+study_name: tabpfnv3_graph_scm_rr_smoke_20260716_195517
+total_trials: 1
+completed_trials: 1
+failed_trials: 0
+reserve_ratio_low: 0.0001
+reserve_ratio_high: 0.3
+best_trial: 0
+best_objective: 0.9637958532695374
+best_ttt_c_reserve_ratio: 0.11242458164232401

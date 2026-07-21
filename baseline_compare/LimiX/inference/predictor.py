@@ -1,5 +1,5 @@
-from inference.inference_method import InferenceAttentionMap, InferenceResultWithRetrieval
-from inference.preprocess import (
+from baseline_compare.LimiX.inference.inference_method import InferenceAttentionMap, InferenceResultWithRetrieval
+from baseline_compare.LimiX.inference.preprocess import (
     FeatureShuffler, 
     FilterValidFeatures, 
     CategoricalFeatureEncoder, 
@@ -7,7 +7,7 @@ from inference.preprocess import (
     FingerprintFeatureEncoder,
     PolynomialInteractionGenerator,
     SubSampleData)
-from utils.loading import load_model
+from baseline_compare.LimiX.utils.loading import load_model
 import torch
 from typing import List, Literal
 import random

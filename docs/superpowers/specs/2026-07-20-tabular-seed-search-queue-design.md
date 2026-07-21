@@ -22,7 +22,7 @@
 ## 调度与恢复
 
 - 在 `jiqun` 的 `tmux zh` 中创建命名窗口 `seed_search`。
-- GPU1/GPU2 各运行一个 worker；worker 等待已有计算进程退出且显存连续满足阈值后，再通过锁占用 GPU。
+- 当前 Optuna 完成并写出最佳配置后，GPU0/GPU1/GPU2 各运行一个 worker，占用全部三张物理 GPU；每个 worker 必须先等待对应卡上的已有计算进程退出且显存连续满足阈值，再通过锁占用 GPU。
 - worker 原子领取完整 cell；队列优先级为 `data184` 后 `OpenML-CC18`。
 - 状态为 `pending -> running -> complete/complete_with_failures`。异常退出后从未终态 seed 继续，不重复已完成或已记录失败的 seed。
 - GPU0 以及 GPU1/GPU2 上已有任务均不得被中断或抢占。

@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from model.layer import EncoderBaseLayer, MLP
+from baseline_compare.LimiX.model.layer import EncoderBaseLayer, MLP
 from typing import Any,Literal
 from torch.nn.init import orthogonal_
 import numpy as np

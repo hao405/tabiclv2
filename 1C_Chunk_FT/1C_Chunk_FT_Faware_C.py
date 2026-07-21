@@ -31,6 +31,7 @@ DEFAULT_CHECKPOINT_VERSION = "tabicl-classifier-v1.1-20250506.ckpt"
 DEFAULT_OUT_DIR_ROOT = Path("1b_result")
 CLASSIFICATION_TASKS = {"binclass", "multiclass"}
 CATEGORICAL_MISSING_TOKEN = "__tabicl_missing__"
+TEST_CENTROID_RESERVE_SELECTION = "f_test_centroid_reserve"
 
 np = None
 pd = None
@@ -126,7 +127,7 @@ class TTTConfig:
     save_ckpt_every: int = 2
     save_ckpt_start_step: Optional[int] = None
     ckpt_root: Optional[str] = None
-    c_selection: str = "f_mmd"
+    c_selection: str = TEST_CENTROID_RESERVE_SELECTION
     c_source: str = "test"
     c_metric: str = "standardized_l2"
     c_candidate_multiplier: int = 5
@@ -195,7 +196,6 @@ class CSelectionContext:
     mean: Any = None
     scale: Any = None
     target_mean: Any = None
-    target_var: Any = None
     reserved_context_indices: Any = None
     reserved_context_scores: Any = None
     reserved_context_ratio: float = 0.0
@@ -900,8 +900,11 @@ def build_ttt_config(args: argparse.Namespace) -> TTTConfig:
         raise ValueError("--ttt-eval-metric must be one of: roc_auc, log_loss, accuracy")
     if not 0.0 <= float(args.ttt_wise_alpha) <= 1.0:
         raise ValueError("--ttt-wise-alpha must be in [0, 1]")
-    if c_selection not in {"random", "f_mmd"}:
-        raise ValueError("--ttt-c-selection must be one of: random, f_mmd")
+    if c_selection not in {"random", TEST_CENTROID_RESERVE_SELECTION}:
+        raise ValueError(
+            "--ttt-c-selection must be one of: "
+            f"random, {TEST_CENTROID_RESERVE_SELECTION}"
+        )
     if c_source not in {"none", "validation", "test"}:
         raise ValueError("--ttt-c-source must be one of: none, validation, test")
     if c_metric not in {"tabicl_encoded_l2", "standardized_l2"}:
@@ -910,13 +913,20 @@ def build_ttt_config(args: argparse.Namespace) -> TTTConfig:
         raise ValueError("--ttt-c-candidate-multiplier must be >= 1")
     if c_selection == "random":
         c_source = "none"
-    if c_selection == "f_mmd":
+    wise_ft = bool(args.ttt_wise_ft) and c_selection != "random"
+    if c_selection == TEST_CENTROID_RESERVE_SELECTION:
         if not 0.0 < float(args.ttt_c_reserve_ratio) < 1.0:
             raise ValueError("--ttt-c-reserve-ratio must be in (0, 1)")
         if float(args.ttt_c_reserve_ratio) + float(args.ttt_query_ratio) >= 1.0:
-            raise ValueError("--ttt-c-reserve-ratio + --ttt-query-ratio must be < 1 for f_mmd")
+            raise ValueError(
+                "--ttt-c-reserve-ratio + --ttt-query-ratio must be < 1 for "
+                f"{TEST_CENTROID_RESERVE_SELECTION}"
+            )
         if c_source != "test":
-            raise ValueError("F-aware --ttt-c-selection f_mmd now requires --ttt-c-source test")
+            raise ValueError(
+                "F-aware --ttt-c-selection "
+                f"{TEST_CENTROID_RESERVE_SELECTION} requires --ttt-c-source test"
+            )
 
     return TTTConfig(
         enabled=bool(args.ttt_enabled),
@@ -928,7 +938,7 @@ def build_ttt_config(args: argparse.Namespace) -> TTTConfig:
         dtype=str(args.ttt_dtype),
         micro_batch_size=int(args.ttt_micro_batch_size),
         weight_decay=float(args.ttt_weight_decay),
-        wise_ft=bool(args.ttt_wise_ft),
+        wise_ft=wise_ft,
         wise_alpha=float(args.ttt_wise_alpha),
         epochs=int(args.ttt_epochs),
         steps=int(args.ttt_epochs),
@@ -1069,7 +1079,6 @@ def build_c_selection_context(
             reference=reference,
             metric=config.c_metric,
             target_mean=np.nanmean(reference, axis=0),
-            target_var=np.nanvar(reference, axis=0),
         )
 
     _X_train_std, reference_std, mean, scale = _standardize_for_selection(train_encoded, reference_encoded)
@@ -1079,7 +1088,6 @@ def build_c_selection_context(
         mean=mean,
         scale=scale,
         target_mean=np.nanmean(reference_std, axis=0),
-        target_var=np.nanvar(reference_std, axis=0),
     )
 
 
@@ -1124,62 +1132,10 @@ def _class_balanced_order(order, y_chunk, query_size: int) -> list[int]:
     return selected
 
 
-def _mmd_greedy_order(
-    X_chunk_for_selection,
+def _test_centroid_distance_scores(
+    X_rows,
     reference_context: CSelectionContext | None,
-    candidate_indices,
-    *,
-    max_items: int,
-    y_chunk=None,
-) -> list[int]:
-    X_arr = np.asarray(X_chunk_for_selection, dtype=np.float64)
-    if reference_context is None or reference_context.target_mean is None:
-        return [int(idx) for idx in candidate_indices[:max_items]]
-
-    target_mean = np.asarray(reference_context.target_mean, dtype=np.float64)
-    target_var = np.asarray(reference_context.target_var, dtype=np.float64)
-    remaining = [int(idx) for idx in candidate_indices]
-    selected: list[int] = []
-    current_sum = np.zeros(X_arr.shape[1], dtype=np.float64)
-    current_sumsq = np.zeros(X_arr.shape[1], dtype=np.float64)
-    y_arr = None if y_chunk is None else np.asarray(y_chunk).astype(int)
-    selected_per_label: dict[int, int] = {}
-    per_label_cap: dict[int, int] = {}
-    if y_arr is not None:
-        labels, counts = np.unique(y_arr, return_counts=True)
-        per_label_cap = {int(label): max(0, int(count) - 1) for label, count in zip(labels, counts)}
-        selected_per_label = {label: 0 for label in per_label_cap}
-
-    for _ in range(min(int(max_items), len(remaining))):
-        best_pos = None
-        best_score = None
-        next_n = len(selected) + 1
-        for pos, idx in enumerate(remaining):
-            if y_arr is not None:
-                label = int(y_arr[idx])
-                if selected_per_label.get(label, 0) >= per_label_cap.get(label, 0):
-                    continue
-            row = X_arr[idx]
-            cand_mean = (current_sum + row) / next_n
-            cand_var = (current_sumsq + row * row) / next_n - cand_mean * cand_mean
-            score = float(np.mean((cand_mean - target_mean) ** 2) + 0.25 * np.mean((cand_var - target_var) ** 2))
-            if best_score is None or score < best_score:
-                best_score = score
-                best_pos = pos
-        if best_pos is None:
-            break
-        idx = remaining.pop(best_pos)
-        selected.append(idx)
-        if y_arr is not None:
-            label = int(y_arr[idx])
-            selected_per_label[label] = selected_per_label.get(label, 0) + 1
-        row = X_arr[idx]
-        current_sum += row
-        current_sumsq += row * row
-    return selected
-
-
-def _mmd_far_context_scores(X_rows, reference_context: CSelectionContext | None) -> Any:
+) -> Any:
     ensure_runtime_deps()
     X_arr = np.asarray(X_rows, dtype=np.float64)
     if X_arr.ndim == 1:
@@ -1188,13 +1144,11 @@ def _mmd_far_context_scores(X_rows, reference_context: CSelectionContext | None)
         return np.zeros(X_arr.shape[0], dtype=np.float64)
 
     target_mean = np.asarray(reference_context.target_mean, dtype=np.float64)
-    target_var = np.asarray(reference_context.target_var, dtype=np.float64)
-    row_var = np.zeros_like(X_arr, dtype=np.float64)
-    scores = np.mean((X_arr - target_mean) ** 2, axis=1) + 0.25 * np.mean((row_var - target_var) ** 2, axis=1)
+    scores = np.mean((X_arr - target_mean) ** 2, axis=1)
     return np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64, copy=False)
 
 
-def build_f_mmd_reserved_context(
+def build_test_centroid_reserved_context(
     X_train_for_selection,
     selection_context: CSelectionContext | None,
     *,
@@ -1209,8 +1163,11 @@ def build_f_mmd_reserved_context(
 
     reserve_count = max(1, int(math.ceil(float(reserve_ratio) * n)))
     reserve_count = min(reserve_count, n - 1)
-    scores = _mmd_far_context_scores(X_train_for_selection, selection_context)
-    ranked = np.argsort(scores, kind="stable")[::-1]
+    scores = _test_centroid_distance_scores(
+        X_train_for_selection,
+        selection_context,
+    )
+    ranked = np.argsort(-scores, kind="stable")
     reserved = np.asarray(ranked[:reserve_count], dtype=int)
     reserved_scores = scores[reserved]
 
@@ -1241,7 +1198,7 @@ def _split_ctx_query_from_allowed(
     return allowed_idx[local_ctx_idx], allowed_idx[local_qry_idx], split_strategy
 
 
-def _select_f_mmd_reserved_context_indices(
+def _select_test_centroid_reserved_context_indices(
     y_chunk,
     *,
     global_indices,
@@ -1268,11 +1225,14 @@ def _select_f_mmd_reserved_context_indices(
         return CSelectionResult(
             ctx_idx=np.array([], dtype=int),
             qry_idx=np.array([], dtype=int),
-            split_strategy="f_mmd_reserved_context:fallback",
+            split_strategy="f_test_centroid_reserve:global:fallback",
             distance_sum=selection_context.reserved_context_score_sum,
             distance_sumsq=selection_context.reserved_context_score_sumsq,
             distance_count=selection_context.reserved_context_score_count,
-            fallback_reason="f_mmd reserved context left fewer than two query candidates",
+            fallback_reason=(
+                "f_test_centroid_reserve global reserved context left fewer "
+                "than two query candidates"
+            ),
             label_coverage_ok=False,
         )
 
@@ -1287,11 +1247,14 @@ def _select_f_mmd_reserved_context_indices(
         return CSelectionResult(
             ctx_idx=np.array([], dtype=int),
             qry_idx=np.array([], dtype=int),
-            split_strategy="f_mmd_reserved_context:fallback",
+            split_strategy="f_test_centroid_reserve:global:fallback",
             distance_sum=selection_context.reserved_context_score_sum,
             distance_sumsq=selection_context.reserved_context_score_sumsq,
             distance_count=selection_context.reserved_context_score_count,
-            fallback_reason=f"f_mmd allowed query split failed: {type(exc).__name__}",
+            fallback_reason=(
+                "f_test_centroid_reserve allowed query split failed: "
+                f"{type(exc).__name__}"
+            ),
             label_coverage_ok=False,
         )
 
@@ -1315,11 +1278,18 @@ def _select_f_mmd_reserved_context_indices(
     return CSelectionResult(
         ctx_idx=ctx_idx,
         qry_idx=np.asarray(qry_idx, dtype=int),
-        split_strategy=f"f_mmd_reserved_context:test:{selection_context.metric}:{split_strategy}",
+        split_strategy=(
+            "f_test_centroid_reserve:global:test:"
+            f"{selection_context.metric}:{split_strategy}"
+        ),
         distance_sum=selection_context.reserved_context_score_sum,
         distance_sumsq=selection_context.reserved_context_score_sumsq,
         distance_count=selection_context.reserved_context_score_count,
-        fallback_reason=None if coverage_ok else "f_mmd reserved-context query labels absent from context",
+        fallback_reason=(
+            None
+            if coverage_ok
+            else "f_test_centroid_reserve query labels absent from context"
+        ),
         label_coverage_ok=coverage_ok,
     )
 
@@ -1394,8 +1364,8 @@ def _select_ctx_query_for_chunk(
     config: TTTConfig,
     selection_context: CSelectionContext | None,
 ) -> CSelectionResult:
-    if config.c_selection == "f_mmd":
-        selected = _select_f_mmd_reserved_context_indices(
+    if config.c_selection == TEST_CENTROID_RESERVE_SELECTION:
+        selected = _select_test_centroid_reserved_context_indices(
             y_chunk,
             global_indices=global_indices,
             query_size=query_size,
@@ -1407,8 +1377,8 @@ def _select_ctx_query_for_chunk(
         return CSelectionResult(
             ctx_idx=np.array([], dtype=int),
             qry_idx=np.array([], dtype=int),
-            split_strategy="f_mmd_reserved_context:fallback",
-            fallback_reason="missing f_mmd reserved context",
+            split_strategy="f_test_centroid_reserve:global:fallback",
+            fallback_reason="missing f_test_centroid_reserve global reserved context",
             label_coverage_ok=False,
         )
     elif config.c_selection in {"f_nearest", "f_density_mixed"}:
@@ -2001,6 +1971,7 @@ def build_auto_out_dir(
 
     if args.ttt_enabled:
         c_source_label = "none" if args.ttt_c_selection == "random" else args.ttt_c_source
+        wise_ft_label = bool(args.ttt_wise_ft) and args.ttt_c_selection != "random"
         eval_estimator_parts = [
             f"ttt_eval-{args.ttt_eval_metric}",
             f"finetuneest{args.ttt_n_estimators_finetune}",
@@ -2010,10 +1981,10 @@ def build_auto_out_dir(
             f"q{args.ttt_query_ratio}",
             f"csel{args.ttt_c_selection}",
             f"csrc{c_source_label}",
-            f"wise{_format_path_value(args.ttt_wise_ft)}",
+            f"wise{_format_path_value(wise_ft_label)}",
             f"wisealpha{_format_path_value(args.ttt_wise_alpha)}",
         ]
-        if args.ttt_c_selection == "f_mmd":
+        if args.ttt_c_selection == TEST_CENTROID_RESERVE_SELECTION:
             eval_estimator_parts.extend(
                 [
                     f"cmetric{args.ttt_c_metric}",
@@ -2115,8 +2086,9 @@ def run_ttt_epoch_chunk_update(
     apply_wise_for_dataset: bool = False,
 ) -> TTTUpdateResult:
     ensure_runtime_deps()
-    wise_ft_for_dataset = bool(config.wise_ft) and bool(apply_wise_for_dataset)
-    wise_alpha_for_dataset = float(config.wise_alpha) if bool(config.wise_ft) else None
+    wise_ft_enabled = bool(config.wise_ft) and config.c_selection != "random"
+    wise_ft_for_dataset = wise_ft_enabled and bool(apply_wise_for_dataset)
+    wise_alpha_for_dataset = float(config.wise_alpha) if wise_ft_enabled else None
 
     if config.scheduler not in {"constant", "cosine_warmup"}:
         raise ValueError("--ttt-scheduler must be one of: constant, cosine_warmup")
@@ -2126,7 +2098,7 @@ def run_ttt_epoch_chunk_update(
             loss=None,
             steps=0,
             update_seconds=0.0,
-            wise_ft=bool(config.wise_ft),
+            wise_ft=wise_ft_enabled,
             wise_alpha=wise_alpha_for_dataset,
             reason="--ttt-epochs must be >= 1",
             epochs=0,
@@ -2143,7 +2115,7 @@ def run_ttt_epoch_chunk_update(
             loss=None,
             steps=0,
             update_seconds=time.time() - update_start,
-            wise_ft=bool(config.wise_ft),
+            wise_ft=wise_ft_enabled,
             wise_alpha=wise_alpha_for_dataset,
             reason=(
                 f"TTT training skipped because n_classes={classifier.n_classes_} "
@@ -2165,7 +2137,7 @@ def run_ttt_epoch_chunk_update(
             loss=None,
             steps=0,
             update_seconds=time.time() - update_start,
-            wise_ft=bool(config.wise_ft),
+            wise_ft=wise_ft_enabled,
             wise_alpha=wise_alpha_for_dataset,
             reason="No trainable parameters selected for TTT",
             epochs=0,
@@ -2179,8 +2151,8 @@ def run_ttt_epoch_chunk_update(
     X_encoded = classifier.X_encoder_.transform(X_train)
     y_encoded = classifier.y_encoder_.transform(y_train)
     selection_context = build_c_selection_context(classifier, X_train, X_c_reference, config)
-    if config.c_selection == "f_mmd":
-        build_f_mmd_reserved_context(
+    if config.c_selection == TEST_CENTROID_RESERVE_SELECTION:
+        build_test_centroid_reserved_context(
             transform_chunk_for_c_selection(X_encoded, selection_context),
             selection_context,
             reserve_ratio=config.c_reserve_ratio,
@@ -2231,7 +2203,7 @@ def run_ttt_epoch_chunk_update(
                 loss=None,
                 steps=0,
                 update_seconds=time.time() - update_start,
-                wise_ft=bool(config.wise_ft),
+                wise_ft=wise_ft_enabled,
                 wise_alpha=wise_alpha_for_dataset,
                 reason="Need at least two encoded training samples for chunk TTT",
                 epochs=0,
@@ -2375,7 +2347,7 @@ def run_ttt_epoch_chunk_update(
                 loss=None,
                 steps=0,
                 update_seconds=time.time() - update_start,
-                wise_ft=bool(config.wise_ft),
+                wise_ft=wise_ft_enabled,
                 wise_alpha=wise_alpha_for_dataset,
                 reason=reason,
                 epochs=config.epochs,
@@ -2434,7 +2406,7 @@ def run_ttt_epoch_chunk_update(
         loss=last_loss,
         steps=update_steps,
         update_seconds=time.time() - update_start,
-        wise_ft=bool(config.wise_ft),
+        wise_ft=wise_ft_enabled,
         wise_alpha=wise_alpha_for_dataset,
         wise_applied=wise_applied,
         reason=None,
@@ -2687,11 +2659,12 @@ def evaluate_one_dataset(
 
         classes = pd.unique(pd.Series(np.concatenate([np.asarray(y_train), np.asarray(y_test)], axis=0)))
         dataset_total_rows = int(len(y_train) + len(y_test))
-        apply_wise_for_dataset = bool(ttt_config.wise_ft) and dataset_total_rows < 2000
+        wise_ft_enabled = bool(ttt_config.wise_ft) and ttt_config.c_selection != "random"
+        apply_wise_for_dataset = wise_ft_enabled and dataset_total_rows < 2000
 
         ttt_loss = None
-        ttt_wise_ft = bool(ttt_config.wise_ft) if ttt_config.enabled else False
-        ttt_wise_alpha = float(ttt_config.wise_alpha) if ttt_config.enabled and ttt_config.wise_ft else None
+        ttt_wise_ft = wise_ft_enabled if ttt_config.enabled else False
+        ttt_wise_alpha = float(ttt_config.wise_alpha) if ttt_config.enabled and wise_ft_enabled else None
         ttt_wise_applied = False
         ttt_steps = 0
         ttt_lr = ttt_config.lr if ttt_config.enabled else None
@@ -2737,9 +2710,12 @@ def evaluate_one_dataset(
                         f" c_source={ttt_config.c_source}"
                         f" c_metric={ttt_config.c_metric}"
                     )
-                    if ttt_config.c_selection == "f_mmd":
+                    if ttt_config.c_selection == TEST_CENTROID_RESERVE_SELECTION:
                         reserve_pct = float(ttt_config.c_reserve_ratio) * 100.0
-                        ttt_split_reason += f" | f_mmd_reserved_context={reserve_pct:g}% source=test"
+                        ttt_split_reason += (
+                            " | f_test_centroid_reserve_global_context="
+                            f"{reserve_pct:g}% source=test"
+                        )
                 if ttt_config.wise_ft:
                     if apply_wise_for_dataset:
                         ttt_split_reason += (
@@ -3469,7 +3445,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=True,
         help=(
             "Apply fixed-alpha WiSE-FT weight interpolation after the FT update path "
-            "for datasets with total rows < 2000."
+            "for datasets with total rows < 2000. This is always disabled when "
+            "--ttt-c-selection=random."
         ),
     )
     parser.add_argument(
@@ -3504,13 +3481,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ttt-freeze-icl", type=parse_bool, default=False)
     parser.add_argument(
         "--ttt-c-selection",
-        choices=["random", "f_mmd"],
-        default="f_mmd",
+        choices=["random", TEST_CENTROID_RESERVE_SELECTION],
+        default=TEST_CENTROID_RESERVE_SELECTION,
         help=(
             "How to choose the per-chunk query C used for TTT. random uses the "
             "stratified-first chunk split without an unlabeled reference distribution; "
-            "f_mmd reserves the farthest --ttt-c-reserve-ratio train rows from the "
-            "test distribution as context-only rows."
+            "f_test_centroid_reserve globally reserves the farthest "
+            "--ttt-c-reserve-ratio train rows from the test centroid as "
+            "context-only rows."
         ),
     )
     parser.add_argument(
@@ -3539,7 +3517,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0.05,
         help=(
             "Fraction of train rows reserved as test-farthest context-only rows when "
-            "--ttt-c-selection=f_mmd. Must be in (0, 1), and reserve_ratio + "
+            "--ttt-c-selection=f_test_centroid_reserve. Must be in (0, 1), "
+            "and reserve_ratio + "
             "--ttt-query-ratio must be < 1."
         ),
     )

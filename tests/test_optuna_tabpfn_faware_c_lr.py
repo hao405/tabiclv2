@@ -173,6 +173,9 @@ def test_trial_path_contains_lr_and_reserve_ratio(tmp_path):
 
     assert paths.out_dir.parent == tmp_path / "trials"
     assert paths.out_dir.name == "trial_0003_lr_7em06_rr_0p15"
+    assert paths.log_path == (
+        tmp_path / "logs" / "trial_0003_lr_7em06_rr_0p15.log"
+    )
 
 
 def test_trial_path_rounds_long_sampled_values_for_readability(tmp_path):
@@ -241,7 +244,7 @@ def test_build_trial_command_contains_joint_parameters(tmp_path):
         ttt_lr=7e-6,
         ttt_epochs=30,
         ttt_query_ratio=0.4,
-        ttt_c_selection="f_mmd",
+        ttt_c_selection="f_test_centroid_reserve",
         ttt_c_metric="standardized_l2",
         ttt_c_reserve_ratio=0.15,
         ttt_weight_decay=0.01,
@@ -269,21 +272,31 @@ def test_validate_search_space_rejects_invalid_reserve_ranges():
     with pytest.raises(ValueError, match="reserve ratio bounds"):
         search.validate_search_space(5e-6, 1e-5, 0.6, 0.2, 0.2, "random")
 
-    with pytest.raises(ValueError, match="must be < 1 for f_mmd"):
-        search.validate_search_space(5e-6, 1e-5, 0.01, 0.4, 0.6, "f_mmd")
+    with pytest.raises(
+        ValueError,
+        match="must be < 1 for f_test_centroid_reserve",
+    ):
+        search.validate_search_space(
+            5e-6,
+            1e-5,
+            0.01,
+            0.4,
+            0.6,
+            "f_test_centroid_reserve",
+        )
 
     search.validate_search_space(5e-6, 1e-5, 0.01, 0.4, 0.6, "random")
 
 
-def test_parser_defaults_use_v3_f_mmd_and_fixed_query_ratio():
+def test_parser_defaults_use_v3_test_centroid_reserve_and_fixed_query_ratio():
     args = search.build_arg_parser().parse_args([])
 
     assert args.model_version == "v3"
     assert args.study_name == "tabpfnv3_lr_reserve_ratio"
-    assert args.ttt_c_selection == "f_mmd"
+    assert args.ttt_c_selection == "f_test_centroid_reserve"
     assert args.ttt_query_ratio == 0.2
-    assert args.reserve_ratio_low == 0.01
-    assert args.reserve_ratio_high == 0.4
+    assert args.reserve_ratio_low == search.RESERVE_RATIO_LOW
+    assert args.reserve_ratio_high == search.RESERVE_RATIO_HIGH
 
 
 def test_evaluate_trial_outputs_maximizes_status_ok_average_accuracy(tmp_path):
@@ -300,18 +313,47 @@ def test_evaluate_trial_outputs_maximizes_status_ok_average_accuracy(tmp_path):
 
 def test_ensure_trial_outputs_reuses_valid_cache(tmp_path):
     out_dir = tmp_path / "cached"
+    log_path = tmp_path / "logs" / "cached.log"
     write_trial_outputs(out_dir, accuracies={"alpha": 0.8})
+    log_path.parent.mkdir(parents=True)
+    log_path.write_text("existing log\n", encoding="utf-8")
 
     def fail_runner(*args, **kwargs):
         raise AssertionError("runner should not be called when cache is valid")
 
     reused = search.ensure_trial_outputs(
         out_dir=out_dir,
+        log_path=log_path,
         command=["python", "runner.py"],
         runner=fail_runner,
     )
 
     assert reused is True
+    assert log_path.read_text(encoding="utf-8") == "existing log\n"
+
+
+def test_ensure_trial_outputs_combines_stdout_and_stderr_in_log(tmp_path):
+    out_dir = tmp_path / "trial"
+    log_path = tmp_path / "logs" / "trial.log"
+
+    def fake_runner(command, cwd, env, check, stdout, stderr):
+        assert stderr is subprocess.STDOUT
+        stdout.write("runner stdout\n")
+        stdout.write("runner stderr\n")
+        write_trial_outputs(out_dir, accuracies={"alpha": 0.8})
+        return subprocess.CompletedProcess(command, 0)
+
+    reused = search.ensure_trial_outputs(
+        out_dir=out_dir,
+        log_path=log_path,
+        command=["python", "runner.py"],
+        runner=fake_runner,
+    )
+
+    assert reused is False
+    assert log_path.read_text(encoding="utf-8") == (
+        "runner stdout\nrunner stderr\n"
+    )
 
 
 def test_dry_run_writes_only_trials_and_best_summary(tmp_path):
@@ -342,8 +384,10 @@ def test_dry_run_writes_only_trials_and_best_summary(tmp_path):
     assert exit_code == 0
     assert {path.name for path in output_root.iterdir()} == {
         "trials",
+        "logs",
         "best_summary.json",
     }
+    assert list((output_root / "logs").iterdir()) == []
     summary = json.loads((output_root / "best_summary.json").read_text())
     assert summary["mode"] == "dry_run"
     assert summary["planned_trials"] == 2
@@ -362,6 +406,8 @@ def test_dry_run_writes_only_trials_and_best_summary(tmp_path):
         assert "--ttt-query-ratio" in trial["command"]
         assert "--ttt-c-reserve-ratio" in trial["command"]
         assert "_rr_" in Path(trial["out_dir"]).name
+        assert Path(trial["log_path"]).parent == output_root / "logs"
+        assert Path(trial["log_path"]).stem == Path(trial["out_dir"]).name
 
 
 def test_main_writes_only_trials_and_best_summary(tmp_path, monkeypatch):
@@ -373,20 +419,25 @@ def test_main_writes_only_trials_and_best_summary(tmp_path, monkeypatch):
 
     monkeypatch.setattr(search, "load_optuna", lambda: FakeOptuna)
 
-    def fake_runner(command, cwd, env, check):
+    def fake_runner(command, cwd, env, check, stdout, stderr):
         out_dir = Path(command[command.index("--out-dir") + 1])
         assert float(command[command.index("--ttt-lr") + 1]) == 7e-6
         assert float(command[command.index("--ttt-query-ratio") + 1]) == 0.2
         assert float(command[command.index("--ttt-c-reserve-ratio") + 1]) == 0.15
         assert command[command.index("--ttt-eval-metric") + 1] == "acc"
+        assert stderr is subprocess.STDOUT
+        stdout.write("fake trial output\n")
         write_trial_outputs(out_dir, accuracies={"alpha": 0.81, "beta": 0.83})
         return subprocess.CompletedProcess(command, 0)
 
     original_ensure = search.ensure_trial_outputs
 
-    def fake_ensure_trial_outputs(*, out_dir: Path, command, cwd, force=False, runner=None):
+    def fake_ensure_trial_outputs(
+        *, out_dir: Path, log_path: Path, command, cwd, force=False, runner=None
+    ):
         return original_ensure(
             out_dir=out_dir,
+            log_path=log_path,
             command=command,
             cwd=cwd,
             force=force,
@@ -417,6 +468,7 @@ def test_main_writes_only_trials_and_best_summary(tmp_path, monkeypatch):
     assert exit_code == 0
     assert {path.name for path in output_root.iterdir()} == {
         "trials",
+        "logs",
         "best_summary.json",
     }
     summary = json.loads((output_root / "best_summary.json").read_text())
@@ -430,3 +482,7 @@ def test_main_writes_only_trials_and_best_summary(tmp_path, monkeypatch):
     assert best["ttt_c_reserve_ratio"] == 0.15
     assert best["ok_count"] == 2
     assert Path(best["out_dir"]).name == "trial_0000_lr_7em06_rr_0p15"
+    assert Path(best["log_path"]).name == "trial_0000_lr_7em06_rr_0p15.log"
+    assert Path(best["log_path"]).read_text(encoding="utf-8") == (
+        "fake trial output\n"
+    )

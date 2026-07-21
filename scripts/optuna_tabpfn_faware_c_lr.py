@@ -30,16 +30,17 @@ RUNNER_PATH = (
     / "TabPFN-main"
     / "Tabpfn_1c_ttt_faware_c.py"
 )
-LR_LOW = 2e-6
-LR_HIGH = 1.5e-5
+LR_LOW = 1e-6
+LR_HIGH = 1e-5
 RESERVE_RATIO_LOW = 0.01
-RESERVE_RATIO_HIGH = 0.3
-DEFAULT_OUTPUT_METHOD = "optuna_lr"
+RESERVE_RATIO_HIGH = 0.25
+DEFAULT_OUTPUT_METHOD = "data184_lr_reserve_ratio"
 
 
 @dataclass(frozen=True)
 class TrialPaths:
     out_dir: Path
+    log_path: Path
 
 
 def resolve_repo_path(value: str | Path) -> Path:
@@ -236,6 +237,7 @@ def has_valid_trial_outputs(out_dir: Path) -> bool:
 def ensure_trial_outputs(
     *,
     out_dir: Path,
+    log_path: Path,
     command: list[str],
     cwd: Path = REPO_ROOT,
     force: bool = False,
@@ -246,16 +248,20 @@ def ensure_trial_outputs(
         return True
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
 
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
     runner = runner or subprocess.run
-    completed = runner(
-        command,
-        cwd=cwd,
-        env=env,
-        check=False,
-    )
+    with log_path.open("w", encoding="utf-8") as log_handle:
+        completed = runner(
+            command,
+            cwd=cwd,
+            env=env,
+            check=False,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+        )
 
     if completed.returncode != 0:
         raise RuntimeError(
@@ -307,6 +313,7 @@ def trial_paths(
     slug = format_trial_dir_name(trial_number, ttt_lr, ttt_c_reserve_ratio)
     return TrialPaths(
         out_dir=output_root / "trials" / slug,
+        log_path=output_root / "logs" / f"{slug}.log",
     )
 
 
@@ -323,6 +330,7 @@ def record_from_trial(trial: Any) -> dict[str, Any]:
         "failed_count": attrs.get("failed_count"),
         "avg_accuracy_ok": attrs.get("avg_accuracy_ok"),
         "out_dir": attrs.get("out_dir"),
+        "log_path": attrs.get("log_path"),
         "command": attrs.get("command"),
         "error": attrs.get("error"),
     }
@@ -402,11 +410,12 @@ def validate_search_space(
     if not 0.0 < float(ttt_query_ratio) < 1.0:
         raise ValueError("--ttt-query-ratio must be in (0, 1)")
     if (
-        str(ttt_c_selection) == "f_mmd"
+        str(ttt_c_selection) == "f_test_centroid_reserve"
         and float(reserve_ratio_high) + float(ttt_query_ratio) >= 1.0
     ):
         raise ValueError(
-            "--reserve-ratio-high + --ttt-query-ratio must be < 1 for f_mmd"
+            "--reserve-ratio-high + --ttt-query-ratio must be < 1 for "
+            "f_test_centroid_reserve"
         )
 
 
@@ -458,11 +467,13 @@ def create_objective(args: argparse.Namespace, output_root: Path):
             ttt_grad_accumulation_steps=int(args.ttt_grad_accumulation_steps),
         )
         trial.set_user_attr("out_dir", str(paths.out_dir))
+        trial.set_user_attr("log_path", str(paths.log_path))
         trial.set_user_attr("command", shlex.join(command))
         print(f"trial_command: {shlex.join(command)}", flush=True)
         try:
             reused_cache = ensure_trial_outputs(
                 out_dir=paths.out_dir,
+                log_path=paths.log_path,
                 command=command,
                 cwd=REPO_ROOT,
                 force=bool(args.force),
@@ -535,6 +546,7 @@ def dry_run_trials(args: argparse.Namespace, output_root: Path) -> None:
                 "failed_count": "",
                 "avg_accuracy_ok": "",
                 "out_dir": str(paths.out_dir),
+                "log_path": str(paths.log_path),
                 "command": shlex.join(command),
                 "error": "",
             }
@@ -573,7 +585,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--data-root", default="data184")
+    parser.add_argument("--data-root", default="data184", help="Root directory for benchmark datasets")
     parser.add_argument(
         "--output-root",
         default=None,
@@ -582,8 +594,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "results/tabpfn/<model-version>/optuna_lr/<numbered-run>."
         ),
     )
-    parser.add_argument("--study-name", default="tabpfnv3_lr_reserve_ratio")
-    parser.add_argument("--n-trials", type=int, default=5)
+    parser.add_argument("--study-name", default="tabpfnv3_lr_reserve_ratio_data184")
+    parser.add_argument("--n-trials", type=int, default=4)
     parser.add_argument("--timeout", type=int, default=None)
     parser.add_argument("--sampler-seed", type=int, default=42)
     parser.add_argument("--python-bin", default=sys.executable)
@@ -601,8 +613,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reserve-ratio-high", type=float, default=RESERVE_RATIO_HIGH)
     parser.add_argument("--ttt-query-ratio", type=float, default=0.2)
     parser.add_argument("--ttt-epochs", type=int, default=30)
-    parser.add_argument("--ttt-c-selection", choices=["f_mmd", "random"], default="f_mmd")
-    parser.add_argument("--ttt-c-metric", choices=["raw_l2", "standardized_l2"], default="raw_l2")
+    parser.add_argument(
+        "--ttt-c-selection",
+        choices=["f_test_centroid_reserve", "random"],
+        default="f_test_centroid_reserve",
+    )
+    parser.add_argument("--ttt-c-metric", choices=["raw_l2", "standardized_l2"], default="standardized_l2")
     parser.add_argument("--ttt-weight-decay", type=float, default=0.01)
     parser.add_argument("--ttt-patience", type=int, default=8)
     parser.add_argument("--ttt-min-delta", type=float, default=1e-4)
@@ -643,6 +659,7 @@ def main(argv: list[str] | None = None) -> int:
         output_root = resolve_repo_path(args.output_root)
         output_root.mkdir(parents=True, exist_ok=True)
     (output_root / "trials").mkdir(parents=True, exist_ok=True)
+    (output_root / "logs").mkdir(parents=True, exist_ok=True)
 
     if args.dry_run:
         dry_run_trials(args, output_root)

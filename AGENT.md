@@ -112,7 +112,7 @@ GPU 参数不要混用：TabPFN-main 三个脚本和 `benchmark.py` 的 `--gpus`
 
 ## 远程运行与复现实验规范
 
-需要真实训练、benchmark、GPU smoke 或复现结果时，优先使用用户指定的运行环境。若用户没有指定，默认先考虑 `ssh 238`；涉及集群 GPU 或 `jiqun` 时，使用 `ssh jiqun` 后附着既有 `tmux zh` 会话，并确认 repo 路径、`data184`、权重文件和脚本同步。
+需要真实训练、benchmark、GPU smoke 或复现结果时，优先使用用户指定的运行环境。若用户没有指定，默认先考虑 `ssh jiqun`；涉及集群 GPU 或 `jiqun` 时，使用 `ssh jiqun` 后附着既有 `tmux zh` 会话，并确认 repo 路径、`data184`、权重文件和脚本同步。
 
 全量实验应遵循“先 smoke，再全量”的顺序。远程验证成功时，必须回报具体 evidence：命令、输出目录、`all_classification_results.csv`、`summary.txt`、关键 telemetry 字段和退出状态。
 

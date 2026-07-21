@@ -27,16 +27,23 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-DEFAULT_DATA_ROOT = Path("data184")
+DEFAULT_DATA_ROOT = Path("results/dataset_views/openml_cc18_max10")
 DEFAULT_MODEL_PATH = "tabicl-classifier-v2-20260212.ckpt"
 DEFAULT_CHECKPOINT_VERSION = "tabicl-classifier-v2-20260212.ckpt"
 DEFAULT_TABPFN_MODEL_PATH = Path(
     "baseline_compare/TabPFN-main/tabpfn-v2-classifier-v2_default.ckpt"
 )
+DEFAULT_TABPFN_V3_BINARY_MODEL_PATH = Path(
+    "baseline_compare/TabPFN-main/tabpfn-v3-classifier-v3_20260417_binary.ckpt"
+)
+DEFAULT_TABPFN_V3_MULTICLASS_MODEL_PATH = Path(
+    "baseline_compare/TabPFN-main/tabpfn-v3-classifier-v3_20260417_multiclass.ckpt"
+)
 DEFAULT_OUT_DIR_ROOT = Path("results/PEFT")
 TABPFN_RUNNER_PATH = REPO_ROOT / "baseline_compare/TabPFN-main/Tabpfn_1c_ttt.py"
 PEFT_METHODS = ("lora", "last_layers", "ln_head_embedding")
-MODEL_FAMILIES = ("tabiclv2", "tabpfnv2")
+MODEL_FAMILIES = ("tabiclv2", "tabpfnv2", "tabpfnv3")
+MATRIX_MODEL_FAMILIES = ("tabiclv2", "tabpfnv3")
 CLASSIFICATION_TASKS = {"binclass", "multiclass"}
 CATEGORICAL_MISSING_TOKEN = "__tabicl_missing__"
 
@@ -1219,12 +1226,24 @@ def _select_last_layer_params(model, config: TTTConfig, targets: Set[str]) -> No
         _set_requires_grad(icl.decoder, True)
 
 
-def _set_layer_norm_trainable(module) -> None:
+def _set_normalization_trainable(module) -> None:
     import torch
 
+    normalization_types = [torch.nn.LayerNorm]
+    rms_norm = getattr(torch.nn, "RMSNorm", None)
+    if rms_norm is not None:
+        normalization_types.append(rms_norm)
+    normalization_types_tuple = tuple(normalization_types)
     for child in module.modules():
-        if isinstance(child, torch.nn.LayerNorm):
+        if isinstance(child, normalization_types_tuple) or child.__class__.__name__.endswith(
+            "RMSNorm"
+        ):
             _set_requires_grad(child, True)
+
+
+def _set_layer_norm_trainable(module) -> None:
+    """Compatibility alias that now also covers TabPFNv3 RMSNorm modules."""
+    _set_normalization_trainable(module)
 
 
 def _set_named_child_trainable(module, *names: str) -> None:
@@ -1339,6 +1358,58 @@ def _configure_tabpfn_trainable_params(model, config: TTTConfig):
     trainable = [param for param in model.parameters() if param.requires_grad]
     if not trainable:
         raise RuntimeError(f"TabPFN PEFT method {method!r} selected no trainable parameters")
+    return trainable
+
+
+def _tabpfnv3_output_head_names(model) -> tuple[str, ...]:
+    if hasattr(model, "many_class_decoder"):
+        return ("many_class_decoder",)
+    if hasattr(model, "output_projection"):
+        return ("output_projection",)
+    raise RuntimeError(
+        "TabPFNv3 PEFT requires many_class_decoder or output_projection"
+    )
+
+
+def _configure_tabpfnv3_trainable_params(model, config: TTTConfig):
+    """Apply PEFT policies to a loaded TabPFNv3 binary or multiclass model."""
+    model.train()
+    for param in model.parameters():
+        param.requires_grad = False
+
+    method = str(config.peft_method).lower()
+    if method == "lora":
+        installed = _install_lora(model, config)
+        if installed == 0:
+            raise RuntimeError(
+                "LoRA PEFT did not find any TabPFNv3 Linear or attention projection layers"
+            )
+        _set_lora_trainable_only(model)
+    elif method == "last_layers":
+        blocks = getattr(model, "icl_blocks", None)
+        if blocks is None:
+            raise RuntimeError("TabPFNv3 last_layers PEFT requires model.icl_blocks")
+        start = max(0, len(blocks) - int(config.last_n_icl_blocks))
+        for block in list(blocks)[start:]:
+            _set_requires_grad(block, True)
+        _set_named_child_trainable(model, "output_norm", *_tabpfnv3_output_head_names(model))
+    elif method == "ln_head_embedding":
+        _set_normalization_trainable(model)
+        _set_named_child_trainable(
+            model,
+            "x_embed",
+            "col_y_encoder",
+            "icl_y_encoder",
+            *_tabpfnv3_output_head_names(model),
+        )
+    else:
+        raise ValueError(
+            "--ttt-peft-method must be one of: lora, last_layers, ln_head_embedding"
+        )
+
+    trainable = [param for param in model.parameters() if param.requires_grad]
+    if not trainable:
+        raise RuntimeError(f"TabPFNv3 PEFT method {method!r} selected no trainable parameters")
     return trainable
 
 
@@ -3012,7 +3083,88 @@ def _load_tabpfn_runner_module():
     return module
 
 
-def _tabpfn_args_from_common(args: argparse.Namespace, module) -> argparse.Namespace:
+@dataclass(frozen=True)
+class TabICLBackend:
+    model_family: str = "tabiclv2"
+
+
+class TabPFNBackend:
+    model_family: str
+    model_version: str
+    peft_targets: str
+
+    def configure_runner_args(
+        self,
+        args: argparse.Namespace,
+        tabpfn_args: argparse.Namespace,
+    ) -> None:
+        raise NotImplementedError
+
+    def configure_trainable_params(self, model, config: TTTConfig):
+        raise NotImplementedError
+
+
+class TabPFNv2Backend(TabPFNBackend):
+    model_family = "tabpfnv2"
+    model_version = "v2"
+    peft_targets = "tabpfnv2_all"
+
+    def configure_runner_args(
+        self,
+        args: argparse.Namespace,
+        tabpfn_args: argparse.Namespace,
+    ) -> None:
+        tabpfn_args.model_version = self.model_version
+        tabpfn_args.model_path = str(Path(args.tabpfn_model_path).expanduser().resolve())
+        tabpfn_args.v3_binary_model_path = "auto"
+        tabpfn_args.v3_multiclass_model_path = "auto"
+
+    def configure_trainable_params(self, model, config: TTTConfig):
+        return _configure_tabpfn_trainable_params(model, config)
+
+
+class TabPFNv3Backend(TabPFNBackend):
+    model_family = "tabpfnv3"
+    model_version = "v3"
+    peft_targets = "tabpfnv3_all"
+
+    def configure_runner_args(
+        self,
+        args: argparse.Namespace,
+        tabpfn_args: argparse.Namespace,
+    ) -> None:
+        tabpfn_args.model_version = self.model_version
+        tabpfn_args.model_path = None
+        tabpfn_args.v3_binary_model_path = str(
+            Path(args.tabpfn_v3_binary_model_path).expanduser().resolve()
+        )
+        tabpfn_args.v3_multiclass_model_path = str(
+            Path(args.tabpfn_v3_multiclass_model_path).expanduser().resolve()
+        )
+
+    def configure_trainable_params(self, model, config: TTTConfig):
+        return _configure_tabpfnv3_trainable_params(model, config)
+
+
+TABPFN_BACKENDS: Dict[str, TabPFNBackend] = {
+    backend.model_family: backend
+    for backend in (TabPFNv2Backend(), TabPFNv3Backend())
+}
+
+
+def _get_tabpfn_backend(model_family: str) -> TabPFNBackend:
+    try:
+        return TABPFN_BACKENDS[model_family]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported TabPFN model family: {model_family}") from exc
+
+
+def _tabpfn_args_from_common(
+    args: argparse.Namespace,
+    module,
+    backend: Optional[TabPFNBackend] = None,
+) -> argparse.Namespace:
+    backend = backend or _get_tabpfn_backend(args.model_family)
     tabpfn_args = module.build_arg_parser().parse_args([])
     tabpfn_args.data_root = str(Path(args.data_root).resolve())
     tabpfn_args.out_dir = str(Path(args.out_dir).resolve())
@@ -3022,10 +3174,7 @@ def _tabpfn_args_from_common(args: argparse.Namespace, module) -> argparse.Names
     tabpfn_args.random_state = int(args.random_state)
     tabpfn_args.n_estimators = int(args.n_estimators)
     tabpfn_args.verbose = bool(args.verbose)
-    tabpfn_args.model_version = "v2"
-    tabpfn_args.model_path = str(Path(args.tabpfn_model_path).expanduser().resolve())
-    tabpfn_args.v3_binary_model_path = "auto"
-    tabpfn_args.v3_multiclass_model_path = "auto"
+    backend.configure_runner_args(args, tabpfn_args)
     tabpfn_args.many_class = "off"
     tabpfn_args.ttt = bool(args.ttt_enabled)
     tabpfn_args.ttt_epochs = int(args.ttt_epochs)
@@ -3078,11 +3227,12 @@ def tabpfn_peft_worker_main(
         ensure_runtime_deps()
         device_str = apply_worker_environment_updates(gpu_group)
         if "," in normalize_gpu_group(gpu_group):
-            raise ValueError("TabPFNv2 PEFT supports one physical GPU per worker")
+            raise ValueError("TabPFN PEFT supports one physical GPU per worker")
 
         args = argparse.Namespace(**args_dict)
+        backend = _get_tabpfn_backend(args.model_family)
         module = _load_tabpfn_runner_module()
-        tabpfn_args = _tabpfn_args_from_common(args, module)
+        tabpfn_args = _tabpfn_args_from_common(args, module, backend)
         peft_config = build_ttt_config(args)
         peft_telemetry: Dict[str, Any] = {}
 
@@ -3092,7 +3242,7 @@ def tabpfn_peft_worker_main(
 
                 def configure_model_for_optimization(instance, model) -> None:
                     del instance
-                    _configure_tabpfn_trainable_params(model, peft_config)
+                    backend.configure_trainable_params(model, peft_config)
                     trainable, ratio = _peft_trainable_summary(model)
                     peft_telemetry.update(
                         {
@@ -3114,9 +3264,9 @@ def tabpfn_peft_worker_main(
             record = asdict(row)
             record.update(
                 {
-                    "model_family": "tabpfnv2",
+                    "model_family": backend.model_family,
                     "peft_method": str(peft_config.peft_method),
-                    "peft_targets": "tabpfn_all",
+                    "peft_targets": backend.peft_targets,
                     "peft_trainable_params": peft_telemetry.get("peft_trainable_params"),
                     "peft_trainable_ratio": peft_telemetry.get("peft_trainable_ratio"),
                     "peft_rank": (
@@ -3157,7 +3307,7 @@ def tabpfn_peft_worker_main(
                         predict_seconds=0.0,
                         status="fail",
                         error=traceback.format_exc(),
-                        model_family="tabpfnv2",
+                        model_family=str(args_dict.get("model_family", "tabpfn")),
                     )
                 ),
                 "peft_method": args_dict.get("ttt_peft_method"),
@@ -3219,11 +3369,11 @@ def run_tabpfn_single_model_mode(
     system_failure = all_df["dataset_name"].astype(str).str.startswith("__WORKER_")
     if integrity_errors or system_failure.any():
         details = "; ".join(integrity_errors) if integrity_errors else "worker failure row produced"
-        raise RuntimeError(f"TabPFNv2 PEFT worker output integrity check failed: {details}")
+        raise RuntimeError(f"TabPFN PEFT worker output integrity check failed: {details}")
 
 
 def expand_matrix_trials(model_family: str, peft_method: str) -> List[tuple[str, str]]:
-    models = list(MODEL_FAMILIES) if model_family == "all" else [model_family]
+    models = list(MATRIX_MODEL_FAMILIES) if model_family == "all" else [model_family]
     methods = list(PEFT_METHODS) if peft_method == "all" else [peft_method]
     return [(model, method) for model in models for method in methods]
 
@@ -3247,6 +3397,70 @@ def _trial_is_complete(trial_dir: Path) -> bool:
     except Exception:
         return False
     return config.get("status") == "success"
+
+
+def _resolve_manifest_output_dir(manifest_path: Path, value: Any) -> Path:
+    output_dir = Path(str(value)).expanduser()
+    if output_dir.is_absolute():
+        return output_dir
+    repo_relative = REPO_ROOT / output_dir
+    if repo_relative.exists():
+        return repo_relative
+    return manifest_path.parent / output_dir
+
+
+def _load_reused_matrix_trials(
+    source_manifest_value: Optional[str],
+    trials: List[tuple[str, str]],
+) -> Dict[tuple[str, str], Dict[str, Any]]:
+    if not source_manifest_value:
+        return {}
+
+    source_manifest = Path(source_manifest_value).expanduser()
+    if not source_manifest.is_absolute():
+        source_manifest = REPO_ROOT / source_manifest
+    if not source_manifest.is_file():
+        raise FileNotFoundError(f"Reuse matrix manifest does not exist: {source_manifest}")
+    source_payload = json.loads(source_manifest.read_text(encoding="utf-8"))
+    source_index = {
+        (item.get("model_family"), item.get("peft_method")): item
+        for item in source_payload.get("trials", [])
+    }
+
+    reused: Dict[tuple[str, str], Dict[str, Any]] = {}
+    for key in trials:
+        if key[0] != "tabiclv2":
+            continue
+        source_item = source_index.get(key)
+        if source_item is None:
+            raise ValueError(
+                f"Reuse manifest has no completed trial for {key[0]}/{key[1]}"
+            )
+        if source_item.get("status") != "success":
+            raise ValueError(
+                f"Reuse trial {key[0]}/{key[1]} is not success: "
+                f"{source_item.get('status')!r}"
+            )
+        source_output_dir = _resolve_manifest_output_dir(
+            source_manifest,
+            source_item.get("output_dir"),
+        )
+        if not _trial_is_complete(source_output_dir):
+            raise ValueError(
+                f"Reuse trial {key[0]}/{key[1]} has incomplete artifacts: "
+                f"{source_output_dir}"
+            )
+        reused[key] = {
+            "model_family": key[0],
+            "peft_method": key[1],
+            "status": "success",
+            "execution": "reused",
+            "output_dir": str(source_output_dir),
+            "source_manifest": str(source_manifest),
+            "source_output_dir": str(source_output_dir),
+            **_summarize_trial_output(source_output_dir),
+        }
+    return reused
 
 
 def _append_log(log_paths: List[Path], text_value: str) -> None:
@@ -3338,6 +3552,10 @@ def build_matrix_trial_command(
         str(args.tabicl_model_path),
         "--tabpfn-model-path",
         str(args.tabpfn_model_path),
+        "--tabpfn-v3-binary-model-path",
+        str(args.tabpfn_v3_binary_model_path),
+        "--tabpfn-v3-multiclass-model-path",
+        str(args.tabpfn_v3_multiclass_model_path),
         "--checkpoint-version",
         str(args.checkpoint_version),
         "--ttt-early-stopping",
@@ -3356,19 +3574,70 @@ def _summarize_trial_output(trial_dir: Path) -> Dict[str, Any]:
     ensure_runtime_deps()
     csv_path = trial_dir / "all_classification_results.csv"
     if not csv_path.exists():
-        return {"ok_count": 0, "peft_applied_count": 0, "mean_accuracy": None}
+        return {
+            "ok_count": 0,
+            "peft_applied_count": 0,
+            "nonzero_trainable_count": 0,
+            "mean_accuracy": None,
+        }
     frame = pd.read_csv(csv_path)
     ok = frame[frame["status"].astype(str) == "ok"] if "status" in frame else frame.iloc[0:0]
     applied = ok[truthy_column_mask(ok, "ttt_applied")] if len(ok) else ok
     accuracy = pd.to_numeric(applied.get("accuracy"), errors="coerce") if len(applied) else None
+    trainable = (
+        pd.to_numeric(applied.get("peft_trainable_params"), errors="coerce")
+        if len(applied) and "peft_trainable_params" in applied
+        else None
+    )
     return {
         "row_count": int(len(frame)),
         "ok_count": int(len(ok)),
         "peft_applied_count": int(len(applied)),
+        "nonzero_trainable_count": (
+            int((trainable > 0).sum()) if trainable is not None else 0
+        ),
+        "skipped_count": int((frame.get("status", pd.Series(dtype=str)).astype(str) == "skip").sum()),
+        "ttt_oom_fallback_count": int(
+            truthy_column_mask(frame, "ttt_oom_fallback").sum()
+        ),
         "mean_accuracy": (
             float(accuracy.mean()) if accuracy is not None and accuracy.notna().any() else None
         ),
     }
+
+
+def _write_matrix_common_results(
+    matrix_rows: List[Dict[str, Any]],
+    matrix_dir: Path,
+) -> int:
+    ensure_runtime_deps()
+    frames: List[Any] = []
+    dataset_sets: List[Set[str]] = []
+    for item in matrix_rows:
+        if item.get("status") != "success":
+            continue
+        csv_path = Path(str(item["output_dir"])) / "all_classification_results.csv"
+        if not csv_path.is_file():
+            continue
+        frame = pd.read_csv(csv_path)
+        if "status" not in frame or "dataset_name" not in frame:
+            continue
+        frame = frame[
+            (frame["status"].astype(str) == "ok")
+            & truthy_column_mask(frame, "ttt_applied")
+        ].copy()
+        frame["model_family"] = item["model_family"]
+        frame["peft_method"] = item["peft_method"]
+        frames.append(frame)
+        dataset_sets.append(set(frame["dataset_name"].astype(str)))
+
+    common = set.intersection(*dataset_sets) if dataset_sets else set()
+    common_frames = [
+        frame[frame["dataset_name"].astype(str).isin(common)] for frame in frames
+    ]
+    common_frame = pd.concat(common_frames, ignore_index=True) if common_frames else pd.DataFrame()
+    common_frame.to_csv(matrix_dir / "matrix_common_results.csv", index=False)
+    return len(common)
 
 
 def run_matrix_mode(args: argparse.Namespace) -> None:
@@ -3381,6 +3650,7 @@ def run_matrix_mode(args: argparse.Namespace) -> None:
         raise ValueError("Matrix PEFT mode requires TTT/finetuning to be enabled")
 
     trials = expand_matrix_trials(args.model_family, args.ttt_peft_method)
+    reused_trials = _load_reused_matrix_trials(args.reuse_matrix_manifest, trials)
     run_name = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
     output_root = Path(args.output_root).expanduser()
     matrix_dir = output_root / "_matrix" / run_name
@@ -3398,6 +3668,7 @@ def run_matrix_mode(args: argparse.Namespace) -> None:
             "run_name": run_name,
             "created_at": datetime.now().isoformat(),
             "status": "running",
+            "reuse_matrix_manifest": args.reuse_matrix_manifest,
             "trials": [],
         }
     indexed = {
@@ -3408,10 +3679,22 @@ def run_matrix_mode(args: argparse.Namespace) -> None:
     matrix_rows: List[Dict[str, Any]] = []
     any_failed = False
     for model_family, peft_method in trials:
+        key = (model_family, peft_method)
+        if key in reused_trials:
+            reused_item = dict(reused_trials[key])
+            previous_item = indexed.get(key)
+            if previous_item is None:
+                manifest["trials"].append(reused_item)
+            else:
+                manifest["trials"][manifest["trials"].index(previous_item)] = reused_item
+            indexed[key] = reused_item
+            matrix_rows.append(dict(reused_item))
+            _atomic_write_json(manifest_path, manifest)
+            continue
+
         trial_dir = output_root / model_family / peft_method / run_name
         trial_dir.mkdir(parents=True, exist_ok=True)
         (trial_dir / "logs").mkdir(parents=True, exist_ok=True)
-        key = (model_family, peft_method)
         item = indexed.get(key)
         if args.resume and item and item.get("status") == "success" and _trial_is_complete(trial_dir):
             summary = _summarize_trial_output(trial_dir)
@@ -3457,6 +3740,7 @@ def run_matrix_mode(args: argparse.Namespace) -> None:
                 summary.get("row_count", 0) > 0
                 and summary.get("ok_count") == summary.get("row_count")
                 and summary.get("peft_applied_count") == summary.get("row_count")
+                and summary.get("nonzero_trainable_count") == summary.get("row_count")
             )
         item["status"] = "success" if exit_code == 0 and valid_peft else "fail"
         matrix_rows.append(dict(item))
@@ -3468,6 +3752,8 @@ def run_matrix_mode(args: argparse.Namespace) -> None:
 
     manifest["status"] = "fail" if any_failed else "success"
     manifest["finished_at"] = datetime.now().isoformat()
+    common_dataset_count = _write_matrix_common_results(matrix_rows, matrix_dir)
+    manifest["common_successful_dataset_count"] = common_dataset_count
     _atomic_write_json(manifest_path, manifest)
     pd.DataFrame(matrix_rows).to_csv(matrix_dir / "matrix_results.csv", index=False)
     summary_lines = [
@@ -3477,6 +3763,8 @@ def run_matrix_mode(args: argparse.Namespace) -> None:
         f"completed_trials: {len(matrix_rows)}",
         f"successful_trials: {sum(row.get('status') == 'success' for row in matrix_rows)}",
         f"failed_trials: {sum(row.get('status') == 'fail' for row in matrix_rows)}",
+        f"reused_trials: {sum(row.get('execution') == 'reused' for row in matrix_rows)}",
+        f"common_successful_dataset_count: {common_dataset_count}",
     ]
     (matrix_dir / "matrix_summary.txt").write_text(
         "\n".join(summary_lines) + "\n",
@@ -3498,13 +3786,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--model-family",
         choices=[*MODEL_FAMILIES, "all"],
         default="tabiclv2",
-        help="Model backend to run. Use all to expand the TabICLv2/TabPFNv2 matrix.",
+        help="Model backend to run. Use all to expand the TabICLv2/TabPFNv3 matrix.",
     )
     parser.add_argument("--data-root", default=str(DEFAULT_DATA_ROOT))
     parser.add_argument("--model-path", default=None)
     parser.add_argument("--models-dir", default=None)
     parser.add_argument("--tabicl-model-path", default=DEFAULT_MODEL_PATH)
     parser.add_argument("--tabpfn-model-path", default=str(DEFAULT_TABPFN_MODEL_PATH))
+    parser.add_argument(
+        "--tabpfn-v3-binary-model-path",
+        default=str(DEFAULT_TABPFN_V3_BINARY_MODEL_PATH),
+    )
+    parser.add_argument(
+        "--tabpfn-v3-multiclass-model-path",
+        default=str(DEFAULT_TABPFN_V3_MULTICLASS_MODEL_PATH),
+    )
     parser.add_argument("--checkpoint-version", default=DEFAULT_CHECKPOINT_VERSION)
     parser.add_argument(
         "--out-dir",
@@ -3517,6 +3813,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", default=str(DEFAULT_OUT_DIR_ROOT))
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--reuse-matrix-manifest",
+        default=None,
+        help=(
+            "Reuse successful TabICLv2 trials from an existing matrix manifest. "
+            "Each source trial is validated independently even if the source matrix is running."
+        ),
+    )
     parser.add_argument(
         "--matrix-fail-fast",
         action="store_true",
@@ -3980,12 +4284,20 @@ def main() -> None:
         if args.model_path is not None:
             args.tabicl_model_path = args.model_path
         args.model_path = None if args.models_dir is not None else args.tabicl_model_path
-    else:
+    elif args.model_family == "tabpfnv2":
         if args.models_dir is not None:
             raise ValueError("--models-dir is only supported by the TabICLv2 backend")
         if args.model_path is not None:
             args.tabpfn_model_path = args.model_path
         args.model_path = None
+    else:
+        if args.models_dir is not None:
+            raise ValueError("--models-dir is only supported by the TabICLv2 backend")
+        if args.model_path is not None:
+            raise ValueError(
+                "--model-path is a TabICLv2/TabPFNv2 compatibility option; "
+                "use the task-specific --tabpfn-v3-*-model-path arguments for TabPFNv3"
+            )
 
     ensure_runtime_deps()
 
@@ -4040,7 +4352,7 @@ def main() -> None:
     }
     _atomic_write_json(run_config_path, run_config)
     try:
-        if args.model_family == "tabpfnv2":
+        if args.model_family in TABPFN_BACKENDS:
             run_tabpfn_single_model_mode(args, dataset_dirs, gpu_ids, gpu_groups, out_dir)
         elif args.models_dir is not None:
             run_multi_model_mode(args, dataset_dirs, gpu_ids, gpu_groups, out_dir)

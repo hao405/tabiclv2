@@ -222,6 +222,8 @@ class ResultRow:
     ttt_stopped_early: bool = False
     ttt_oom_fallback: bool = False
     ttt_fallback_reason: Optional[str] = None
+    ttt_auto_scale_n_estimators: Optional[bool] = None
+    execution_phase: Optional[str] = None
 
 
 @dataclass
@@ -245,6 +247,7 @@ class TTTConfig:
     lr_warmup_only: bool = False
     use_activation_checkpointing: bool = True
     save_checkpoint_interval: Optional[int] = None
+    auto_scale_n_estimators: bool = True
 
 
 RESULT_COLUMNS = list(ResultRow.__annotations__.keys())
@@ -302,6 +305,7 @@ def build_ttt_config(args: argparse.Namespace) -> TTTConfig:
         lr_warmup_only=bool(args.ttt_lr_warmup_only),
         use_activation_checkpointing=bool(args.ttt_activation_checkpointing),
         save_checkpoint_interval=None,
+        auto_scale_n_estimators=bool(args.ttt_auto_scale_n_estimators),
     )
 
 
@@ -786,6 +790,7 @@ class TabPFNAdapter:
             save_checkpoint_interval=config.save_checkpoint_interval,
             extra_classifier_kwargs=classifier_kwargs,
             eval_metric=config.eval_metric,
+            auto_scale_n_estimators=config.auto_scale_n_estimators,
         )
 
     def _fit_predict_with_ttt(self, loaded: LoadedDataset) -> PredictionResult:

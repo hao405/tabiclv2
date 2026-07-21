@@ -93,13 +93,79 @@ def import_many_class_classifier():
 import numpy as np
 import pandas as pd
 
+# =============================================================================
+# User-configurable defaults
+#
+# Edit this block to change the experiment defaults. Every value remains
+# overridable from the command line; build_arg_parser() only exposes this block.
+# =============================================================================
+@dataclass(frozen=True)
+class ExperimentDefaults:
+    # Data, output, and parallel execution
+    data_root: str = "../../data184"
+    out_dir: str | None = (
+        "../../results/tabpfn/tabpfnv3_lr857e-6_f_test_centroid_reserve_wise_ft"
+    )
+    workers: int = 1
+    gpus: str = "0"
+    max_datasets: int | None = None
+    random_state: int = 42
+    verbose: bool = False
+
+    # TabPFN model and base inference
+    model_version: str = "v3"
+    model_path: str | None = None
+    v3_binary_model_path: str = "auto"
+    v3_multiclass_model_path: str = "auto"
+    n_estimators: int = 8
+    ignore_pretraining_limits: bool = True
+
+    # Many-class compatibility
+    many_class: str = "auto"
+    many_class_alphabet_size: int = 10
+    many_class_redundancy: int = 4
+    many_class_n_estimators: int = 16
+
+    # TTT and F-aware-C
+    ttt_enabled: bool = True
+    ttt_epochs: int = 30
+    ttt_max_chunk_size: int = 10_000
+    ttt_grad_accumulation_steps: int = 1
+    ttt_query_ratio: float = 0.2
+    ttt_c_selection: str = "f_test_centroid_reserve"
+    ttt_c_metric: str = "standardized_l2"
+    ttt_c_reserve_ratio: float = 0.05
+    ttt_lr: float = 8.57e-6
+    ttt_weight_decay: float = 0.01
+    ttt_wise_ft: bool = True
+    ttt_wise_alpha: float = 0.1
+    ttt_grad_clip: float = 1.0
+    ttt_patience: int = 8
+    ttt_min_delta: float = 1e-4
+    ttt_eval_metric: str = "acc"
+    ttt_validation_fraction: float = 0.1
+    ttt_n_estimators_finetune: int = 2
+    ttt_validation_n_estimators: int = 2
+    ttt_lr_scheduler: bool = True
+    ttt_lr_warmup_only: bool = False
+    ttt_activation_checkpointing: bool = True
+
+    # Failed-dataset retry and result merging
+    retry_failed_datasets_only: bool = False
+    reference_results_csv: str = "v3_results/all_classification_results.csv"
+    retry_include_oom_failures: bool = False
+    merge_results_from_csv: str | None = None
+
+
+DEFAULTS = ExperimentDefaults()
+
 CLASSIFICATION_TASKS = {"binclass", "multiclass"}
 CATEGORICAL_MISSING_TOKEN = "__tabicl_missing__"
-DEFAULT_MODEL_VERSION = "v3"
-TABPFN_CLASS_LIMIT = 10
-FAWARE_C_SELECTION = "f_mmd"
+TABPFN_CLASS_LIMIT = DEFAULTS.many_class_alphabet_size
+FAWARE_C_SELECTION = "f_test_centroid_reserve"
 FAWARE_C_SOURCE = "test"
 FAWARE_C_RANDOM_SOURCE = "none"
+WISE_FT_MAX_DATASET_ROWS = 2_000
 RESULTS_ROOT = BASELINE_COMPARE_ROOT / "results"
 V3_BINARY_CLASSIFIER_FILE = "tabpfn-v3-classifier-v3_20260417_binary.ckpt"
 V3_MULTICLASS_CLASSIFIER_FILE = "tabpfn-v3-classifier-v3_20260417_multiclass.ckpt"
@@ -250,6 +316,9 @@ class PredictionResult:
     n_holdout_c: int = 0
     n_test_d: int = 0
     ttt_loss: Optional[float] = None
+    ttt_wise_ft: bool = False
+    ttt_wise_alpha: Optional[float] = None
+    ttt_wise_applied: bool = False
     ttt_steps: int = 0
     ttt_lr: Optional[float] = None
     ttt_applied: bool = False
@@ -302,6 +371,9 @@ class ResultRow:
     n_holdout_c: int = 0
     n_test_d: int = 0
     ttt_loss: Optional[float] = None
+    ttt_wise_ft: bool = False
+    ttt_wise_alpha: Optional[float] = None
+    ttt_wise_applied: bool = False
     ttt_steps: int = 0
     ttt_lr: Optional[float] = None
     ttt_applied: bool = False
@@ -339,6 +411,8 @@ class TTTConfig:
     query_ratio: float = 0.2
     lr: float = 1e-5
     weight_decay: float = 0.01
+    wise_ft: bool = True
+    wise_alpha: float = 0.1
     grad_clip: Optional[float] = 1.0
     patience: int = 8
     min_delta: float = 1e-4
@@ -372,21 +446,32 @@ class SkipDataset(Exception):
 
 
 def faware_c_source_for_selection(selection: str) -> str:
-    return FAWARE_C_SOURCE if selection == "f_mmd" else FAWARE_C_RANDOM_SOURCE
+    return FAWARE_C_SOURCE if selection == FAWARE_C_SELECTION else FAWARE_C_RANDOM_SOURCE
 
 
 def ttt_c_metric_for_config(config: TTTConfig) -> Optional[str]:
-    return config.c_metric if config.c_selection == "f_mmd" else None
+    return config.c_metric if config.c_selection == FAWARE_C_SELECTION else None
 
 
 def ttt_c_reserve_ratio_for_config(config: TTTConfig) -> Optional[float]:
-    return config.c_reserve_ratio if config.c_selection == "f_mmd" else None
+    return config.c_reserve_ratio if config.c_selection == FAWARE_C_SELECTION else None
+
+
+def wise_ft_enabled_for_config(config: TTTConfig) -> bool:
+    return bool(config.enabled and config.wise_ft and config.c_selection == FAWARE_C_SELECTION)
+
+
+def wise_ft_enabled_for_dataset(config: TTTConfig, dataset_total_rows: int) -> bool:
+    return (
+        wise_ft_enabled_for_config(config)
+        and int(dataset_total_rows) < WISE_FT_MAX_DATASET_ROWS
+    )
 
 
 def ttt_c_reason_suffix(config: TTTConfig) -> str:
     source = faware_c_source_for_selection(config.c_selection)
     parts = [f"c_selection={config.c_selection}", f"c_source={source}"]
-    if config.c_selection == "f_mmd":
+    if config.c_selection == FAWARE_C_SELECTION:
         parts.extend(
             [
                 f"c_metric={config.c_metric}",
@@ -423,17 +508,23 @@ def build_ttt_config(args: argparse.Namespace) -> TTTConfig:
         raise ValueError("--n-estimators must be >= 1")
     if str(args.ttt_eval_metric) not in {"roc_auc", "log_loss", "acc"}:
         raise ValueError("--ttt-eval-metric must be one of: roc_auc, log_loss, acc")
+    if not 0.0 <= float(args.ttt_wise_alpha) <= 1.0:
+        raise ValueError("--ttt-wise-alpha must be in [0, 1]")
     c_selection = str(args.ttt_c_selection)
-    if c_selection not in {"f_mmd", "random"}:
-        raise ValueError("--ttt-c-selection must be one of: f_mmd, random")
+    if c_selection not in {FAWARE_C_SELECTION, "random"}:
+        raise ValueError(
+            "--ttt-c-selection must be one of: "
+            f"{FAWARE_C_SELECTION}, random"
+        )
     if str(args.ttt_c_metric) not in {"raw_l2", "standardized_l2"}:
         raise ValueError("--ttt-c-metric must be one of: raw_l2, standardized_l2")
-    if c_selection == "f_mmd":
+    if c_selection == FAWARE_C_SELECTION:
         if not 0.0 < float(args.ttt_c_reserve_ratio) < 1.0:
             raise ValueError("--ttt-c-reserve-ratio must be in (0, 1)")
         if float(args.ttt_c_reserve_ratio) + float(args.ttt_query_ratio) >= 1.0:
             raise ValueError(
-                "--ttt-c-reserve-ratio + --ttt-query-ratio must be < 1 for f_mmd"
+                "--ttt-c-reserve-ratio + --ttt-query-ratio must be < 1 for "
+                f"{FAWARE_C_SELECTION}"
             )
     grad_clip = None if float(args.ttt_grad_clip) <= 0 else float(args.ttt_grad_clip)
     return TTTConfig(
@@ -444,6 +535,8 @@ def build_ttt_config(args: argparse.Namespace) -> TTTConfig:
         query_ratio=float(args.ttt_query_ratio),
         lr=float(args.ttt_lr),
         weight_decay=float(args.ttt_weight_decay),
+        wise_ft=bool(args.ttt_wise_ft) and c_selection == FAWARE_C_SELECTION,
+        wise_alpha=float(args.ttt_wise_alpha),
         grad_clip=grad_clip,
         patience=int(args.ttt_patience),
         min_delta=float(args.ttt_min_delta),
@@ -702,6 +795,13 @@ class FawareIndexSplit:
     label_coverage_ok: bool = True
 
 
+@dataclass(frozen=True)
+class GlobalCentroidReservation:
+    reserved_row_ids: np.ndarray
+    scores: np.ndarray
+    requested_count: int
+
+
 @dataclass
 class AlignedSplitResult:
     X_context: Any
@@ -720,19 +820,10 @@ def _take_rows(obj: Any, idx: np.ndarray) -> Any:
     return obj.iloc[idx] if hasattr(obj, "iloc") else obj[idx]
 
 
-def _as_2d_float(values: Any) -> np.ndarray:
-    arr = np.asarray(values, dtype=np.float64)
-    if arr.ndim == 1:
-        arr = arr.reshape(-1, 1)
-    return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-
-
 def _standardize_train_reference(
-    X_train: Any,
-    X_reference: Any,
+    train_arr: np.ndarray,
+    ref_arr: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    train_arr = _as_2d_float(X_train)
-    ref_arr = _as_2d_float(X_reference)
     mean = np.nanmean(train_arr, axis=0)
     scale = np.nanstd(train_arr, axis=0)
     scale = np.where(np.isfinite(scale) & (scale > 1e-12), scale, 1.0)
@@ -742,36 +833,126 @@ def _standardize_train_reference(
     )
 
 
-def _selection_space(
+def _selection_only_feature_space(
     X_train: Any,
     X_reference: Any,
     *,
+    categorical_feature_indices: Sequence[int],
     metric: str,
 ) -> tuple[np.ndarray, np.ndarray]:
+    from sklearn.preprocessing import OrdinalEncoder
+
+    train_frame = pd.DataFrame(X_train).reset_index(drop=True)
+    reference_frame = pd.DataFrame(X_reference).reset_index(drop=True)
+    if train_frame.shape[1] != reference_frame.shape[1]:
+        raise ValueError("Training and test selection spaces must have equal width")
+
+    categorical = set(int(index) for index in categorical_feature_indices)
+    train_columns: list[np.ndarray] = []
+    reference_columns: list[np.ndarray] = []
+    for column_index in range(train_frame.shape[1]):
+        train_column = train_frame.iloc[:, column_index]
+        reference_column = reference_frame.iloc[:, column_index]
+        if column_index in categorical:
+            missing_token = "__TABPFN_SELECTION_MISSING__"
+            train_values = (
+                train_column.astype("object")
+                .where(~train_column.isna(), missing_token)
+                .map(str)
+                .to_numpy()
+                .reshape(-1, 1)
+            )
+            reference_values = (
+                reference_column.astype("object")
+                .where(~reference_column.isna(), missing_token)
+                .map(str)
+                .to_numpy()
+                .reshape(-1, 1)
+            )
+            encoder = OrdinalEncoder(
+                handle_unknown="use_encoded_value",
+                unknown_value=-1,
+                dtype=np.float64,
+            )
+            train_encoded = encoder.fit_transform(train_values).reshape(-1)
+            reference_encoded = encoder.transform(reference_values).reshape(-1)
+            train_columns.append(train_encoded)
+            reference_columns.append(reference_encoded)
+            continue
+
+        train_numeric = pd.to_numeric(train_column, errors="coerce").to_numpy(
+            dtype=np.float64
+        )
+        reference_numeric = pd.to_numeric(
+            reference_column, errors="coerce"
+        ).to_numpy(dtype=np.float64)
+        finite_train = train_numeric[np.isfinite(train_numeric)]
+        median = float(np.median(finite_train)) if len(finite_train) else 0.0
+        train_columns.append(
+            np.where(np.isfinite(train_numeric), train_numeric, median)
+        )
+        reference_columns.append(
+            np.where(np.isfinite(reference_numeric), reference_numeric, median)
+        )
+
+    train_arr = np.column_stack(train_columns).astype(np.float64, copy=False)
+    reference_arr = np.column_stack(reference_columns).astype(np.float64, copy=False)
     if metric == "standardized_l2":
-        return _standardize_train_reference(X_train, X_reference)
-    return _as_2d_float(X_train), _as_2d_float(X_reference)
+        return _standardize_train_reference(train_arr, reference_arr)
+    return train_arr, reference_arr
 
 
-def _mmd_far_context_scores(
-    X_rows: Any,
-    reference_rows: Any,
+def _test_centroid_distance_scores(
+    X_train: Any,
+    X_test: Any,
     *,
+    categorical_feature_indices: Sequence[int],
     metric: str,
 ) -> np.ndarray:
-    X_sel, ref_sel = _selection_space(X_rows, reference_rows, metric=metric)
-    if len(ref_sel) == 0:
-        return np.zeros(X_sel.shape[0], dtype=np.float64)
-    target_mean = np.nanmean(ref_sel, axis=0)
-    target_var = np.nanvar(ref_sel, axis=0)
-    row_var = np.zeros_like(X_sel, dtype=np.float64)
-    scores = np.mean((X_sel - target_mean) ** 2, axis=1) + 0.25 * np.mean(
-        (row_var - target_var) ** 2,
-        axis=1,
+    X_sel, test_sel = _selection_only_feature_space(
+        X_train,
+        X_test,
+        categorical_feature_indices=categorical_feature_indices,
+        metric=metric,
     )
+    if len(test_sel) == 0:
+        return np.zeros(X_sel.shape[0], dtype=np.float64)
+    test_centroid = np.mean(test_sel, axis=0)
+    scores = np.mean((X_sel - test_centroid) ** 2, axis=1)
     return np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0).astype(
         np.float64,
         copy=False,
+    )
+
+
+def _build_global_test_centroid_reservation(
+    X_train: Any,
+    X_test: Any,
+    *,
+    categorical_feature_indices: Sequence[int],
+    metric: str,
+    reserve_ratio: float,
+) -> GlobalCentroidReservation:
+    n_train = int(len(X_train))
+    if n_train < 3:
+        raise ValueError(
+            f"Need at least three rows for {FAWARE_C_SELECTION} context/query split"
+        )
+    if X_test is None or len(X_test) == 0:
+        raise ValueError(f"Missing test rows for {FAWARE_C_SELECTION}")
+    scores = _test_centroid_distance_scores(
+        X_train,
+        X_test,
+        categorical_feature_indices=categorical_feature_indices,
+        metric=metric,
+    )
+    requested_count = max(1, int(math.ceil(float(reserve_ratio) * n_train)))
+    reserve_count = min(requested_count, n_train - 1)
+    ranked_row_ids = np.argsort(-scores, kind="stable")
+    return GlobalCentroidReservation(
+        reserved_row_ids=np.asarray(ranked_row_ids[:reserve_count], dtype=np.int64),
+        scores=scores,
+        requested_count=requested_count,
     )
 
 
@@ -901,35 +1082,116 @@ def _make_aligned_split_fn(
     return aligned_split_fn
 
 
-def _faware_mmd_indices(
-    X_chunk: Any,
+def _repair_query_label_coverage(
     y_chunk: Any,
-    X_reference: Any,
+    ctx_idx: np.ndarray,
+    qry_idx: np.ndarray,
+    *,
+    protected_context_idx: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, str | None]:
+    y_arr = np.asarray(y_chunk)
+    context = [int(index) for index in ctx_idx.tolist()]
+    query = [int(index) for index in qry_idx.tolist()]
+    protected = set(np.asarray(protected_context_idx, dtype=int).tolist())
+    context_label_counts: dict[Any, int] = {}
+    for context_index in context:
+        label = y_arr[context_index]
+        context_label_counts[label] = context_label_counts.get(label, 0) + 1
+
+    repaired = 0
+    moved = 0
+    moved_indices: set[int] = set()
+    for query_position, query_index in enumerate(list(query)):
+        query_label = y_arr[query_index]
+        if context_label_counts.get(query_label, 0) > 0:
+            continue
+        swap_index = next(
+            (
+                context_index
+                for context_index in context
+                if context_index not in protected
+                and context_label_counts.get(y_arr[context_index], 0) > 1
+            ),
+            None,
+        )
+        if swap_index is not None:
+            swap_label = y_arr[swap_index]
+            context.remove(swap_index)
+            context.append(query_index)
+            query[query_position] = swap_index
+            context_label_counts[swap_label] -= 1
+            context_label_counts[query_label] = (
+                context_label_counts.get(query_label, 0) + 1
+            )
+            repaired += 1
+            continue
+        if len(query) - len(moved_indices) > 1:
+            context.append(query_index)
+            moved_indices.add(query_index)
+            context_label_counts[query_label] = (
+                context_label_counts.get(query_label, 0) + 1
+            )
+            moved += 1
+
+    if repaired == 0 and moved == 0:
+        return ctx_idx, qry_idx, None
+    if moved_indices:
+        query = [index for index in query if index not in moved_indices]
+    actions: list[str] = []
+    if repaired:
+        actions.append(f"swapped {repaired}")
+    if moved:
+        actions.append(f"moved {moved}")
+    return (
+        np.asarray(sorted(set(context)), dtype=int),
+        np.asarray(query, dtype=int),
+        f"{FAWARE_C_SELECTION} {' and '.join(actions)} query row(s) "
+        "for label coverage",
+    )
+
+
+def _global_test_centroid_reserve_indices(
+    y_chunk: Any,
+    global_row_ids: Any,
+    reservation: GlobalCentroidReservation,
     split_fn: Any,
     stratify: Any,
-    *,
-    metric: str,
-    reserve_ratio: float,
 ) -> FawareIndexSplit:
     n_samples = int(len(y_chunk))
     if n_samples < 3:
-        raise ValueError("Need at least three rows for f_mmd context/query split")
-    if X_reference is None or len(X_reference) == 0:
-        raise ValueError("Missing test reference rows for f_mmd")
+        raise ValueError(
+            f"Need at least three rows for {FAWARE_C_SELECTION} context/query split"
+        )
+    row_ids = np.asarray(global_row_ids, dtype=np.int64).reshape(-1)
+    if len(row_ids) != n_samples:
+        raise ValueError("Chunk rows and global row IDs are not aligned")
 
-    requested_reserve_count = max(1, int(math.ceil(float(reserve_ratio) * n_samples)))
-    reserve_count = min(requested_reserve_count, max(1, n_samples - 2))
+    reserved_global = set(reservation.reserved_row_ids.tolist())
+    reserved_idx = np.asarray(
+        [
+            local_index
+            for local_index, row_id in enumerate(row_ids.tolist())
+            if row_id in reserved_global
+        ],
+        dtype=int,
+    )
     max_reserved_for_split = _max_reserved_count_for_split_fn(split_fn, n_samples)
     reserve_adjust_reason = None
-    if reserve_count > max_reserved_for_split:
-        reserve_adjust_reason = (
-            "f_mmd reserve_count reduced from "
-            f"{reserve_count} to {max_reserved_for_split} to preserve official split"
+    if len(reserved_idx) > max_reserved_for_split:
+        ranked_local = sorted(
+            reserved_idx.tolist(),
+            key=lambda local_index: (
+                -float(reservation.scores[int(row_ids[local_index])]),
+                int(row_ids[local_index]),
+            ),
         )
-        reserve_count = max_reserved_for_split
-    scores = _mmd_far_context_scores(X_chunk, X_reference, metric=metric)
-    ranked = np.argsort(scores, kind="stable")[::-1]
-    reserved_idx = np.asarray(ranked[:reserve_count], dtype=int)
+        retained = ranked_local[:max_reserved_for_split]
+        reserve_adjust_reason = (
+            f"{FAWARE_C_SELECTION} chunk capacity released "
+            f"{len(reserved_idx) - max_reserved_for_split} lowest-score reserved "
+            "row(s) to preserve the official split"
+        )
+        reserved_idx = np.asarray(sorted(retained), dtype=int)
     reserved_set = set(reserved_idx.tolist())
     allowed_idx = np.asarray(
         [idx for idx in range(n_samples) if idx not in reserved_set],
@@ -947,45 +1209,41 @@ def _faware_mmd_indices(
         index_column,
         y_allowed,
         stratify_allowed,
-        fallback_label="f_mmd allowed-row",
+        fallback_label=f"{FAWARE_C_SELECTION} allowed-row",
     )
     allowed_ctx_idx = np.asarray(aligned.X_context, dtype=int).reshape(-1)
     qry_idx = np.asarray(aligned.X_query, dtype=int).reshape(-1)
     if set(reserved_idx.tolist()) & set(qry_idx.tolist()):
-        raise ValueError("f_mmd reserved context rows leaked into query")
+        raise ValueError(
+            f"{FAWARE_C_SELECTION} reserved context rows leaked into query"
+        )
 
     ctx_idx = np.unique(np.concatenate([reserved_idx, allowed_ctx_idx])).astype(int)
+    ctx_idx, qry_idx, coverage_repair_reason = _repair_query_label_coverage(
+        y_chunk,
+        ctx_idx,
+        qry_idx,
+        protected_context_idx=reserved_idx,
+    )
     coverage_ok = _has_query_label_coverage(y_chunk, ctx_idx, qry_idx)
+    reserved_row_ids = row_ids[reserved_idx]
     return FawareIndexSplit(
         ctx_idx=ctx_idx,
         qry_idx=qry_idx.astype(int),
         reserved_idx=reserved_idx,
-        reserved_scores=scores[reserved_idx],
-        fallback_reason=_join_reasons(reserve_adjust_reason, aligned.fallback_reason),
+        reserved_scores=reservation.scores[reserved_row_ids],
+        fallback_reason=_join_reasons(
+            reserve_adjust_reason,
+            aligned.fallback_reason,
+            coverage_repair_reason,
+        ),
         label_coverage_ok=coverage_ok,
-    )
-
-
-def _transform_reference_for_selection(calling_instance: Any, X_reference_raw: Any) -> np.ndarray:
-    from tabpfn.preprocessing.clean import fix_dtypes, process_text_na_dataframe
-    from tabpfn.preprocessing.datamodel import FeatureModality
-
-    feature_schema = getattr(calling_instance, "inferred_feature_schema_", None)
-    ordinal_encoder = getattr(calling_instance, "ordinal_encoder_", None)
-    if feature_schema is None or ordinal_encoder is None:
-        raise ValueError("TabPFN preprocessing state is unavailable for f_mmd")
-    categorical_indices = feature_schema.indices_for(FeatureModality.CATEGORICAL)
-    X_fixed = fix_dtypes(np.asarray(X_reference_raw), cat_indices=categorical_indices)
-    return process_text_na_dataframe(
-        X=X_fixed,
-        ord_encoder=ordinal_encoder,
-        fit_encoder=False,
     )
 
 
 def _make_faware_get_preprocessed_dataset_chunks(
     *,
-    reference_raw: Any,
+    global_reservation: GlobalCentroidReservation | None,
     config: TTTConfig,
     stats: FawareSplitStats,
     original_get_preprocessed_dataset_chunks: Any,
@@ -1037,15 +1295,15 @@ def _make_faware_get_preprocessed_dataset_chunks(
                 shuffle=shuffle,
                 force_no_stratify=force_no_stratify,
             )
-        if reference_raw is None:
+        if global_reservation is None:
             stats.record(
-                fallback_reason="missing test reference for f_mmd",
+                fallback_reason=f"missing global reservation for {FAWARE_C_SELECTION}",
                 label_coverage_ok=False,
             )
             aligned_split_fn = _make_aligned_split_fn(
                 split_fn,
                 stats,
-                fallback_label="f_mmd missing-reference",
+                fallback_label=f"{FAWARE_C_SELECTION} missing-global-reservation",
             )
             return original_get_preprocessed_dataset_chunks(
                 calling_instance=calling_instance,
@@ -1073,8 +1331,15 @@ def _make_faware_get_preprocessed_dataset_chunks(
         if not hasattr(calling_instance, "models_") or calling_instance.models_ is None:
             calling_instance._initialize_model_variables()
 
-        X_split, y_split = [], []
+        X_split, y_split, row_id_split = [], [], []
+        row_id_offset = 0
         for X_item, y_item in zip(X_raw, y_raw):
+            item_row_ids = np.arange(
+                row_id_offset,
+                row_id_offset + len(y_item),
+                dtype=np.int64,
+            )
+            row_id_offset += len(y_item)
             if max_data_size is not None:
                 Xparts, yparts = data_util.shuffle_and_chunk_data(
                     X_item,
@@ -1085,14 +1350,38 @@ def _make_faware_get_preprocessed_dataset_chunks(
                     task="multiclass",
                     shuffle=shuffle,
                 )
+                row_id_parts, row_id_y_parts = data_util.shuffle_and_chunk_data(
+                    item_row_ids,
+                    y_item,
+                    max_chunk_size=max_data_size,
+                    equal_split_size=equal_split_size,
+                    seed=data_shuffle_seed,
+                    task="multiclass",
+                    shuffle=shuffle,
+                )
+                if len(yparts) != len(row_id_y_parts) or any(
+                    not np.array_equal(np.asarray(y_part), np.asarray(row_id_y_part))
+                    for y_part, row_id_y_part in zip(yparts, row_id_y_parts)
+                ):
+                    raise ValueError(
+                        f"{FAWARE_C_SELECTION} row-ID chunking lost alignment"
+                    )
             else:
                 Xparts, yparts = [X_item], [y_item]
+                row_id_parts = [item_row_ids]
             X_split.extend(Xparts)
             y_split.extend(yparts)
+            row_id_split.extend(row_id_parts)
+        if row_id_offset != len(global_reservation.scores):
+            raise ValueError(
+                f"{FAWARE_C_SELECTION} global reservation has "
+                f"{len(global_reservation.scores)} rows but fit received "
+                f"{row_id_offset}"
+            )
 
-        reference_by_x_id: dict[int, np.ndarray] = {}
+        row_ids_by_x_id: dict[int, np.ndarray] = {}
         dataset_config_collection: list[Any] = []
-        for X_item, y_item in zip(X_split, y_split):
+        for X_item, y_item, row_ids in zip(X_split, y_split, row_id_split):
             ensemble_configs, X_mod, y_mod = (
                 calling_instance._initialize_dataset_preprocessing(
                     X=X_item,
@@ -1100,19 +1389,11 @@ def _make_faware_get_preprocessed_dataset_chunks(
                     random_state=preprocessing_random_state,
                 )
             )
-            try:
-                reference_by_x_id[id(X_mod)] = _transform_reference_for_selection(
-                    calling_instance,
-                    reference_raw,
+            if len(X_mod) != len(row_ids):
+                raise ValueError(
+                    f"{FAWARE_C_SELECTION} preprocessing changed row count"
                 )
-            except Exception as exc:
-                stats.record(
-                    fallback_reason=(
-                        "f_mmd reference transform failed: "
-                        f"{type(exc).__name__}: {exc}"
-                    ),
-                    label_coverage_ok=False,
-                )
+            row_ids_by_x_id[id(X_mod)] = np.asarray(row_ids, dtype=np.int64)
             current_cat_ix = calling_instance.inferred_feature_schema_.indices_for(
                 FeatureModality.CATEGORICAL
             )
@@ -1126,10 +1407,12 @@ def _make_faware_get_preprocessed_dataset_chunks(
             )
 
         def faware_split_fn(X: Any, y: Any, stratify: Any = None) -> tuple[Any, Any, Any, Any]:
-            reference_mod = reference_by_x_id.get(id(X))
-            if reference_mod is None:
+            global_row_ids = row_ids_by_x_id.get(id(X))
+            if global_row_ids is None:
                 stats.record(
-                    fallback_reason="missing transformed test reference for f_mmd",
+                    fallback_reason=(
+                        f"missing chunk row IDs for {FAWARE_C_SELECTION}"
+                    ),
                     label_coverage_ok=False,
                 )
                 result = _aligned_split_with_stratify_fallback(
@@ -1137,7 +1420,7 @@ def _make_faware_get_preprocessed_dataset_chunks(
                     X,
                     y,
                     stratify,
-                    fallback_label="f_mmd missing-transformed-reference",
+                    fallback_label=f"{FAWARE_C_SELECTION} missing-row-IDs",
                 )
                 stats.record(
                     fallback_reason=result.fallback_reason,
@@ -1146,18 +1429,19 @@ def _make_faware_get_preprocessed_dataset_chunks(
                 return result.X_context, result.X_query, result.y_context, result.y_query
 
             try:
-                split = _faware_mmd_indices(
-                    X,
+                split = _global_test_centroid_reserve_indices(
                     y,
-                    reference_mod,
+                    global_row_ids,
+                    global_reservation,
                     split_fn,
                     stratify,
-                    metric=config.c_metric,
-                    reserve_ratio=config.c_reserve_ratio,
                 )
             except Exception as exc:
                 stats.record(
-                    fallback_reason=f"f_mmd split failed: {type(exc).__name__}: {exc}",
+                    fallback_reason=(
+                        f"{FAWARE_C_SELECTION} split failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
                     label_coverage_ok=False,
                 )
                 raise
@@ -1213,6 +1497,48 @@ def _split_summary(classifier: Any) -> dict[str, Any]:
     }
 
 
+def _clone_model_state_dict_cpu(model: Any) -> dict[str, Any]:
+    return {
+        name: tensor.detach().cpu().clone()
+        for name, tensor in model.state_dict().items()
+    }
+
+
+def _interpolate_state_dicts(
+    initial_state: dict[str, Any],
+    tuned_state: dict[str, Any],
+    alpha: float,
+) -> dict[str, Any]:
+    blended_state: dict[str, Any] = {}
+    alpha = float(alpha)
+    for name, tuned_tensor in tuned_state.items():
+        tuned_cpu = tuned_tensor.detach().cpu()
+        initial_tensor = initial_state.get(name)
+        if initial_tensor is None:
+            blended_state[name] = tuned_cpu.clone()
+            continue
+        if tuned_cpu.is_floating_point() and initial_tensor.is_floating_point():
+            initial_for_tuned = initial_tensor.to(dtype=tuned_cpu.dtype)
+            blended_state[name] = initial_for_tuned.mul(1.0 - alpha).add(
+                tuned_cpu,
+                alpha=alpha,
+            )
+        else:
+            blended_state[name] = tuned_cpu.clone()
+    return blended_state
+
+
+def _apply_wise_ft_weights(
+    model: Any,
+    initial_state: dict[str, Any],
+    alpha: float,
+) -> None:
+    tuned_state = _clone_model_state_dict_cpu(model)
+    model.load_state_dict(
+        _interpolate_state_dicts(initial_state, tuned_state, alpha)
+    )
+
+
 class VersionedFinetunedTabPFNClassifier:
     @staticmethod
     def build(model_version: str, **kwargs: Any):
@@ -1223,6 +1549,8 @@ class VersionedFinetunedTabPFNClassifier:
         faware_selection = str(kwargs.pop("faware_c_selection"))
         faware_metric = str(kwargs.pop("faware_c_metric"))
         faware_reserve_ratio = float(kwargs.pop("faware_c_reserve_ratio"))
+        wise_ft_enabled = bool(kwargs.pop("wise_ft_enabled"))
+        wise_alpha = float(kwargs.pop("wise_alpha"))
         version_map = {
             "v2": ModelVersion.V2,
             "v2.5": ModelVersion.V2_5,
@@ -1232,8 +1560,38 @@ class VersionedFinetunedTabPFNClassifier:
         version = version_map[model_version]
 
         class _VersionedFinetunedTabPFNClassifier(FinetunedTabPFNClassifier):
-            def set_faware_reference(self, X_reference: Any) -> None:
-                self._faware_reference_raw_ = np.asarray(X_reference)
+            def _configure_model_for_optimization(self, model: Any) -> None:
+                super()._configure_model_for_optimization(model)
+                self._ttt_wise_applied_ = False
+                self._ttt_wise_initial_state_ = (
+                    _clone_model_state_dict_cpu(model)
+                    if wise_ft_enabled
+                    else None
+                )
+
+            def _setup_inference_model(
+                self,
+                final_inference_eval_config: dict[str, Any],
+            ) -> None:
+                initial_state = getattr(
+                    self,
+                    "_ttt_wise_initial_state_",
+                    None,
+                )
+                if wise_ft_enabled and initial_state is not None:
+                    _apply_wise_ft_weights(
+                        self.finetuned_estimator_.model_,
+                        initial_state,
+                        wise_alpha,
+                    )
+                    self._ttt_wise_applied_ = True
+                super()._setup_inference_model(final_inference_eval_config)
+
+            def set_faware_global_reservation(
+                self,
+                reservation: GlobalCentroidReservation,
+            ) -> None:
+                self._faware_global_reservation_ = reservation
 
             def _create_estimator(self, config: dict[str, Any]) -> TabPFNClassifier:
                 if model_version == "v3":
@@ -1276,7 +1634,11 @@ class VersionedFinetunedTabPFNClassifier:
             ):
                 from tabpfn.finetuning import finetuned_base
 
-                reference_raw = getattr(self, "_faware_reference_raw_", None)
+                global_reservation = getattr(
+                    self,
+                    "_faware_global_reservation_",
+                    None,
+                )
                 self._faware_split_stats_ = FawareSplitStats()
                 faware_values = {
                     "enabled": True,
@@ -1313,7 +1675,7 @@ class VersionedFinetunedTabPFNClassifier:
                 original_get = finetuned_base.get_preprocessed_dataset_chunks
                 finetuned_base.get_preprocessed_dataset_chunks = (
                     _make_faware_get_preprocessed_dataset_chunks(
-                        reference_raw=reference_raw,
+                        global_reservation=global_reservation,
                         config=faware_config,
                         stats=self._faware_split_stats_,
                         original_get_preprocessed_dataset_chunks=original_get,
@@ -1496,6 +1858,13 @@ class TabPFNAdapter:
         config = self.ttt_config
         values = result.__dict__.copy()
         values.update(
+            ttt_wise_ft=wise_ft_enabled_for_config(config),
+            ttt_wise_alpha=(
+                float(config.wise_alpha)
+                if wise_ft_enabled_for_config(config)
+                else None
+            ),
+            ttt_wise_applied=False,
             ttt_c_selection=config.c_selection if config.enabled else None,
             ttt_c_source=(
                 faware_c_source_for_selection(config.c_selection)
@@ -1549,6 +1918,13 @@ class TabPFNAdapter:
             n_holdout_c=0,
             n_test_d=int(len(loaded.y_test)),
             ttt_lr=self.ttt_config.lr if self.ttt_config.enabled else None,
+            ttt_wise_ft=wise_ft_enabled_for_config(self.ttt_config),
+            ttt_wise_alpha=(
+                float(self.ttt_config.wise_alpha)
+                if wise_ft_enabled_for_config(self.ttt_config)
+                else None
+            ),
+            ttt_wise_applied=False,
             ttt_applied=False,
             ttt_split_reason=ttt_reason,
             ttt_oom_fallback=ttt_oom_fallback,
@@ -1573,7 +1949,12 @@ class TabPFNAdapter:
             ),
         )
 
-    def _make_finetuned_classifier(self, loaded: LoadedDataset):
+    def _make_finetuned_classifier(
+        self,
+        loaded: LoadedDataset,
+        *,
+        apply_wise_ft: bool,
+    ):
         config = self.ttt_config
         classifier_kwargs = self._classifier_kwargs(
             loaded.categorical_feature_indices,
@@ -1611,6 +1992,8 @@ class TabPFNAdapter:
             "faware_c_selection": config.c_selection,
             "faware_c_metric": config.c_metric,
             "faware_c_reserve_ratio": config.c_reserve_ratio,
+            "wise_ft_enabled": bool(apply_wise_ft),
+            "wise_alpha": float(config.wise_alpha),
         }
         init_params = inspect.signature(FinetunedTabPFNClassifier.__init__).parameters
         if "gradient_accumulation_steps" in init_params:
@@ -1637,6 +2020,9 @@ class TabPFNAdapter:
         X_val = loaded.X_val.to_numpy() if loaded.X_val is not None else None
         y_val = np.asarray(loaded.y_val) if loaded.y_val is not None else None
         X_test = loaded.X_test.to_numpy()
+        dataset_total_rows = int(loaded.n_train_report + len(loaded.y_test))
+        wise_ft_requested = wise_ft_enabled_for_config(config)
+        apply_wise_ft = wise_ft_enabled_for_dataset(config, dataset_total_rows)
         chunks_per_epoch = max(
             1,
             (int(len(y_train)) + int(config.max_chunk_size) - 1)
@@ -1644,9 +2030,19 @@ class TabPFNAdapter:
         )
 
         fit_started = time.time()
-        classifier = self._make_finetuned_classifier(loaded)
-        if config.c_selection == "f_mmd":
-            classifier.set_faware_reference(X_test)
+        classifier = self._make_finetuned_classifier(
+            loaded,
+            apply_wise_ft=apply_wise_ft,
+        )
+        if config.c_selection == FAWARE_C_SELECTION:
+            global_reservation = _build_global_test_centroid_reservation(
+                loaded.X_train,
+                loaded.X_test,
+                categorical_feature_indices=loaded.categorical_feature_indices,
+                metric=config.c_metric,
+                reserve_ratio=config.c_reserve_ratio,
+            )
+            classifier.set_faware_global_reservation(global_reservation)
         ttt_update_started = time.time()
         try:
             classifier.fit(X_train, y_train, X_val=X_val, y_val=y_val, output_dir=None)
@@ -1672,6 +2068,28 @@ class TabPFNAdapter:
             epochs=config.epochs,
         )
         split_summary = _split_summary(classifier)
+        wise_ft_applied = bool(
+            getattr(classifier, "_ttt_wise_applied_", False)
+        )
+        ttt_reason = (
+            (
+                "dataset_val_split"
+                if X_val is not None
+                else f"internal validation_split_ratio={config.validation_fraction}"
+            )
+            + ttt_c_reason_suffix(config)
+        )
+        if wise_ft_requested:
+            if wise_ft_applied:
+                ttt_reason += (
+                    f" | wise_ft=alpha{config.wise_alpha:g}"
+                    f" rows={dataset_total_rows}<{WISE_FT_MAX_DATASET_ROWS}"
+                )
+            else:
+                ttt_reason += (
+                    f" | wise_ft_skipped rows={dataset_total_rows}"
+                    f">={WISE_FT_MAX_DATASET_ROWS}"
+                )
 
         predict_started = time.time()
         y_pred, y_proba, classes = predict_from_proba_or_model(classifier, X_test)
@@ -1693,16 +2111,14 @@ class TabPFNAdapter:
                 // _grad_accumulation_steps(config)
             ),
             ttt_applied=True,
+            ttt_wise_ft=wise_ft_requested,
+            ttt_wise_alpha=(
+                float(config.wise_alpha) if wise_ft_requested else None
+            ),
+            ttt_wise_applied=wise_ft_applied,
             ttt_update_seconds=float(ttt_update_seconds),
             ttt_split_strategy=f"tabpfn_finetune_epoch_chunks_{config.c_selection}",
-            ttt_split_reason=(
-                (
-                    "dataset_val_split"
-                    if X_val is not None
-                    else f"internal validation_split_ratio={config.validation_fraction}"
-                )
-                + ttt_c_reason_suffix(config)
-            ),
+            ttt_split_reason=ttt_reason,
             ttt_epochs=config.epochs,
             ttt_chunks_per_epoch=chunks_per_epoch,
             ttt_batch_mode=ttt_c_batch_mode(config),
@@ -2114,6 +2530,12 @@ def evaluate_one_dataset(adapter: TabPFNAdapter, dataset_dir: Path) -> ResultRow
                 ttt_c_reserve_ratio=ttt_c_reserve_ratio_for_config(
                     adapter.ttt_config
                 ),
+                ttt_wise_ft=wise_ft_enabled_for_config(adapter.ttt_config),
+                ttt_wise_alpha=(
+                    float(adapter.ttt_config.wise_alpha)
+                    if wise_ft_enabled_for_config(adapter.ttt_config)
+                    else None
+                ),
             )
         try:
             result = adapter.fit_predict(loaded)
@@ -2154,6 +2576,9 @@ def evaluate_one_dataset(adapter: TabPFNAdapter, dataset_dir: Path) -> ResultRow
             n_holdout_c=result.n_holdout_c,
             n_test_d=result.n_test_d,
             ttt_loss=result.ttt_loss,
+            ttt_wise_ft=result.ttt_wise_ft,
+            ttt_wise_alpha=result.ttt_wise_alpha,
+            ttt_wise_applied=result.ttt_wise_applied,
             ttt_steps=result.ttt_steps,
             ttt_lr=result.ttt_lr,
             ttt_applied=result.ttt_applied,
@@ -2317,6 +2742,11 @@ def write_summary(summary_path: Path, result_df: pd.DataFrame, dataset_dirs: lis
         if len(ok_df) and "ttt_oom_fallback" in ok_df.columns
         else pd.DataFrame()
     )
+    wise_applied_df = (
+        ok_df[ok_df["ttt_wise_applied"].astype(str).str.lower().isin({"true", "1", "yes"})].copy()
+        if len(ok_df) and "ttt_wise_applied" in ok_df.columns
+        else pd.DataFrame()
+    )
 
     def mean_line(label: str, column: str) -> str:
         if len(ok_df) and column in ok_df.columns and ok_df[column].notna().any():
@@ -2330,6 +2760,7 @@ def write_summary(summary_path: Path, result_df: pd.DataFrame, dataset_dirs: lis
         f"failed_count: {len(failed_df)}",
         f"skipped_count: {len(skipped_df)}",
         f"ttt_oom_fallback_count: {len(oom_fallback_df)}",
+        f"ttt_wise_applied_count: {len(wise_applied_df)}",
         mean_line("avg_accuracy_ok", "accuracy"),
         mean_line("avg_f1_ok", "f1"),
         mean_line("avg_balanced_accuracy_ok", "balanced_accuracy"),
@@ -2342,6 +2773,8 @@ def write_summary(summary_path: Path, result_df: pd.DataFrame, dataset_dirs: lis
         + (", ".join(skipped_df["dataset_name"].astype(str).tolist()) if len(skipped_df) else "(none)"),
         "ttt_oom_fallback_datasets: "
         + (", ".join(oom_fallback_df["dataset_name"].astype(str).tolist()) if len(oom_fallback_df) else "(none)"),
+        "ttt_wise_applied_datasets: "
+        + (", ".join(wise_applied_df["dataset_name"].astype(str).tolist()) if len(wise_applied_df) else "(none)"),
     ]
     summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -2538,7 +2971,10 @@ def worker_main(
                         f"f1={format_optional_float(row.f1)} "
                         f"balanced_accuracy={format_optional_float(row.balanced_accuracy)} "
                         f"roc_auc={format_optional_float(row.roc_auc)} "
-                        f"log_loss={format_optional_float(row.log_loss)}",
+                        f"log_loss={format_optional_float(row.log_loss)} "
+                        f"wise_ft={row.ttt_wise_ft} "
+                        f"wise_alpha={format_optional_float(row.ttt_wise_alpha)} "
+                        f"wise_applied={row.ttt_wise_applied}",
                         flush=True,
                     )
                 else:
@@ -2644,10 +3080,13 @@ def run_benchmark(args: argparse.Namespace) -> None:
         if bool(args.ttt):
             c_selection_label = str(args.ttt_c_selection)
             ttt_label_value = f"{ttt_label_value}_csel{c_selection_label}"
-            if c_selection_label == "f_mmd":
+            if c_selection_label == FAWARE_C_SELECTION:
                 reserve_label = str(args.ttt_c_reserve_ratio).replace(".", "p")
+                wise_alpha_label = str(args.ttt_wise_alpha).replace(".", "p")
                 ttt_label_value = (
                     f"{ttt_label_value}_{args.ttt_c_metric}_reserve{reserve_label}"
+                    f"_wise{int(bool(args.ttt_wise_ft))}"
+                    f"_alpha{wise_alpha_label}"
                 )
         out_dir = auto_out_dir(
             model_label=model_label,
@@ -2728,41 +3167,41 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--data-root",
-        default="../../data184",
+        default=DEFAULTS.data_root,
         help="Root directory containing data178-style dataset folders.",
     )
     parser.add_argument(
         "--out-dir",
-        default="../../results/tabpfnv2/tabpfnv2_random_ft",
+        default=DEFAULTS.out_dir,
         help=(
             "Directory for worker CSVs, all_classification_results.csv, and summary.txt. "
             "If omitted, uses baseline_compare/results/<auto_name>."
         ),
     )
-    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=DEFAULTS.workers)
     parser.add_argument(
         "--gpus",
-        default="0",
+        default=DEFAULTS.gpus,
         help="Comma-separated physical GPU ids, or 'auto' to use detected GPUs.",
     )
-    parser.add_argument("--max-datasets", type=int, default=None)
-    parser.add_argument("--random-state", type=int, default=42)
+    parser.add_argument("--max-datasets", type=int, default=DEFAULTS.max_datasets)
+    parser.add_argument("--random-state", type=int, default=DEFAULTS.random_state)
     parser.add_argument(
         "--n-estimators",
         type=int,
-        default=8,
+        default=DEFAULTS.n_estimators,
         help="Number of TabPFN ensemble estimators used by the base inference estimator.",
     )
-    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--verbose", action="store_true", default=DEFAULTS.verbose)
     parser.add_argument(
         "--model-version",
         choices=["v2", "v2.5", "v2.6", "v3"],
-        default=DEFAULT_MODEL_VERSION,
+        default=DEFAULTS.model_version,
         help="TabPFN model version to use when --model-path is not provided.",
     )
     parser.add_argument(
         "--model-path",
-        default=None,
+        default=DEFAULTS.model_path,
         help=(
             "Path to a local TabPFN checkpoint. Relative paths are resolved from the "
             "current working directory if they exist, otherwise from this script's "
@@ -2773,7 +3212,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--v3-binary-model-path",
-        default="auto",
+        default=DEFAULTS.v3_binary_model_path,
         help=(
             "TabPFN v3 checkpoint used automatically for data178 binclass tasks "
             f"when --model-version v3 and --model-path is omitted. 'auto' searches "
@@ -2782,7 +3221,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--v3-multiclass-model-path",
-        default="auto",
+        default=DEFAULTS.v3_multiclass_model_path,
         help=(
             "TabPFN v3 checkpoint used automatically for data178 multiclass tasks "
             f"when --model-version v3 and --model-path is omitted. 'auto' searches "
@@ -2792,7 +3231,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--many-class",
         choices=["auto", "on", "off"],
-        default="auto",
+        default=DEFAULTS.many_class,
         help=(
             "Legacy many-class wrapper switch. Datasets with >10 classes are "
             "skipped by this benchmark before model fitting."
@@ -2801,10 +3240,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--many-class-alphabet-size",
         type=int,
-        default=TABPFN_CLASS_LIMIT,
+        default=DEFAULTS.many_class_alphabet_size,
     )
-    parser.add_argument("--many-class-redundancy", type=int, default=4)
-    parser.add_argument("--many-class-n-estimators", type=int, default=16)
+    parser.add_argument(
+        "--many-class-redundancy",
+        type=int,
+        default=DEFAULTS.many_class_redundancy,
+    )
+    parser.add_argument(
+        "--many-class-n-estimators",
+        type=int,
+        default=DEFAULTS.many_class_n_estimators,
+    )
     ttt_group = parser.add_mutually_exclusive_group()
     ttt_group.add_argument(
         "--ttt",
@@ -2818,13 +3265,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Disable TTT and run baseline TabPFN inference.",
     )
-    parser.set_defaults(ttt=True)
-    parser.add_argument("--ttt-epochs", type=int, default=30)
-    parser.add_argument("--ttt-max-chunk-size", type=int, default=10000)
+    parser.set_defaults(ttt=DEFAULTS.ttt_enabled)
+    parser.add_argument("--ttt-epochs", type=int, default=DEFAULTS.ttt_epochs)
+    parser.add_argument(
+        "--ttt-max-chunk-size",
+        type=int,
+        default=DEFAULTS.ttt_max_chunk_size,
+    )
     parser.add_argument(
         "--ttt-grad-accumulation-steps",
         type=int,
-        default=1,
+        default=DEFAULTS.ttt_grad_accumulation_steps,
         help=(
             "Accumulate gradients across this many TTT chunks before one "
             "optimizer update. With the default chunk size 10000 and value 1, "
@@ -2832,66 +3283,112 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "10000 samples at once."
         ),
     )
-    parser.add_argument("--ttt-query-ratio", type=float, default=0.2)
+    parser.add_argument(
+        "--ttt-query-ratio",
+        type=float,
+        default=DEFAULTS.ttt_query_ratio,
+    )
     parser.add_argument(
         "--ttt-c-selection",
-        choices=["f_mmd", "random"],
-        default="random",
+        choices=[FAWARE_C_SELECTION, "random"],
+        default=DEFAULTS.ttt_c_selection,
         help=(
-            "How to choose per-chunk query/context rows for TTT. f_mmd reserves "
-            "test-farthest train rows as context-only; random uses the original "
-            "TabPFN finetuning random split_fn as an ablation."
+            f"How to choose query/context rows for TTT. {FAWARE_C_SELECTION} "
+            "scores the full training set once against the global test centroid "
+            "and reserves the highest-score row IDs as context-only across all "
+            "chunks/epochs; random uses the original TabPFN finetuning split."
         ),
     )
     parser.add_argument(
         "--ttt-c-metric",
         choices=["raw_l2", "standardized_l2"],
-        default="standardized_l2",
+        default=DEFAULTS.ttt_c_metric,
         help=(
-            "Feature space metric used only when --ttt-c-selection=f_mmd. raw_l2 "
-            "uses cleaned TabPFN input features; standardized_l2 z-scores them "
-            "with train-chunk statistics."
+            f"Selection-only feature metric used when --ttt-c-selection="
+            f"{FAWARE_C_SELECTION}. raw_l2 uses train-fitted numeric/categorical "
+            "encodings; standardized_l2 z-scores them with full-train statistics."
         ),
     )
     parser.add_argument(
         "--ttt-c-reserve-ratio",
         type=float,
-        default=0.05,
+        default=DEFAULTS.ttt_c_reserve_ratio,
         help=(
-            "Fraction of train rows reserved as test-farthest context-only rows "
-            "when --ttt-c-selection=f_mmd. Must satisfy reserve_ratio + "
-            "--ttt-query-ratio < 1 for f_mmd."
+            "Fraction of globally scored train rows reserved as context-only when "
+            f"--ttt-c-selection={FAWARE_C_SELECTION}. Must satisfy reserve_ratio "
+            f"+ --ttt-query-ratio < 1 for {FAWARE_C_SELECTION}."
         ),
     )
-    parser.add_argument("--ttt-lr", type=float, default=1e-5)
-    parser.add_argument("--ttt-weight-decay", type=float, default=0.01)
-    parser.add_argument("--ttt-grad-clip", type=float, default=1.0)
-    parser.add_argument("--ttt-patience", type=int, default=8)
-    parser.add_argument("--ttt-min-delta", type=float, default=1e-4)
-    parser.add_argument("--ttt-eval-metric", choices=["roc_auc", "log_loss", "acc"], default="acc")
-    parser.add_argument("--ttt-validation-fraction", type=float, default=0.1)
-    parser.add_argument("--ttt-n-estimators-finetune", type=int, default=2)
-    parser.add_argument("--ttt-validation-n-estimators", type=int, default=2)
+    parser.add_argument("--ttt-lr", type=float, default=DEFAULTS.ttt_lr)
+    parser.add_argument(
+        "--ttt-weight-decay",
+        type=float,
+        default=DEFAULTS.ttt_weight_decay,
+    )
+    parser.add_argument(
+        "--ttt-wise-ft",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULTS.ttt_wise_ft,
+        help=(
+            "Apply fixed-alpha WiSE-FT after early-stopping restoration only for "
+            f"--ttt-c-selection={FAWARE_C_SELECTION} datasets with total rows "
+            f"< {WISE_FT_MAX_DATASET_ROWS}. random always disables WiSE-FT."
+        ),
+    )
+    parser.add_argument(
+        "--ttt-wise-alpha",
+        type=float,
+        default=DEFAULTS.ttt_wise_alpha,
+        help=(
+            "WiSE-FT interpolation alpha in [0, 1], where 0 keeps the initial "
+            "model weights and 1 keeps the fine-tuned endpoint."
+        ),
+    )
+    parser.add_argument("--ttt-grad-clip", type=float, default=DEFAULTS.ttt_grad_clip)
+    parser.add_argument("--ttt-patience", type=int, default=DEFAULTS.ttt_patience)
+    parser.add_argument("--ttt-min-delta", type=float, default=DEFAULTS.ttt_min_delta)
+    parser.add_argument(
+        "--ttt-eval-metric",
+        choices=["roc_auc", "log_loss", "acc"],
+        default=DEFAULTS.ttt_eval_metric,
+    )
+    parser.add_argument(
+        "--ttt-validation-fraction",
+        type=float,
+        default=DEFAULTS.ttt_validation_fraction,
+    )
+    parser.add_argument(
+        "--ttt-n-estimators-finetune",
+        type=int,
+        default=DEFAULTS.ttt_n_estimators_finetune,
+    )
+    parser.add_argument(
+        "--ttt-validation-n-estimators",
+        type=int,
+        default=DEFAULTS.ttt_validation_n_estimators,
+    )
     parser.add_argument(
         "--ttt-lr-scheduler",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=DEFAULTS.ttt_lr_scheduler,
         help="Use the TabPFN finetuning LR scheduler.",
     )
     parser.add_argument(
         "--ttt-lr-warmup-only",
         action="store_true",
+        default=DEFAULTS.ttt_lr_warmup_only,
         help="Use warmup-only LR scheduling during finetuning.",
     )
     parser.add_argument(
         "--ttt-activation-checkpointing",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=DEFAULTS.ttt_activation_checkpointing,
         help="Use activation checkpointing during finetuning.",
     )
     parser.add_argument(
         "--retry-failed-datasets-only",
         action="store_true",
+        default=DEFAULTS.retry_failed_datasets_only,
         help=(
             "When enabled, only rerun datasets whose rows have status=fail in "
             "--reference-results-csv. Disabled by default so the script can run "
@@ -2900,7 +3397,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--reference-results-csv",
-        default="v3_results/all_classification_results.csv",
+        default=DEFAULTS.reference_results_csv,
         help=(
             "Historical results CSV used by --retry-failed-datasets-only to pick "
             "failed datasets. Default points to the local v3 results file."
@@ -2909,11 +3406,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--retry-include-oom-failures",
         action="store_true",
+        default=DEFAULTS.retry_include_oom_failures,
         help="When retrying previous failures, also rerun failures whose error looks like OOM.",
     )
     parser.add_argument(
         "--merge-results-from-csv",
-        default=None,
+        default=DEFAULTS.merge_results_from_csv,
         help=(
             "Merge the current run into this existing results CSV before saving "
             "all_classification_results.csv. Defaults to --reference-results-csv "
@@ -2936,7 +3434,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Enforce TabPFN pretraining limits and fail on those validation checks.",
     )
-    parser.set_defaults(ignore_pretraining_limits=True)
+    parser.set_defaults(
+        ignore_pretraining_limits=DEFAULTS.ignore_pretraining_limits,
+    )
     return parser
 
 
@@ -2965,14 +3465,19 @@ def _run_faware_sanity_checks() -> None:
     if reserve_ratio + query_ratio >= 1.0:
         raise AssertionError("sanity setup violates reserve/query ratio")
     split_fn = partial(train_test_split, test_size=2, random_state=42)
-    split = _faware_mmd_indices(
+    reservation = _build_global_test_centroid_reservation(
         X,
-        y,
         X_reference,
-        split_fn,
-        y,
+        categorical_feature_indices=[],
         metric="standardized_l2",
         reserve_ratio=reserve_ratio,
+    )
+    split = _global_test_centroid_reserve_indices(
+        y,
+        np.arange(len(y)),
+        reservation,
+        split_fn,
+        y,
     )
     if set(split.reserved_idx.tolist()) & set(split.qry_idx.tolist()):
         raise AssertionError("reserved context rows leaked into query")
@@ -2999,21 +3504,30 @@ def _run_faware_sanity_checks() -> None:
     if random_summary["ttt_c_f_distance_mean"] is not None:
         raise AssertionError("random sanity unexpectedly recorded f-distance")
 
-    rare_faware_split = _faware_mmd_indices(
+    rare_reservation = _build_global_test_centroid_reservation(
         rare_X.astype(np.float64),
-        rare_y,
         np.array([[0.0]], dtype=np.float64),
-        rare_split_fn,
-        rare_y,
+        categorical_feature_indices=[],
         metric="standardized_l2",
         reserve_ratio=0.1,
+    )
+    rare_faware_split = _global_test_centroid_reserve_indices(
+        rare_y,
+        np.arange(len(rare_y)),
+        rare_reservation,
+        rare_split_fn,
+        rare_y,
     )
     if set(rare_faware_split.reserved_idx.tolist()) & set(
         rare_faware_split.qry_idx.tolist()
     ):
-        raise AssertionError("rare f_mmd reserved context rows leaked into query")
+        raise AssertionError(
+            f"rare {FAWARE_C_SELECTION} reserved context rows leaked into query"
+        )
     if rare_faware_split.fallback_reason is None:
-        raise AssertionError("rare f_mmd sanity did not record aligned fallback")
+        raise AssertionError(
+            f"rare {FAWARE_C_SELECTION} sanity did not record aligned fallback"
+        )
 
     random_args = argparse.Namespace(
         ttt=True,
@@ -3032,6 +3546,8 @@ def _run_faware_sanity_checks() -> None:
         ttt_grad_clip=1.0,
         ttt_lr=1e-5,
         ttt_weight_decay=0.01,
+        ttt_wise_ft=True,
+        ttt_wise_alpha=0.1,
         ttt_patience=1,
         ttt_min_delta=1e-4,
         ttt_lr_scheduler=True,
@@ -3047,6 +3563,8 @@ def _run_faware_sanity_checks() -> None:
         raise AssertionError("random selection should not report c_metric")
     if ttt_c_reserve_ratio_for_config(random_config) is not None:
         raise AssertionError("random selection should not report c_reserve_ratio")
+    if wise_ft_enabled_for_config(random_config):
+        raise AssertionError("random selection should always disable WiSE-FT")
 
 
 def main() -> None:

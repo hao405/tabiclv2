@@ -1,0 +1,21 @@
+{
+  "run_id": "tabiclv2_graph_scm_2x3_full_20260716_090925",
+  "created_at": "2026-07-16T09:09:26.279610+08:00",
+  "source_root": "results/managed_experiments/tabiclv2_graph_scm_3stage_512_full_20260715_1518",
+  "reason": "Exact-match reuse after correcting Graph-SCM matrix from 4x3 to default 2x3",
+  "cells": [
+    "tabicl-v2/infer",
+    "tabicl-v2/ft",
+    "tabicl-v2/faware_ft"
+  ],
+  "verified": {
+    "data_root": "results/tabiclv2_prior_data/graph_scm_3stage_512_seed42",
+    "seed": 42,
+    "n_estimators": 32,
+    "ttt_epochs": 30,
+    "ttt_lr": 1e-05,
+    "ttt_patience": 8,
+    "ttt_c_metric": "standardized_l2",
+    "devices": "1"
+  }
+}

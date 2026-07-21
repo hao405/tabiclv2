@@ -1,7 +1,7 @@
 import torch
 import random
 import numpy as np
-from model.transformer import FeaturesTransformer
+from baseline_compare.LimiX.model.transformer import FeaturesTransformer
 
 def build_model(config:dict):
     model = FeaturesTransformer(

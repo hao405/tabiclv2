@@ -1,0 +1,237 @@
+Sparse Mixture of In-Context Prompters, MICP, routes each test sample to one of K “In-Context
+Prompters” (ICP), {Tk }Kk=0 , specializing on a cluster of the training dataset, using a routing module,
+R : Rd → {0, ..., K − 1}. Each ICP then constructs a relevant “prompt” for incoming test samples,
+which are sent to the downstream PFN model in batch.
+To reduce the “prompt”-construction overhead, each ICP, {Tk }K    k=0 , precomputes its own support
+set, Dprompt (k) ⊂ Dtrain , of constant size, |Dprompt (k)| = B. During inference, ICP concatenates
+                                                                                      (i)    (i)
+incoming test samples with its support set to form the scalable “prompt”: Tk ({xtest : R(xtest =
+           (i)        (i)
+k)}) = ({xtest : R(xtest = k)}, Dprompt (k)). The goal of MICP is efficiently approximate KNN-
+prompts, which can be accomplished by maximizing the overlap between the prompter’s and the test
+                                      (i)               (i)
+sample’s support sets: |Dprompt (R(xtest )) ∩ Dsupp (xtest )| ∀i ∈ [0, ..., Ntest − 1].
+
+3.2.1   Router and Prompter Initialization
+Intuitively, each ICP, Tk , specializes on a local cluster of the training dataset. The router, R, routes
+each test sample to its nearest cluster. To capture local clusters, we initialize the router and ICP with
+                                       (k)             (k)
+K-Means on the training dataset: {Dcluster }K                  K
+                                               k=0 , {xcenter }k=0 = KM EANS (Dtrain ). Our resulting
+                                                                           (k)
+router is the Nearest Neighbor Search algorithm: R(x) = NNS(x|{xcenter }K          k=0 ).
+Because efficient “prompts” have bounded number of entries, B, we subsample clusters with more
+than B entries. Because PFN performance drastically increases with more training samples [Holl-
+mann et al., 2022, Müller et al., 2021, McElfresh et al., 2023], we expand clusters with less than B
+                                                                                        (k)
+entries via K-Nearest Neighbors. We define this process in Equation 2, where G(k) = |Dcluster | < B
+denotes whether the clusters are too big or small.
+                                        (
+                                                   (k)
+                                            KNN(xcenter |Dtrain , B), if G(k)
+                       Dprompt (k) =                 (k)                                               (2)
+                                            S AMPLE(Dcluster , B),    else
+
+                                                           (i)
+During inference, MICP routes each test sample, xtest , to its corresponding ICP. Similar to
+sparse mixture of experts, once each ICP receives enough test entries, PFN inference is per-
+                                                 (k)
+formed on batched test “prompts”: (Xbatch , Dprompt ), which contains multiple entries from
+the test set Xbatch ⊆ Xtest , because all said entries were routed to the same ICP cluster:
+    (i)           (j)
+R(xbatch ) = R(xbatch )∀i, j. Hence, MICP efficiently constructs bounded batched “prompts”.
+In total, router and prompter initialization takes O(tNtrain K + (Ntrain + KB)logNtrain ) time and
+O(Ntrain + KB) space complexity and is done once before inference. Routing takes O(log(K))
+time and O(1) space complexity, using efficient nearest neighbor search with ball-tree for each test
+sample. PFN transformer inference takes O(B 2 + BNbatch ) time and space complexity, as MICP
+prompts contain at most B training samples and Nbatch = |Xbatch | testing samples. We provide time
+and space complexity details in the Appendix. We illustrate MICP in Figure 2.
+
+3.2.2   Efficiency and Effectiveness Trade-Off
+The effectiveness of MICP prompts depend on the number of ICP S used, K. As the complexity and
+size of data increase, more ICP S are needed to capture the entropy of the labels. This is natural as
+                                            (i)
+each router’s support set, Dprompt (R(xtest )), should be representative of test samples routed to that
+                    (i)                                        (i)
+cluster, Dsupport (xtest ). If the true support set Dsupport (xtest ) becomes more granular as the dataset
+                                                                                 (i)                (i)
+size increases, more ICP S are required to maximize overlap: |Dprompt (R(xtest )) ∩ Dsupp (xtest )|.
+We theoretically characterize this relationship between K, B, and overlap by analyzing conditions
+                                                                      (i)                 (i)
+required for nonzero overlap on the training data: |Dprompt (R(xtrain )) ∩ Dsupp (xtrain )| ≥ 1
+∀i ∈ [0, ..., Ntrain − 1]. Specifically, we encourage nonzero overlap by scaling the number of
+“prompts”, K, linearly with the size of each “prompt”, B, and training dataset size, |Ntrain |, as stated
+in Theorem 1: K ≥ ⌈Ntrain /B⌉.
+This insight allows M IXTURE PFN to trade-off efficiency and effectiveness with a single hyper-
+parameter, γ, which controls the number of ICP S as a ratio of training and support set sizes:
+
+
+                                                    5
+                                 Condorcet Statistics                 All Algo.       Top-10 Algo.
+  Method
+                       #Votes↑    #Wins↑ #Ties #Losses↓                      Mean ± Std Rank↓
+  MixturePFN           524         19          0           0          2.350 ± 1.824        2.273 ± 1.7106
+  XGBoost              500         18          0           1          5.500 ± 4.621        4.000 ± 2.663
+  CatBoost             474         17          0           2          4.900 ± 4.158        3.955 ± 2.688
+  SAINT                408         16          0           3          8.300 ± 5.367        4.045 ± 1.965
+  TabPFN*              381         13          1           5          4.550 ± 2.747        4.040 ± 1.311
+  LightGBM             373         14          1           4          9.150 ± 4.351        6.409 ± 2.839
+  DANet                312         14          0           5          9.050 ± 3.369        7.045 ± 1.988
+  FTTransformer        294         12          0           7          8.600 ± 3.541        6.773 ± 2.235
+  ResNet               286         11          0           8          8.400 ± 3.262        6.864 ± 1.961
+  SVM                  285         9           0           10         11.300 ± 4.766       7.500 ± 2.482
+  STG                  284         10          0           9          11.900 ± 4.549       -
+  RandomForest         247         7           0           12         11.600 ± 4.443       -
+  NODE                 243         7           0           12         13.350 ± 3.410       -
+  MLP-rtdl             227         5           0           14         10.800 ± 5.046       -
+  TabNet               210         5           0           14         13.550 ± 5.296       -
+  LinearModel          202         3           1           15         12.400 ± 4.652       -
+  MLP                  191         5           1           13         13.700 ± 3.621       -
+  VIME                 134         2           0           17         15.350 ± 3.851       -
+  DecisionTree         114         1           0           18         16.800 ± 3.881       -
+  KNN                  74          0           0           19         18.450 ± 1.936       -
+
+Table 1: M IXTURE PFN is the Condorcet winner across 36 datasets against 19 baseline algorithms.
+M IXTURE PFN achieves the top mean rank across 20 datasets where all algorithms successfully
+run and across 22 datasets where all Top-10 algorithms successfully run. To break ties, we rank
+algorithms based on their mean log-likelihoods following TAB Z ILLA [McElfresh et al., 2023]. We
+report the Condorcet matrix, dataset breakdowns, and accuracy-metric results in the Appendix.
+
+
+K = ⌈γNtrain /B⌉. Intuitively, larger γ improves effectiveness at the cost of efficiency. Assum-
+ing fixed γ, Nbatch , and B, M IXTURE PFN routing takes O(log(Ntrain )) time and O(1) space
+complexity, and PFN inference takes O(1) time and space complexity.
+Theorem 1 (Nonzero Overlap). If every K-Means cluster contains at most B samples,
+   (k)
+|Dcluster | ≤ B ∀k ∈ [0, ..., K − 1] and training points route to their assigned K-Means clus-
+         (i)            (i)      (k)
+ter R∗ (xtrain ) = k : xtrain ∈ Dcluster 5 , then nonzero overlap on the training data is guaranteed,
+                 (i)               (i)
+|Dprompt (R∗ (xtrain )) ∩ Dsupp (xtrain )| ≥ 1 ∀i ∈ [0, ..., Ntrain − 1] ∀Dtrain .
+
+
+3.3       Context-Aware Finetuning (C A PFN)
+
+PFN S are pretrained on the ICL task over a synthetic dataset prior, p(D) = p(D|ϕ)p(ϕ) [Müller
+et al., 2021, Hollmann et al., 2022]. Inspired by recent works which aligns Large Language Models
+on ICL “prompts” via finetuning [Thoppilan et al., 2022, Wei et al., 2021, Gu et al., 2023], we argue
+the pretraining data prior, p(D) = p(D|ϕ)p(ϕ), is different than the true data generating mechanism
+during inference, p(Dprompt |Dtrain ), which was described in Section 3.2. To better align the
+parameterized model, qθ , with the inference-time dataset, Dprompt , C A PFN uses bootstrapping
+on the downstream dataset, Dtrain , to simulate ICL “prompts”: (Xsubtest , Ysubtest , Dsubtrain ) ∼
+p(D|Dtrain ), where Xsubtest ⊂ Xtrain , Ysubtest ⊂ Ytrain , and Dsubtrain ⊂ Dtrain . Bootstrapped
+samples are used to tune adapters [Houlsby et al., 2019] via prior data negative log likelihood loss, as
+shown in Equation 1, except the dataset prior is now the bootstrap mechanism: p(D) = p(D|Dtrain ).
+
+      5
+     Thse conditions can be satisfied via constrained K-Means [Bradley et al., 2000], which ensures each cluster
+has at most B entries, and a router that sends train points to their assigned clusters. In practice, we find the
+relationship with the tunable parameter γ also holds for M IXTURE PFN’s regular K-Means and Nearest-Neighbor
+Search router.
+
+
+                                                       6
+ (a) Ntrain w.r.t. TAB PFN*   (b) Ntrain w.r.t. baselines             (c) Kurtosis and #Feats
+
+Figure 3: (a): We plot the difference in Log Likelihood between M IXTURE PFN and TAB PFN* for
+each dataset of size Ntrain . M IXTURE PFN substantially improves the performance and TAB PFN*
+and runs on datasets with > 3, 000 samples. (b): We plot the Log Likelihood of the top deep learning
+(DL) PFN, and tree baselines across all 36 datasets and the best-fit line between rank and dataset size,
+compared to the top baseline. Unlike TAB PFN, M IXTURE PFN maintains its good performance as
+the size of the dataset increases. (c) : We plot the best among the top DL, PFN, and tree baselines
+on all 36 datasets across different dataset properties. M IXTURE PFN performs well across different
+dataset irregularities. We provide further breakdowns in the Appendix.
+
+
+3.3.1     Bootstrapping Large MICP Datasets
+The bootstrap procedure mimics MICP on large Ntrain > 3000 datasets: p(D|Dtrain ) =
+p(Dsupport |x)p(x|Dtrain ). Specifically, we sample a random training point from the training
+dataset, x ∼ p(x|Dtrain ), then run K-Nearest Neighbors from the sampled point, p(Dsupport |x) =
+KNN(x|Dtrain , B), as defined in Section 3.1, to obtain a bootstrap dataset, Dbootstrap . We randomly
+split the bootstrapped dataset Dbootstrap ∼ p(D|Dtrain ) into train/test splits to obtain the “labelled
+prompt”, (Xsubtest , Ysubtest , Dsubtrain ).
+
+3.3.2     Bootstrapping Small Datasets
+MICP does not run on smaller Ntrain ≤ 3000 datasets. However, bootstrapping can still be used to
+finetune the model on said datasets to match the downstream dataset distribution. In this case, we
+sample from p(D|Dtrain ) by randomly sampling 90% of training samples without replacement to
+obtain Dsubtrain and treating the remaining 10% of sample as Xsubtest , Ysubtest .
+
+3.3.3     Finetuning with Adapters
+To prevent overfitting, we only train a small set of new adapter [Houlsby et al., 2019, Bapna et al.,
+2019, Hu et al., 2021, Liu et al., 2022] parameters, ψ, on p(D|Dtrain ), without modifying in the
+pretrained transformer’s parameters, θ.6 Specifically, we freeze a pretrained TAB PFN transformer,
+qθ (y|x, D). Next, for each downstream dataset, Dtrain , we add linear adapter layers [Houlsby et al.,
+          (D    )                                 (D    )              (D     )
+2019], Aψ train , with parameters ψ, to form qθ,ψtrain (y|x, D, qθ , Aψ train ). During finetuning,
+                                                                                                (D      )
+only ψ is optimized. Intuitively, qθ encodes the handcrafted prior, p(D|ϕ)p(ϕ), and Aψ train
+encodes the bootstrapped prior, p(D|Dtrain ). We illustrate C A PFN in Figure 2.
+
+4       Experiment Setup
+We evaluate M IXTURE PFN on the recently proposed TAB Z ILLA benchmark [McElfresh et al., 2023].
+TAB Z ILLA is the largest tabular benchmark, with 36 hardest datasets out of 176 tabular classification
+datasets and 19 baseline algorithms, covering both deep learning and GBDT S. The benchmark
+covers a diverse range of dataset properties, in number of samples, number of features, and feature
+    6
+    Adapters are also efficient because only a small number of parameters are updated, p(ϕ) is not needed
+during finetuning, and different downstream datasets share a common pretrained model.
+
+
+                                                    7
+Figure 4: Wilcoxon-Signed Rank Test shows M IXTURE PFN significantly outperforms the Top-
+10 baselines on the 22 shared datasets. To break ties, we rank algorithms based on their mean
+log-likelihoods following TAB Z ILLA [McElfresh et al., 2023]. We compute the rank across all 10
+cross-validation splits. We report additional critical difference diagrams in the Appendix.
+
+
+                                                        Mean ± Std       Median     Min       Max
+       Method
+                                                        Rank↓            Rank↓      Rank↓     Rank↓
+       M IXTURE PFN                                     2.75 ± 1.94      2          1         9
+       M IXTURE PFN (KNNv2)                             4.00 ± 1.56      4          2         7
+       CatBoost                                         4.70 ± 3.16      6          1         9
+       M IXTURE PFN (CaPFN w. Full FT)                  4.85 ± 2.03      4.5        2         9
+       XGBoost                                          4.95 ± 3.17      6          1         10
+       M IXTURE PFN (-CaPFN)                            5.10 ± 1.12      5          3         8
+       M IXTURE PFN (-CaPFN-MICP) = TAB PFN*            5.30 ± 1.59      5          2         9
+       M IXTURE PFN (KNNv1)                             7.25 ± 3.70      9          1         10
+       MLP-rtdl                                         7.25 ± 2.79      8          1         10
+       MLP                                              8.85 ± 0.99      9          7         10
+
+Table 2: Ablation table results. M IXTURE PFN (KNNv1) and M IXTURE PFN (KNNv2) replace
+MICP with a scalable variant of KNN-Prompting. M IXTURE PFN (CaPFN w. Full FT) uses full
+finetuning instead of adapters. M IXTURE PFN (-CaPFN) and M IXTURE PFN (-CaPFN-MICP)
+remove each component iteratively, where MICP is replaced by random sampling.
+
+
+
+distributions. M IXTURE PFN’s goal is to (1) improve TAB PFN* [McElfresh et al., 2023], which
+randomly samples B training pairs so that TAB PFN [Hollmann et al., 2022] runs on larger datasets,
+and (2) outperform both GBDT S [Chen and Guestrin, 2016, Prokhorenkova et al., 2018, Ke et al.,
+2017] which were found state-of-the-art by TAB Z ILLA, and recent deep learning models [Popov
+et al., 2019, Gorishniy et al., 2021, Arik and Pfister, 2021, Hollmann et al., 2022, Yamada et al., 2020,
+Yoon et al., 2020, Somepalli et al., 2021, Chen et al., 2022].
+
+
+4.0.1    Evaluation Protocol
+
+Since TAB Z ILLA restricts the total runtime to 10 hours, not all algorithms run on the same datasets.
+To ensure a fair comparison7 , we first evaluate M IXTURE PFN and baselines using Condorcet voting,
+where each dataset ranks the algorithms that successfully ran on it. An algorithm receives a vote
+whenever it achieves a higher rank than a baseline on each dataset. For each pair of algorithms, the
+winner received more votes than the loser across all datasets ranking both algorithms. The Condorcet
+winner is the algorithm that wins all pairwise comparisons.
+After determining the Condorcet winner, We further evaluate M IXTURE PFN by ranking it against all
+baseline algorithms and Top-10 Condorcet algorithms across their shared datasets. We evaluate the
+performance of each algorithm by its mean rank. Finally, we run a Wilcoxon-Signed Rank Test to
+check the statistical significance of said mean rank across the Top-10 Condorcet algorithms.
+
+
+   7
+    We cannot follow the same experimental settings as the October revision of TAB Z ILLA because they are
+unfair, as mentioned in a recent Github issue [abvesa, 2024]. Further details are in the Appendix.
+
+
+                                                    8
+

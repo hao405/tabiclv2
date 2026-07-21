@@ -18,6 +18,10 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-results/managed_experiments}"
 LOG_DIR="${LOG_DIR:-logs/tabiclv2_graph_scm_matrix}"
 DRY_RUN="${DRY_RUN:-0}"
 PRIOR_SRC_ROOT="${PRIOR_SRC_ROOT:-}"
+MATRIX_MODELS="${MATRIX_MODELS:-tabicl-v2 tabpfn-v3}"
+MATRIX_METHODS="${MATRIX_METHODS:-infer ft faware_ft}"
+read -r -a MATRIX_MODEL_ARGS <<< "${MATRIX_MODELS}"
+read -r -a MATRIX_METHOD_ARGS <<< "${MATRIX_METHODS}"
 
 if [[ "${PRESET}" == "smoke" ]]; then
   STAGE_COUNTS=(1 1 1)
@@ -65,6 +69,8 @@ MATRIX_COMMAND=(
   python -u scripts/run_tfm_experiment.py
   --matrix
   --matrix-resume
+  --matrix-models "${MATRIX_MODEL_ARGS[@]}"
+  --matrix-methods "${MATRIX_METHOD_ARGS[@]}"
   --data-root "${DATA_ROOT}"
   --output-root "${OUTPUT_ROOT}"
   --run-id "${RUN_ID}"

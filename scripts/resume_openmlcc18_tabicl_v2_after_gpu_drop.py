@@ -29,7 +29,10 @@ MATRIX_MODELS = ("tabicl-v2", "tabpfn-v3")
 MATRIX_METHODS = ("infer", "ft", "faware_ft")
 TRUTHY = {"1", "true", "yes"}
 EXPECTED_METRIC = "tabicl_encoded_l2"
-EXPECTED_SELECTION = {"ft": "random", "faware_ft": "f_mmd"}
+EXPECTED_SELECTION = {
+    "ft": "random",
+    "faware_ft": "f_test_centroid_reserve",
+}
 SENTINEL_PREFIX = "__WORKER_EXIT__"
 EXPECTED_INITIAL_INVENTORY = {"infer": 14, "ft": 15, "faware_ft": 14}
 
@@ -177,7 +180,11 @@ def validate_success_row(
     if method == "infer":
         return
     expected_selection = EXPECTED_SELECTION[method]
-    if row.get("ttt_c_selection", "").strip() != expected_selection:
+    actual_selection = row.get("ttt_c_selection", "").strip()
+    accepted_selections = {expected_selection}
+    if method == "faware_ft":
+        accepted_selections.add("f_mmd")
+    if actual_selection not in accepted_selections:
         raise ValueError(f"unexpected selector for {method}/{name}")
     if row.get("ttt_c_metric", "").strip() != EXPECTED_METRIC:
         raise ValueError(f"unexpected native metric for {method}/{name}")

@@ -4,7 +4,7 @@
 
 在 `jiqun` 的现有 `tmux zh:1` window 中，先用同一个小数据集
 `eucalyptus` 并行验证 LimiX-2M 的 `infer` 与 `ft`，通过后再用物理
-GPU1、GPU2 启动 seed42 的 data184 八方法完整矩阵。
+GPU1、GPU2 启动 seed42 的 data184 七方法完整矩阵。
 
 本次运行复用现有：
 
@@ -13,7 +13,7 @@ GPU1、GPU2 启动 seed42 的 data184 八方法完整矩阵。
 - `baseline_compare/LimiX/LimiX-2M.ckpt`
 - `baseline_compare/LimiX/config/cls_default_noretrieval.json`
 
-不修改八种方法的实验语义或超参数。
+不修改七种方法的实验语义或超参数。
 
 ## 执行面与 GPU 契约
 
@@ -112,7 +112,7 @@ bash scripts/run_limix2m_data184_matrix.sh
 方法按 shell 既定顺序分批运行：
 
 ```text
-infer, ft, faware_ft, lora, prefix, last_block, localpfn, micp
+infer, ft, faware_ft, lora, prefix, last_block, micp
 ```
 
 标准输出为：
@@ -131,7 +131,7 @@ results/limix/data184/limix2m/seed42/<method>/
 - 日志开始产生逐数据集进度；
 - 未出现配置哈希冲突、依赖错误、CUDA 不可用或立即 OOM。
 
-最终完成状态以后续 `matrix_manifest.json`、八个方法 CSV 和
+最终完成状态以后续 `matrix_manifest.json`、七个方法 CSV 和
 shared-`status=ok` 汇总为准，不能以 pane 空闲或进程退出单独判断。
 
 ## 范围边界

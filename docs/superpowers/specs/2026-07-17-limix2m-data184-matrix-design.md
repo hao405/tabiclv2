@@ -3,7 +3,7 @@
 ## 目标与边界
 
 为 LimiX-2M 实现 `infer`、`ft`、`faware_ft`、`lora`、`prefix`、
-`last_block`、`localpfn` 和 `micp` 八种原生分类实验方法，并用一个 shell
+`last_block`、`micp` 和 `mixturepfn` 八种原生分类实验方法，并用一个 shell
 编排 seed42 的 `8 × 184` data184 矩阵。
 
 本次只交付 runner、shell、测试和 dry-run，不启动 GPU smoke 或完整矩阵。现有
@@ -19,7 +19,7 @@
 - test labels 只用于最终指标；只有方法定义允许时才读取未标注 test features。
 - 最终预测使用完整 `train + val` context。
 - 训练型方法默认使用 AdamW、`lr=1e-5`、weight decay `0.01`、30 epochs、
-  chunk size `200`、query ratio `0.2`、cosine warmup `0.1`、grad clip `1.0`
+  chunk size `10000`、query ratio `0.2`、cosine warmup `0.1`、grad clip `1.0`
   和 patience `8`。
 - 训练使用两个 preprocessing pipelines，最终推理使用全部四个。
 
@@ -35,11 +35,14 @@
 - `prefix`：在 12 层 sequence attention 注入长度 8 的 deep K/V prefix，只训练
   prefix 参数。
 - `last_block`：只训练最后一个 Transformer layer 和 `cls_y_decoder`。
-- `localpfn`：class-aware per-query KNN context、标签覆盖修复和 full FT；
-  context size 为 `min(10 * sqrt(n_train), 1000)`，每 epoch 最多 30 steps。
-- `micp`：沿用现有 MixturePFN 语义。使用 KMeans route-shared support，
-  support size 为 `min(3000, n_train)`；冻结 backbone，只训练每层宽度 8 的
-  零初始化 residual adapter，固定 `128 steps, lr=1e-3`。
+- `micp`：严格采用论文的 routing-only MICP 语义，不更新模型参数。使用
+  `B=3000`、`K=ceil(gamma*N/B)`、KMeans route-shared support；大 cluster
+  随机采样 B 行，小 cluster 以 centroid 的 B-NN 扩充；在验证集上从
+  `gamma={5,1}` 选择。
+- `mixturepfn`：论文完整模型，即 `MICP + C_A PFN`。冻结 backbone，只训练
+  每层零初始化 residual adapter；大数据 bootstrap 先取 anchor 的 B-NN，
+  再取 64 个 decoder query；小数据使用随机 90/10 bootstrap；固定
+  `128 Adam steps, lr=1e-3`。推理 batch 为 1024，ensemble 为 16。
 
 ## 编排、结果与恢复
 

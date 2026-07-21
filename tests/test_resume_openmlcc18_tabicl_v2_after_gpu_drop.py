@@ -44,7 +44,11 @@ def row(name: str, *, status: str = "ok", method: str = "infer") -> dict[str, ob
         "ttt_oom_fallback": False,
         "ttt_fallback_reason": "",
         "ttt_c_fallback_reason": "",
-        "ttt_c_selection": "random" if method == "ft" else ("f_mmd" if adapted else ""),
+        "ttt_c_selection": (
+            "random"
+            if method == "ft"
+            else ("f_test_centroid_reserve" if adapted else "")
+        ),
         "ttt_c_metric": "tabicl_encoded_l2" if adapted else "",
     }
 

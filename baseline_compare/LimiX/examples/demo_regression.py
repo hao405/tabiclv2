@@ -21,7 +21,7 @@ os.environ["MASTER_PORT"] = "29500"
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
-from inference.predictor import LimiXPredictor
+from baseline_compare.LimiX.inference.predictor import LimiXPredictor
 
 house_data = fetch_california_housing()
 X, y = house_data.data, house_data.target

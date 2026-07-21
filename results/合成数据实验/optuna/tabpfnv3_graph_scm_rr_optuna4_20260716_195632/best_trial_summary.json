@@ -1,0 +1,15 @@
+{
+  "number": 3,
+  "state": "COMPLETE",
+  "ttt_c_reserve_ratio": 0.29086417952528093,
+  "ok_count": 512,
+  "failed_count": 0,
+  "ttt_applied_count": 512,
+  "ttt_oom_fallback_count": 0,
+  "avg_accuracy_ok": 0.8149421368300435,
+  "out_dir": "/home/crc00006699/zh/tabiclv2/results/tabpfn/v3/optuna_reserve_ratio/tabpfnv3_graph_scm_rr_optuna4_20260716_195632/trials/trial_0003_reserve_0p290864",
+  "log_path": "/home/crc00006699/zh/tabiclv2/results/tabpfn/v3/optuna_reserve_ratio/tabpfnv3_graph_scm_rr_optuna4_20260716_195632/logs/trial_0003.log",
+  "command": "/home/crc00006699/anaconda3/envs/tabicl/bin/python /home/crc00006699/zh/tabiclv2/baseline_compare/TabPFN-main/Tabpfn_1c_ttt_faware_c.py --data-root /home/crc00006699/zh/tabiclv2/results/tabiclv2_prior_data/graph_scm_3stage_512_seed42 --out-dir /home/crc00006699/zh/tabiclv2/results/tabpfn/v3/optuna_reserve_ratio/tabpfnv3_graph_scm_rr_optuna4_20260716_195632/trials/trial_0003_reserve_0p290864 --workers 1 --gpus 1 --model-version v3 --random-state 42 --n-estimators 8 --ttt --ttt-epochs 30 --ttt-lr 1e-05 --ttt-weight-decay 0.01 --ttt-patience 8 --ttt-min-delta 0.0001 --ttt-eval-metric acc --ttt-validation-fraction 0.1 --ttt-n-estimators-finetune 2 --ttt-validation-n-estimators 2 --ttt-grad-accumulation-steps 1 --ttt-query-ratio 0.2 --ttt-c-selection f_mmd --ttt-c-metric standardized_l2 --ttt-c-reserve-ratio 0.2908641795",
+  "error": null,
+  "objective": 0.8149421368300435
+}

@@ -1,0 +1,30 @@
+{
+  "created_from": {
+    "matrix_root": "results/合成数据实验/matrix/tabiclv2_graph_scm_2x3_full_20260716_090925",
+    "optuna_root": "results/合成数据实验/optuna/tabpfnv3_graph_scm_rr_optuna4_20260716_195632",
+    "stage_manifest": "results/合成数据实验/data_manifest/prior_manifest.csv"
+  },
+  "logical_faware_replacement": {
+    "model": "tabpfn-v3",
+    "method": "faware_ft",
+    "best_trial": 3,
+    "ttt_c_reserve_ratio": 0.29086417952528093,
+    "objective_accuracy": 0.8149421368300435,
+    "source_csv": "results/合成数据实验/optuna/tabpfnv3_graph_scm_rr_optuna4_20260716_195632/trials/trial_0003_reserve_0p290864/all_classification_results.csv"
+  },
+  "sources": {
+    "tabicl-v2/infer": "results/合成数据实验/matrix/tabiclv2_graph_scm_2x3_full_20260716_090925/tabicl-v2/infer/seed42/all_classification_results.csv",
+    "tabicl-v2/ft": "results/合成数据实验/matrix/tabiclv2_graph_scm_2x3_full_20260716_090925/tabicl-v2/ft/seed42/all_classification_results.csv",
+    "tabicl-v2/faware_ft": "results/合成数据实验/matrix/tabiclv2_graph_scm_2x3_full_20260716_090925/tabicl-v2/faware_ft/seed42/all_classification_results.csv",
+    "tabpfn-v3/infer": "results/合成数据实验/matrix/tabiclv2_graph_scm_2x3_full_20260716_090925/tabpfn-v3/infer/seed42/all_classification_results.csv",
+    "tabpfn-v3/ft": "results/合成数据实验/matrix/tabiclv2_graph_scm_2x3_full_20260716_090925/tabpfn-v3/ft/seed42/all_classification_results.csv",
+    "tabpfn-v3/faware_ft": "results/合成数据实验/optuna/tabpfnv3_graph_scm_rr_optuna4_20260716_195632/trials/trial_0003_reserve_0p290864/all_classification_results.csv",
+    "tabpfn-v3/faware_ft_default": "results/合成数据实验/matrix/tabiclv2_graph_scm_2x3_full_20260716_090925/tabpfn-v3/faware_ft/seed42/all_classification_results.csv"
+  },
+  "pairing": "dataset_name shared status=ok",
+  "bootstrap": {
+    "unit": "dataset",
+    "resamples": 10000,
+    "seed": 42
+  }
+}

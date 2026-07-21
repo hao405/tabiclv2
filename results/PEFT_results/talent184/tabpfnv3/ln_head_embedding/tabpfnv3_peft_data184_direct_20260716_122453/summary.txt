@@ -1,0 +1,15 @@
+discovered_datasets: 184
+processed_datasets: 184
+ok_count: 182
+failed_count: 2
+skipped_count: 0
+ft_oom_fallback_count: 1
+avg_accuracy_ok: 0.853361
+avg_f1_ok: 0.844700
+avg_balanced_accuracy_ok: 0.777279
+avg_roc_auc_ok: 0.900980
+avg_log_loss_ok: 0.330115
+wall_seconds: 7264.692
+failed_datasets: accelerometer, connect-4
+skipped_datasets: (none)
+ft_oom_fallback_datasets: madeline

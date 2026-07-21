@@ -1,0 +1,15 @@
+discovered_datasets: 67
+processed_datasets: 67
+ok_count: 65
+failed_count: 2
+skipped_count: 0
+ttt_oom_fallback_count: 2
+avg_accuracy_ok: 0.888517
+avg_f1_ok: 0.884068
+avg_balanced_accuracy_ok: 0.838992
+avg_roc_auc_ok: 0.930950
+avg_log_loss_ok: 0.255211
+wall_seconds: (targeted recovery; see recovery_manifest.json)
+failed_datasets: OpenML-ID-40927, OpenML-ID-40996
+skipped_datasets: (none)
+ttt_oom_fallback_datasets: OpenML-ID-40927, OpenML-ID-554

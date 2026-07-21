@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
-from model.layer import EncoderBaseLayer, MLP, LayerStack
+from baseline_compare.LimiX.model.layer import EncoderBaseLayer, MLP, LayerStack
 from typing import Any, Literal
-from model.encoders import get_x_encoder, get_cls_y_encoder, get_reg_y_encoder, preprocesss_4_x
+from baseline_compare.LimiX.model.encoders import get_x_encoder, get_cls_y_encoder, get_reg_y_encoder, preprocesss_4_x
 from torch.amp import autocast
 
 

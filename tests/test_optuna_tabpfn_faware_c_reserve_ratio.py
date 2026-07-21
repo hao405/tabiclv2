@@ -88,8 +88,9 @@ class FakeStudy:
 
 
 class FakeSampler:
-    def __init__(self, seed: int):
+    def __init__(self, seed: int, n_startup_trials: int):
         self.seed = seed
+        self.n_startup_trials = n_startup_trials
 
 
 class FakeOptuna:
@@ -102,6 +103,7 @@ class FakeOptuna:
         assert direction == "maximize"
         assert isinstance(sampler, FakeSampler)
         assert sampler.seed == 123
+        assert sampler.n_startup_trials == 1
         assert load_if_exists is True
         assert storage.startswith("sqlite:///")
         return FakeStudy(study_name=study_name)
@@ -154,7 +156,7 @@ def test_build_trial_command_contains_tabpfn_runner_and_reserve_ratio(tmp_path):
         ttt_lr=1e-5,
         ttt_epochs=30,
         ttt_query_ratio=0.2,
-        ttt_c_selection="f_mmd",
+        ttt_c_selection="f_test_centroid_reserve",
         ttt_c_metric="standardized_l2",
         ttt_weight_decay=0.01,
         ttt_patience=8,
@@ -172,7 +174,10 @@ def test_build_trial_command_contains_tabpfn_runner_and_reserve_ratio(tmp_path):
     assert command[command.index("--gpus") + 1] == "0"
     assert command[command.index("--ttt-lr") + 1] == "1e-05"
     assert command[command.index("--ttt-eval-metric") + 1] == "acc"
-    assert command[command.index("--ttt-c-selection") + 1] == "f_mmd"
+    assert (
+        command[command.index("--ttt-c-selection") + 1]
+        == "f_test_centroid_reserve"
+    )
     assert command[command.index("--ttt-c-metric") + 1] == "standardized_l2"
     assert command[command.index("--ttt-c-reserve-ratio") + 1] == "0.037421"
     assert command[command.index("--max-datasets") + 1] == "5"
@@ -180,17 +185,20 @@ def test_build_trial_command_contains_tabpfn_runner_and_reserve_ratio(tmp_path):
     assert "--ttt-c-source" not in command
 
 
-def test_parser_defaults_use_tabpfn_v2_gpu0_and_expected_reserve_range():
+def test_parser_defaults_use_tabpfn_v3_gpu1_and_expected_reserve_range():
     parser = search.build_arg_parser()
     args = parser.parse_args([])
 
     assert search.RESERVE_RATIO_LOW == 0.0001
     assert search.RESERVE_RATIO_HIGH == 0.3
-    assert args.model_version == "v2"
+    assert args.model_version == "v3"
     assert args.workers == 1
-    assert args.gpus == "0"
-    assert args.ttt_c_selection == "f_mmd"
+    assert args.gpus == "1"
+    assert args.ttt_c_selection == "f_test_centroid_reserve"
     assert args.ttt_c_metric == "standardized_l2"
+    assert args.n_trials == 4
+    assert args.n_startup_trials == 1
+    assert args.expected_datasets == 512
 
 
 def test_evaluate_trial_outputs_maximizes_status_ok_average_accuracy(tmp_path):
@@ -254,9 +262,11 @@ def test_dry_run_writes_trials_and_summary(tmp_path):
     assert len(trials_df) == 2
     assert set(trials_df["state"]) == {"DRY_RUN"}
     assert "ttt_c_reserve_ratio" in trials_df.columns
-    assert trials_df["command"].str.contains("--model-version v2").all()
-    assert trials_df["command"].str.contains("--gpus 0").all()
-    assert trials_df["command"].str.contains("--ttt-c-selection f_mmd").all()
+    assert trials_df["command"].str.contains("--model-version v3").all()
+    assert trials_df["command"].str.contains("--gpus 1").all()
+    assert trials_df["command"].str.contains(
+        "--ttt-c-selection f_test_centroid_reserve"
+    ).all()
     assert trials_df["command"].str.contains("--ttt-c-reserve-ratio").all()
     summary_text = (output_root / "study_summary.txt").read_text(encoding="utf-8")
     assert "dry_run_trials: 2" in summary_text
@@ -278,8 +288,8 @@ def test_main_writes_study_outputs_with_fake_optuna(tmp_path, monkeypatch):
         reserve_ratio = float(command[command.index("--ttt-c-reserve-ratio") + 1])
         assert abs(reserve_ratio - 0.037421) < 1e-12
         assert command[command.index("--ttt-eval-metric") + 1] == "acc"
-        assert command[command.index("--model-version") + 1] == "v2"
-        assert command[command.index("--gpus") + 1] == "0"
+        assert command[command.index("--model-version") + 1] == "v3"
+        assert command[command.index("--gpus") + 1] == "1"
         write_trial_outputs(out_dir, accuracies={"alpha": 0.81, "beta": 0.83})
         return subprocess.CompletedProcess(command, 0)
 
@@ -313,6 +323,8 @@ def test_main_writes_study_outputs_with_fake_optuna(tmp_path, monkeypatch):
             "123",
             "--max-datasets",
             "5",
+            "--expected-datasets",
+            "2",
         ]
     )
 

@@ -366,7 +366,7 @@ class LimiXAdapter:
     @staticmethod
     def _disable_flash_attention_runtime() -> bool:
         try:
-            from model import layer as limix_layer
+            from baseline_compare.LimiX.model import layer as limix_layer
         except Exception:
             return False
 
@@ -474,7 +474,7 @@ class LimiXAdapter:
             raise self._load_error
         try:
             import torch
-            from inference.predictor import LimiXPredictor
+            from baseline_compare.LimiX.inference.predictor import LimiXPredictor
         except Exception as exc:
             self._load_error = RuntimeError(f"Failed to import LimiX predictor: {exc}")
             raise self._load_error from exc

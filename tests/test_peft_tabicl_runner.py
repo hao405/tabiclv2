@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import sys
 
+import pytest
 import torch
 
 
@@ -92,8 +93,42 @@ class FakeTabPFNV2(torch.nn.Module):
         )
 
 
+class FakeTabPFNV3(torch.nn.Module):
+    def __init__(self, *, multiclass: bool):
+        super().__init__()
+        self.x_embed = torch.nn.Linear(2, 4)
+        self.col_y_encoder = torch.nn.Linear(1, 4)
+        self.feature_distribution_embedder = FakeEncoder(num_blocks=1)
+        self.column_aggregator = FakeEncoder(num_blocks=1)
+        self.icl_y_encoder = torch.nn.Linear(1, 4)
+        self.icl_blocks = torch.nn.ModuleList(
+            [FakeTransformerBlock() for _ in range(3)]
+        )
+        self.output_norm = torch.nn.RMSNorm(4)
+        if multiclass:
+            self.many_class_decoder = torch.nn.Sequential(
+                torch.nn.Linear(4, 8),
+                torch.nn.GELU(),
+                torch.nn.Linear(8, 3),
+            )
+        else:
+            self.output_projection = torch.nn.Sequential(
+                torch.nn.Linear(4, 8),
+                torch.nn.GELU(),
+                torch.nn.Linear(8, 2),
+            )
+
+
 def trainable_names(model):
     return {name for name, param in model.named_parameters() if param.requires_grad}
+
+
+def names_under(model, *prefixes):
+    return {
+        name
+        for name, _ in model.named_parameters()
+        if any(name == prefix or name.startswith(prefix + ".") for prefix in prefixes)
+    }
 
 
 def test_lora_only_trains_lora_params_and_merged_state_excludes_temporary_keys():
@@ -230,16 +265,107 @@ def test_tabpfn_ln_head_embedding_selects_only_norm_embedding_and_head():
     assert not any(name.startswith("blocks.0.attn.q_projection") for name in names)
 
 
+@pytest.mark.parametrize(
+    ("multiclass", "head_name"),
+    [(False, "output_projection"), (True, "many_class_decoder")],
+)
+def test_tabpfnv3_last_layers_selects_exact_tail_norm_and_task_head(
+    multiclass, head_name
+):
+    peft = load_peft_module()
+    model = FakeTabPFNV3(multiclass=multiclass)
+
+    peft._configure_tabpfnv3_trainable_params(
+        model,
+        peft.TTTConfig(
+            enabled=True,
+            peft_method="last_layers",
+            last_n_icl_blocks=1,
+        ),
+    )
+
+    expected = names_under(model, "icl_blocks.2", "output_norm", head_name)
+    assert trainable_names(model) == expected
+    trainable, ratio = peft._peft_trainable_summary(model)
+    assert trainable == sum(model.get_parameter(name).numel() for name in expected)
+    assert 0.0 < ratio < 1.0
+
+
+@pytest.mark.parametrize(
+    ("multiclass", "head_name"),
+    [(False, "output_projection"), (True, "many_class_decoder")],
+)
+def test_tabpfnv3_ln_head_embedding_selects_exact_norm_embeddings_and_head(
+    multiclass, head_name
+):
+    peft = load_peft_module()
+    model = FakeTabPFNV3(multiclass=multiclass)
+
+    peft._configure_tabpfnv3_trainable_params(
+        model,
+        peft.TTTConfig(enabled=True, peft_method="ln_head_embedding"),
+    )
+
+    expected = names_under(
+        model,
+        "x_embed",
+        "col_y_encoder",
+        "icl_y_encoder",
+        head_name,
+    )
+    expected.update(
+        name
+        for name, _ in model.named_parameters()
+        if ".norm" in name or name.startswith("output_norm.")
+    )
+    assert trainable_names(model) == expected
+    assert not any(name.startswith("icl_blocks.0.linear") for name in expected)
+
+
+def test_tabpfnv3_lora_trains_only_lora_and_merges_checkpoint_state():
+    peft = load_peft_module()
+    model = FakeTabPFNV3(multiclass=True)
+
+    peft._configure_tabpfnv3_trainable_params(
+        model,
+        peft.TTTConfig(
+            enabled=True,
+            peft_method="lora",
+            lora_rank=2,
+            lora_alpha=4.0,
+        ),
+    )
+
+    assert trainable_names(model)
+    assert all("._ttt_lora_" in name for name in trainable_names(model))
+    assert model.icl_blocks[0].attn._ttt_lora_in_proj_installed is True
+    merged = peft._merged_ttt_state_dict(model)
+    assert not any("_ttt_lora_" in name or ".parametrizations." in name for name in merged)
+    assert "icl_blocks.0.attn.in_proj_weight" in merged
+
+
 def test_matrix_expansion_is_model_major_and_has_six_trials():
     peft = load_peft_module()
     assert peft.expand_matrix_trials("all", "all") == [
         ("tabiclv2", "lora"),
         ("tabiclv2", "last_layers"),
         ("tabiclv2", "ln_head_embedding"),
-        ("tabpfnv2", "lora"),
-        ("tabpfnv2", "last_layers"),
-        ("tabpfnv2", "ln_head_embedding"),
+        ("tabpfnv3", "lora"),
+        ("tabpfnv3", "last_layers"),
+        ("tabpfnv3", "ln_head_embedding"),
     ]
+
+
+def test_default_data_root_is_openml_view_and_explicit_data184_is_preserved():
+    peft = load_peft_module()
+    parser = peft.build_arg_parser()
+
+    default_args = parser.parse_args([])
+    explicit_args = parser.parse_args(["--data-root", "data184"])
+
+    assert default_args.data_root == "results/dataset_views/openml_cc18_max10"
+    assert explicit_args.data_root == "data184"
+    assert "tabpfnv2" in peft.MODEL_FAMILIES
 
 
 def test_matrix_command_routes_one_concrete_trial(tmp_path):
@@ -258,12 +384,12 @@ def test_matrix_command_routes_one_concrete_trial(tmp_path):
     )
     command = peft.build_matrix_trial_command(
         args,
-        model_family="tabpfnv2",
+        model_family="tabpfnv3",
         peft_method="last_layers",
         trial_dir=tmp_path / "trial",
     )
     joined = " ".join(command)
-    assert "--model-family tabpfnv2" in joined
+    assert "--model-family tabpfnv3" in joined
     assert "--ttt-peft-method last_layers" in joined
     assert "--gpu-groups 2" in joined
     assert f"--out-dir {tmp_path / 'trial'}" in joined
@@ -286,6 +412,77 @@ def test_tabpfn_peft_disables_reentrant_activation_checkpointing(tmp_path):
     )
     tabpfn_args = peft._tabpfn_args_from_common(args, module)
     assert tabpfn_args.ttt_activation_checkpointing is False
+
+
+def test_tabpfnv3_routes_binary_and_multiclass_checkpoints(tmp_path):
+    peft = load_peft_module()
+    module = peft._load_tabpfn_runner_module()
+    binary_path = tmp_path / "binary.ckpt"
+    multiclass_path = tmp_path / "multiclass.ckpt"
+    args = peft.build_arg_parser().parse_args(
+        [
+            "--model-family",
+            "tabpfnv3",
+            "--out-dir",
+            str(tmp_path / "trial"),
+            "--tabpfn-v3-binary-model-path",
+            str(binary_path),
+            "--tabpfn-v3-multiclass-model-path",
+            str(multiclass_path),
+        ]
+    )
+    tabpfn_args = peft._tabpfn_args_from_common(args, module)
+    assert tabpfn_args.model_version == "v3"
+    assert tabpfn_args.model_path is None
+    assert tabpfn_args.v3_binary_model_path == str(binary_path.resolve())
+    assert tabpfn_args.v3_multiclass_model_path == str(multiclass_path.resolve())
+
+
+def _write_complete_trial(trial_dir):
+    trial_dir.mkdir(parents=True)
+    (trial_dir / "all_classification_results.csv").write_text(
+        "dataset_name,status,ttt_applied,peft_trainable_params,accuracy\n"
+        "toy,ok,True,12,0.5\n",
+        encoding="utf-8",
+    )
+    (trial_dir / "summary.txt").write_text("ok_count: 1\n", encoding="utf-8")
+    (trial_dir / "run_config.json").write_text(
+        json.dumps({"status": "success"}),
+        encoding="utf-8",
+    )
+
+
+def test_reuse_accepts_successful_tabicl_trials_from_running_matrix(tmp_path):
+    peft = load_peft_module()
+    manifest = tmp_path / "matrix_manifest.json"
+    trials = []
+    for method in peft.PEFT_METHODS:
+        trial_dir = tmp_path / method
+        _write_complete_trial(trial_dir)
+        trials.append(
+            {
+                "model_family": "tabiclv2",
+                "peft_method": method,
+                "status": "success",
+                "output_dir": str(trial_dir),
+            }
+        )
+    manifest.write_text(
+        json.dumps({"status": "running", "trials": trials}),
+        encoding="utf-8",
+    )
+
+    reused = peft._load_reused_matrix_trials(
+        str(manifest), peft.expand_matrix_trials("all", "all")
+    )
+    assert set(reused) == {("tabiclv2", method) for method in peft.PEFT_METHODS}
+    assert all(item["execution"] == "reused" for item in reused.values())
+
+    (tmp_path / "lora" / "summary.txt").unlink()
+    with pytest.raises(ValueError, match="incomplete artifacts"):
+        peft._load_reused_matrix_trials(
+            str(manifest), peft.expand_matrix_trials("all", "all")
+        )
 
 
 def test_resume_requires_success_config_and_all_artifacts(tmp_path):

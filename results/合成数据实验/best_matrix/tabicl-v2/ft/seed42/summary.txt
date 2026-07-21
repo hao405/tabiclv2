@@ -1,0 +1,15 @@
+discovered_datasets: 512
+processed_datasets: 512
+ok_count: 512
+failed_count: 0
+skipped_count: 0
+ttt_oom_fallback_count: 6
+avg_accuracy_ok: 0.819975
+avg_f1_ok: 0.804996
+avg_balanced_accuracy_ok: 0.765197
+avg_roc_auc_ok: 0.921777
+avg_log_loss_ok: 0.442151
+wall_seconds: (recovered; see recovery manager manifest)
+failed_datasets: (none)
+skipped_datasets: (none)
+ttt_oom_fallback_datasets: stage3_graph_scm_0037_seed42, stage3_graph_scm_0042_seed42, stage3_graph_scm_0054_seed42, stage3_graph_scm_0068_seed42, stage3_graph_scm_0069_seed42, stage3_graph_scm_0090_seed42

@@ -1,0 +1,15 @@
+discovered_datasets: 184
+processed_datasets: 184
+ok_count: 178
+failed_count: 6
+skipped_count: 0
+ft_oom_fallback_count: 1
+avg_accuracy_ok: 0.852163
+avg_f1_ok: 0.843451
+avg_balanced_accuracy_ok: 0.777086
+avg_roc_auc_ok: 0.900555
+avg_log_loss_ok: 0.332544
+wall_seconds: 9051.664
+failed_datasets: accelerometer, company_bankruptcy_prediction, connect-4, default_of_credit_card_clients, dna, madeline
+skipped_datasets: (none)
+ft_oom_fallback_datasets: taiwanese_bankruptcy_prediction
